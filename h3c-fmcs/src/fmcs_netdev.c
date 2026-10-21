@@ -10,12 +10,77 @@
 #include <linux/skbuff.h>
 #include <linux/if_vlan.h>
 #include <linux/if_arp.h>
+#include <linux/of_net.h>
 #include "fmcs.h"
 
 struct fmcs_fttr_port_priv {
 	struct fmcs_priv *priv;
 	u32 port_idx; /* 1-based port index: 1..16 */
 };
+
+/* Fallback prefix used only when the DT supplies no mac-address cell.
+ * Locally administered (0x02) and identical on every unit, so it must not
+ * be relied on: two units on the same L2 domain would collide. */
+#define FMCS_FALLBACK_MAC_PREFIX	{ 0x02, 0xFE, 0x88, 0x75, 0x81, 0x00 }
+
+/*
+ * Increment a MAC by n with carry across all six bytes, so a block of
+ * consecutive ports never wraps the last byte silently.
+ */
+static void fmcs_mac_add(u8 *mac, unsigned int n)
+{
+	unsigned int carry = n;
+	int i;
+
+	for (i = ETH_ALEN - 1; i >= 0 && carry; i--) {
+		unsigned int v = mac[i] + (carry & 0xff);
+
+		mac[i] = v & 0xff;
+		carry = (carry >> 8) + (v >> 8);
+	}
+}
+
+/*
+ * Resolve the base MAC for the fttr1..fttr16 block.
+ *
+ * The cell is consumed through of_get_mac_address(), so the DT side declares
+ * it exactly like any other ethernet node:
+ *	nvmem-cell-names = "mac-address";
+ *	nvmem-cells = <&base_mac 9>;
+ *
+ * fttr1 takes the cell verbatim and fttr2..fttr16 are derived from it, which
+ * reserves base+9 .. base+24 of the mac-base index space for this driver.
+ *
+ * Returns 0 on success, -EPROBE_DEFER when the nvmem provider is not up yet
+ * (the caller must propagate it), or a negative errno when no cell exists.
+ */
+static int fmcs_get_base_mac(struct fmcs_priv *priv, u8 *mac)
+{
+	static const u8 fallback[ETH_ALEN] = FMCS_FALLBACK_MAC_PREFIX;
+	int ret;
+
+	if (!priv->dev || !priv->dev->of_node)
+		ret = -ENODEV;
+	else
+		ret = of_get_mac_address(priv->dev->of_node, mac);
+
+	if (ret == -EPROBE_DEFER)
+		return ret;
+
+	if (ret) {
+		dev_warn(priv->dev,
+			 "no mac-address in DT (%d); fttr ports fall back to the locally-administered 02:fe:88:75:81:xx block\n",
+			 ret);
+		memcpy(mac, fallback, ETH_ALEN);
+	}
+
+	if (!is_valid_ether_addr(mac)) {
+		dev_warn(priv->dev, "base MAC from DT is invalid; using fallback block\n");
+		memcpy(mac, fallback, ETH_ALEN);
+	}
+
+	return 0;
+}
 
 static netdev_tx_t fmcs_omci_xmit(struct sk_buff *skb, struct net_device *dev)
 {
@@ -345,6 +410,7 @@ int fmcs_netdevs_init(struct fmcs_priv *priv)
 	int ret;
 	int i;
 	u8 base_mac[ETH_ALEN];
+	u8 port_mac[ETH_ALEN];
 
 	skb_queue_head_init(&priv->ploam_tx_queue);
 	INIT_WORK(&priv->ploam_tx_work, fmcs_ploam_tx_work);
@@ -398,13 +464,22 @@ int fmcs_netdevs_init(struct fmcs_priv *priv)
 		return ret;
 	}
 
-	/* Generate a deterministic base MAC for downstream FTTR switch ports */
-	eth_random_addr(base_mac);
-	base_mac[0] = 0x02;
-	base_mac[1] = 0xFE;
-	base_mac[2] = 0x88;
-	base_mac[3] = 0x75;
-	base_mac[4] = 0x81;
+	/*
+	 * Resolve a per-unit base MAC for the downstream FTTR switch ports.
+	 *
+	 * These 16 ports end up enslaved in br-lan, and a Linux bridge adopts
+	 * the numerically smallest slave MAC as its own. With the old
+	 * hardcoded 02:fe:88:75:81:xx block that meant the bridge - and
+	 * everything downstream sees as the gateway - carried a locally
+	 * administered address that was also identical on every unit. Deriving
+	 * from the factory label MAC instead keeps br-lan on the label address
+	 * and keeps the block unique per board.
+	 */
+	ret = fmcs_get_base_mac(priv, base_mac);
+	if (ret) {
+		i = 0; /* err_unreg_fttr walks the already-registered ports back */
+		goto err_unreg_fttr;
+	}
 
 	/* Create downstream DSA-style switch ports fttr1 ~ fttr16 */
 	for (i = 0; i < FMCS_MAX_FTTR_PORTS; i++) {
@@ -426,9 +501,10 @@ int fmcs_netdevs_init(struct fmcs_priv *priv)
 		port_priv->priv = priv;
 		port_priv->port_idx = i + 1;
 
-		/* Set unique MAC: 02:FE:88:75:81:01 ~ 10 */
-		base_mac[5] = (u8)(i + 1);
-		eth_hw_addr_set(dev, base_mac);
+		/* fttr1 takes the DT cell verbatim, fttr2..fttr16 follow it */
+		memcpy(port_mac, base_mac, ETH_ALEN);
+		fmcs_mac_add(port_mac, i);
+		eth_hw_addr_set(dev, port_mac);
 
 		/* Default carrier is OFF until ONU establishes O5 link */
 		netif_carrier_off(dev);
