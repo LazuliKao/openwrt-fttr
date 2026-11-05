@@ -29,6 +29,9 @@ make package/feeds/fttr/h3c-fmcs/compile V=s -j2
 make package/feeds/fttr/h3c-fttr-tools/compile V=s -j2
 ```
 
+`kmod-h3c-fmcs` 自动依赖 `h3c-fmcs-firmware`，镜像必须包含该包提供的
+`/lib/firmware/FTTR_TOP.sbit`。缺少该文件会使 FPGA 初始化失败并暂停子光猫发现。
+
 ## 编译选项
 
 | OpenWrt 配置 | Cargo feature | OpenWrt 默认 | Cargo 默认 |
@@ -77,6 +80,23 @@ STAR 观察工具要求传入源 MAC；不再内置现场设备地址。独立 r
 
 正常保留配置的 sysupgrade 会同时备份 `/lib/firmware/modified_UX3326.bin`
 校准文件（若存在），保留项由 `/lib/upgrade/keep.d/fttr` 声明。
+
+ZTE F650A（OMCI EquipmentId 为 `ZXHN F650A(GPON ONU)`）使用独立型号适配，
+从 MIB 发现 T-CONT 和 VEIP。仅对精确匹配的三条出厂 EVTO 丢弃规则替换为
+透明转发，写后必须回读一致；遇到其它既有规则拒绝覆盖。该适配不声明支持
+F650A 的 CWMP/Wi-Fi 配置，业务转发仍需用真实流量另行验证。
+
+F650A V3.0.0P1T1 的本机配置还可能启用厂商 ARP 接管：
+`/proc/net/arp_stolen` 为 `1` 时，OMCI/GEM 下行正常也可能无法建立后挂
+LAN 设备的 ARP 邻居。先用受控抓包和真实双向流量确认，备份子光猫配置后，
+通过完整维护会话检查 `sendcmd 1 DB p LAND` 中的 `ArpStolenEnable`。
+该固件的内核运行开关是全局的：仅关闭主 LAN 的字段，另一 LAN 的开启值
+仍会在重启时恢复接管。经确认允许变更的 LAN 行应设为 `0`，再执行
+`sendcmd 1 DB save` 和 `sync`；重启后必须核对运行开关及双向业务流量。
+这属于子光猫本机配置，不由 OMCI 型号适配自动修改，也不等于开放 PON/WAN
+侧本机管理。固定 LAN telnet 的完整维护权限还需保存
+`TelnetCfg.InitSecLvl=2`，并重新登录验证配置读写与诊断命令；保持
+`Wan_Enable=0`，不要把临时维护账号的权限误认为固定账号已有权限。
 
 持久化状态按内容去重：管理网络 journal 在成功提交后缓存快照，相同状态不再
 写盘；共用原子写入层也避免重写相同文件。事务状态变更仍同步落盘，失败重试

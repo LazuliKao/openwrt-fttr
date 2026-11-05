@@ -12,7 +12,7 @@ include $(INCLUDE_DIR)/package.mk
 define KernelPackage/h3c-fmcs
   SUBMENU:=Network Devices
   TITLE:=H3C HM2004-DU Micro-OLT FPGA Management Controller (FMCS)
-  DEPENDS:=@(TARGET_airoha_an7581) +kmod-spi-gpio +kmod-nf-flow
+  DEPENDS:=@(TARGET_airoha_an7581) +h3c-fmcs-firmware +kmod-spi-gpio +kmod-nf-flow
   FILES:=$(PKG_BUILD_DIR)/h3c-fmcs.ko
   AUTOLOAD:=$(call AutoProbe,h3c-fmcs)
   KCONFIG:=

@@ -1,7 +1,14 @@
 //! ZTE vendor dispatch. Model-specific behavior belongs in its model module.
+pub mod f650a;
 pub mod g1612;
 
-pub fn matches(vendor: &str, equipment: Option<&str>, serial: Option<&str>) -> bool {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Profile {
+    G1612,
+    F650a,
+}
+
+pub fn profile(vendor: &str, equipment: Option<&str>, serial: Option<&str>) -> Option<Profile> {
     let is_zte_vendor = vendor.eq_ignore_ascii_case("9866")
         || vendor.eq_ignore_ascii_case("ZTEG")
         || vendor.eq_ignore_ascii_case("ZTE");
@@ -12,10 +19,16 @@ pub fn matches(vendor: &str, equipment: Option<&str>, serial: Option<&str>) -> b
         .is_some_and(|eq| eq.contains("ZXHN") || eq.contains("ZTE") || eq.contains("G1612"));
 
     if !is_zte_vendor && !is_zte_serial && !is_zte_equipment {
-        return false;
+        return None;
     }
 
-    g1612::matches(vendor, equipment, serial)
+    if is_zte_vendor && f650a::matches(equipment) {
+        Some(Profile::F650a)
+    } else if g1612::matches(vendor, equipment, serial) {
+        Some(Profile::G1612)
+    } else {
+        None
+    }
 }
 
 pub fn matches_cwmp(optical_sn: &str, product_class: &str, serial: &str) -> bool {
@@ -29,8 +42,12 @@ pub fn matches_cwmp(optical_sn: &str, product_class: &str, serial: &str) -> bool
 }
 
 pub fn configure(
+    profile: Profile,
     id: u8,
     cancellation: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> std::io::Result<()> {
-    g1612::configure(id, cancellation)
+    match profile {
+        Profile::G1612 => g1612::configure(id, cancellation),
+        Profile::F650a => f650a::configure(id, cancellation),
+    }
 }
