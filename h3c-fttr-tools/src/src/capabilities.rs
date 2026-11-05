@@ -33,7 +33,7 @@ pub fn compiled() -> Capabilities {
     if zte {
         adapters.push(AdapterCapability {
             id: "zte",
-            name: "ZTE G1612",
+            name: "ZTE G1612 / F650A",
         });
     }
     if scty {

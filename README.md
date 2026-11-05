@@ -29,6 +29,9 @@ make package/feeds/fttr/h3c-fmcs/compile V=s -j2
 make package/feeds/fttr/h3c-fttr-tools/compile V=s -j2
 ```
 
+`kmod-h3c-fmcs` 自动依赖 `h3c-fmcs-firmware`，镜像必须包含该包提供的
+`/lib/firmware/FTTR_TOP.sbit`。缺少该文件会使 FPGA 初始化失败并暂停子光猫发现。
+
 ## 编译选项
 
 | OpenWrt 配置 | Cargo feature | OpenWrt 默认 | Cargo 默认 |
@@ -115,6 +118,9 @@ class 312 的 GET 是**最近完成的 15 分钟下行 PM 区间**，不是实�
 
 正常保留配置的 sysupgrade 会同时备份 `/lib/firmware/modified_UX3326.bin`
 校准文件（若存在），保留项由 `/lib/upgrade/keep.d/fttr` 声明。
+
+设备适配说明、测试清单和已验证边界集中在
+[设备验证文档](docs/devices/README.md)，不在本文件逐型号追加现场记录。
 
 持久化状态按内容去重：管理网络 journal 在成功提交后缓存快照，相同状态不再
 写盘；共用原子写入层也避免重写相同文件。事务状态变更仍同步落盘，失败重试

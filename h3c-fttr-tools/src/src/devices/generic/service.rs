@@ -12,6 +12,14 @@ use std::{
 };
 
 pub fn configure(id: u8, cancellation: Option<Arc<AtomicBool>>) -> io::Result<()> {
+    configure_with_evto(id, cancellation, None)
+}
+
+pub(crate) fn configure_with_evto(
+    id: u8,
+    cancellation: Option<Arc<AtomicBool>>,
+    configure_evto: Option<fn(&mut OmciSession, u16) -> io::Result<()>>,
+) -> io::Result<()> {
     if id >= crate::pon_engine::ONU_SLOTS {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -196,7 +204,11 @@ pub fn configure(id: u8, cancellation: Option<Arc<AtomicBool>>) -> io::Result<()
                 println!("GENERIC_EVTO_DOWNSTREAM_MODE_SKIPPED instance={evto_inst:04x}: {error}")
             }
         }
-        if let Err(error) = session.with_timeout(std::time::Duration::from_secs(30), |session| {
+        if let Some(configure_evto) = configure_evto {
+            session.with_timeout(std::time::Duration::from_secs(30), |session| {
+                configure_evto(session, evto_inst)
+            })?;
+        } else if let Err(error) = session.with_timeout(std::time::Duration::from_secs(30), |session| {
             apply_transparent_evto_table(session, evto_inst)
         }) {
             if matches!(
