@@ -28,6 +28,9 @@ pub(crate) mod zte;
 
 /// Optional device identity rules, independent of the shared OMCI bridge implementation.
 pub(crate) fn matches_cwmp_identity(optical_sn: &str, product_class: &str, serial: &str) -> bool {
+    if cwmp::vendor::ct::matches_identity(optical_sn, product_class, serial) {
+        return true;
+    }
     #[cfg(feature = "device-zte")]
     {
         if zte::matches_cwmp(optical_sn, product_class, serial) {
@@ -369,6 +372,29 @@ pub fn select_with_serial(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn generic_bridge_associates_exact_ct_native_identity_without_enrolling_business() {
+        assert!(matches_cwmp_adapter(
+            "generic", "SCTY72ABCDEF", "TEWA-768G", "308618C8172ABCDEF",
+        ));
+        assert!(!matches_cwmp_adapter(
+            "generic", "SCTY72ABCDE0", "TEWA-768G", "308618C8172ABCDEF",
+        ));
+        assert!(!matches_cwmp_adapter(
+            "generic", "SCTY72ABCDEF", "TEWA-unknown", "308618C8172ABCDEF",
+        ));
+        assert!(!matches_cwmp_adapter(
+            "unavailable", "SCTY72ABCDEF", "TEWA-768G", "308618C8172ABCDEF",
+        ));
+        assert_eq!(
+            select("SCTY", &crate::model::OnuIdentity {
+                equipment_id: Some("TEWA-768G".into()),
+                ..Default::default()
+            }),
+            Adapter::Unavailable,
+        );
+    }
+
     #[test]
     #[cfg(not(feature = "mqtt"))]
     fn mqtt_disabled_commands_are_local_and_inventory_remains_available() {
