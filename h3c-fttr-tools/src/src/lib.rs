@@ -8,6 +8,8 @@ pub mod capabilities;
 pub mod controller;
 pub mod devices;
 pub mod fpga;
+pub mod fpga_diag;
+pub mod fpga_diag_cli;
 pub mod hl202_ipc;
 pub mod ipc;
 pub mod model;

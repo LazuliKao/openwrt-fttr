@@ -41,6 +41,7 @@ make package/feeds/fttr/h3c-fttr-tools/compile V=s -j2
 | `CONFIG_FTTR_DEVICE_STAR` | `device-star` | 开 | 关 |
 | `CONFIG_FTTR_DEVICE_ZTE` | `device-zte` | 开 | 关 |
 | `CONFIG_FTTR_DEVICE_SCTY` | `device-scty` | 开 | 关 |
+| `CONFIG_FTTR_DEVICE_FIBERHOME` | `device-fiberhome` | 关 | 关 |
 | `CONFIG_FTTR_ACS` | `acs` | 开 | 关 |
 | `CONFIG_FTTR_MQTT` | `mqtt` | 开 | 开 |
 | `CONFIG_FTTR_NPU` | `npu` | 开 | 开 |
@@ -102,6 +103,14 @@ ONU class 312 下行 PM 是最近完成的 15 分钟区间，不是实时、累�
 
 设备适配说明、测试清单和已验证边界集中在
 [设备验证文档](docs/devices/README.md)，不在本文件逐型号追加现场记录。
+
+### miniOLT 只读 FPGA 诊断
+
+`fttrctl fpga-diag [ONU_ID|all] [--samples N] [--interval-ms N] [--json]`
+通过 daemon 读取原厂 `moltdbg` 已确认的授权配置、LoB/BIP 和全局错误计数；
+`--offline` 显式直接读取。JSON 为逐行快照及模差，跨注册代次不计算 ONU 差值。
+计数可能回绕、清零或饱和；寄存器不是原子快照，不能单凭累计值判定故障。
+字段来源、地址与解释边界见本地 `EVIDENCE/moltdbg-readonly-diagnostics.md`。
 
 ## Windows Rust 交叉编译
 

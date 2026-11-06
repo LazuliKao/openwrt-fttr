@@ -278,6 +278,7 @@ pub(super) fn compile_sections(input: Vec<(String, Section)>) -> Result<Config, 
             "star" if cfg!(feature = "device-star") => "star",
             "zte" if cfg!(feature = "device-zte") => "zte",
             "scty" if cfg!(feature = "device-scty") => "scty",
+            "fiberhome" if cfg!(feature = "device-fiberhome") => "fiberhome",
             "generic" => "generic",
             _ => return Err(format!("{id}: adapter unknown or not compiled")),
         };

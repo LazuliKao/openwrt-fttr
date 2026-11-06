@@ -31,6 +31,7 @@ Commands:\n  \
   mib ONU_ID [--summary|--json] [--tables]  Read structured OMCI inventory (default: JSON)\n  \
   fec ONU_ID [--json] [--create-pm]  Read downstream FEC PM; optionally create missing PM instance\n  \
   fpga-read <addr>     Directly read 32-bit FPGA hardware register\n  \
+  fpga-diag [ONU_ID|all] [--samples N] [--interval-ms N] [--json] [--offline]\n  \
   fpga-write <a> <v>   Directly write 32-bit FPGA hardware register\n  \
   bosa-diag [--json]   Read calibrated UX3326 optical diagnostics (Temp, Vcc, Bias, TX)\n  \
   bosa-read <addr>     Directly read 8-bit BOSA UX3326 optical register\n  \
@@ -631,6 +632,12 @@ fn main() {
                 exit(1);
             }
         },
+        "fpga-diag" => {
+            if let Err(error) = h3c_fttr_tools::fpga_diag_cli::run(&args[2..]) {
+                eprintln!("FPGA diagnostics: {error}");
+                exit(1);
+            }
+        }
         "fpga-read" => {
             if args.len() < 3 {
                 eprintln!("Usage: fttrctl fpga-read <hex_or_dec_addr>");

@@ -46,6 +46,12 @@ pub fn compiled() -> Capabilities {
         id: "generic",
         name: "Generic G.988 Bridge",
     });
+    if cfg!(feature = "device-fiberhome") {
+        adapters.push(AdapterCapability {
+            id: "fiberhome",
+            name: "FiberHome HG6371F-C (experimental SCTY grant trial; existing bridge only)",
+        });
+    }
     Capabilities {
         schema_version: 1,
         version: env!("CARGO_PKG_VERSION"),

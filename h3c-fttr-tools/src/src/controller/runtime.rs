@@ -535,6 +535,71 @@ fn start_ubus_server(
         .ok()
 }
 
+fn fpga_diagnostic_snapshot(
+    request: &crate::fpga_diag::Request,
+    pon_engine: &Arc<Mutex<PonEngine>>,
+    services: &super::service::States,
+) -> std::io::Result<crate::fpga_diag::Snapshot> {
+    let slots = request.slots()?;
+    // Identity stays inside the daemon. Compare it and the worker generation
+    // around the non-atomic reads rather than attributing counters to a new ONU.
+    let registrations = || -> std::io::Result<_> {
+        let engine = pon_engine
+            .lock()
+            .map_err(|_| std::io::Error::other("PON state unavailable"))?;
+        let states = services
+            .lock()
+            .map_err(|_| std::io::Error::other("ONU workers unavailable"))?;
+        Ok(slots
+            .iter()
+            .map(|id| {
+                let registered = engine.active_onus.iter().find(|onu| {
+                    onu.onu_id == *id
+                        && onu.state == crate::pon_engine::ploam::OnuState::O5Operation
+                });
+                (
+                    *id,
+                    registered.map(|onu| {
+                        (
+                            onu.full_sn_str(),
+                            states.get(id).map(|state| state.generation),
+                        )
+                    }),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>())
+    };
+    let before = registrations()?;
+    let mut snapshot = crate::fpga_diag::snapshot(request, crate::bosa::read_fpga_reg)?;
+    if before != registrations()? {
+        return Err(std::io::Error::other(
+            "ONU registration changed during FPGA diagnostic snapshot",
+        ));
+    }
+    static INSTANCE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    snapshot.daemon_instance = Some(
+        INSTANCE
+            .get_or_init(|| {
+                format!(
+                    "{}-{}",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos()
+                )
+            })
+            .clone(),
+    );
+    for onu in &mut snapshot.onus {
+        onu.generation = before
+            .get(&onu.slot)
+            .and_then(|registered| registered.as_ref())
+            .and_then(|(_, generation)| *generation);
+    }
+    Ok(snapshot)
+}
+
 fn ipc_handler(
     devices: Arc<Mutex<Vec<SubDevice>>>,
     pon_engine: Arc<Mutex<PonEngine>>,
@@ -555,6 +620,22 @@ fn ipc_handler(
                 let _ = request;
                 let _ = stream.write_all(b"{\"schema_version\":1,\"error\":{\"code\":\"adapter_disabled\",\"message\":\"HL202 adapter not compiled\"}}");
             }
+        } else if let Some(request) = line.strip_prefix("FPGA_DIAG ") {
+            let result = serde_json::from_str::<crate::fpga_diag::Request>(request)
+                .map_err(std::io::Error::other)
+                .and_then(|request| fpga_diagnostic_snapshot(&request, &pon_engine, &services));
+            match result {
+                Ok(snapshot) => {
+                    let _ = serde_json::to_writer(&mut stream, &snapshot);
+                }
+                Err(error) => {
+                    let _ = serde_json::to_writer(
+                        &mut stream,
+                        &serde_json::json!({"schema_version": 1, "error": error.to_string()}),
+                    );
+                }
+            }
+            let _ = stream.write_all(b"\n");
         } else if let Some(request) = line.strip_prefix("FEC_PM ") {
             let result = serde_json::from_str::<super::fec::Command>(request)
                 .map_err(std::io::Error::other)

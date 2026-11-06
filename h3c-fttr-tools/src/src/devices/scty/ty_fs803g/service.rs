@@ -245,6 +245,19 @@ pub fn configure(id: u8, cancellation: Option<Arc<AtomicBool>>) -> io::Result<()
     println!("SCTY_TY_FS803G_TR069_BOOTSTRAP id={id} instance={TY_FS803G_VEIP_ENDPOINT:04x}");
     crate::controller::management::bootstrap(&mut session, id, TY_FS803G_VEIP_ENDPOINT);
 
+    // Current miniOLT DBRu-driven scheduling leaves this model with report-only
+    // grants. A bounded measured floor permits upstream traffic while leaving
+    // most shared upstream bandwidth available to other ONUs. Keep this policy
+    // model-local; the platform lease preserves it across temporary diagnostics.
+    lease.set_business_grant_floor(1300)?;
+    // The measured two-byte OMCC polling allocation causes receive errors when
+    // followed by this ONU's business allocation. A 60-byte allocation preserved
+    // both IDs and eliminated BIP growth in bounded field comparisons. Persist
+    // it through the same reversible lease, and require the final OMCI GET below
+    // to succeed before committing ownership. This is not a proof of IP service.
+    lease.set_management_grant_floor(60)?;
+    println!("SCTY_TY_FS803G_BUSINESS_GRANT_FLOOR id={id} bytes=1300");
+
     verify(&mut session, 256, 0, 0x8000, &vendor_bytes)?;
     println!(
         "SCTY_TY_FS803G_BRIDGE_SERVICE_READBACK_OK gem={port:04x} veip={TY_FS803G_VEIP_ENDPOINT:04x}"
