@@ -71,9 +71,15 @@ struct TestOptics {
     desired: bool,
     save_failure: bool,
     enable_failure_after_write: bool,
+    saved_settings: Option<fttr_api::OpticalSettings>,
 }
 
 impl OpticalBackend for TestOptics {
+    fn save_settings(&mut self, settings: fttr_api::OpticalSettings) -> io::Result<()> {
+        self.save(settings.enabled)?;
+        self.saved_settings = Some(settings);
+        Ok(())
+    }
     fn desired(&self) -> io::Result<bool> {
         Ok(self.desired)
     }
@@ -120,6 +126,48 @@ impl OpticalBackend for TestOptics {
             Ok(self.tx)
         }
     }
+}
+
+#[test]
+fn grouped_optical_settings_are_saved_by_the_owner_and_expired_requests_never_save() {
+    let mut actor = OpticalActor {
+        state: OpticalState::Enabled,
+    };
+    let mut backend = TestOptics {
+        ready: true,
+        desired: true,
+        tx: true,
+        ..Default::default()
+    };
+    let settings = fttr_api::OpticalSettings {
+        enabled: true,
+        downstream_tx_enabled: false,
+        fec_enabled: true,
+    };
+    let (reply, _) = std::sync::mpsc::sync_channel(1);
+    let mut request = OpticalRequest {
+        command: OpticalCommand::Set(settings),
+        reply,
+        deadline: Instant::now() + Duration::from_secs(1),
+    };
+    assert_eq!(
+        actor.dispatch(&request, &mut backend, &AtomicBool::new(false))["status"],
+        "success"
+    );
+    assert_eq!(backend.saved_settings, Some(settings));
+    // A settings-only update does not unnecessarily reset the optical owner.
+    assert!(!backend.events.contains(&"quiesce"));
+    request.command = OpticalCommand::Set(fttr_api::OpticalSettings {
+        enabled: false,
+        ..settings
+    });
+    request.deadline = Instant::now() - Duration::from_secs(1);
+    assert_eq!(
+        actor.dispatch(&request, &mut backend, &AtomicBool::new(false))["status"],
+        "error"
+    );
+    assert_eq!(backend.saved_settings, Some(settings));
+    assert!(backend.tx);
 }
 
 #[test]

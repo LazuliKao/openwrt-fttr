@@ -1,3 +1,8 @@
+config optical 'optical'
+	option enabled '1'
+	option downstream_tx_enabled '1'
+	option fec_enabled '0'
+
 config acs 'acs'
 	option enabled '1'
 	option port '7547'
@@ -5,8 +10,7 @@ config acs 'acs'
 
 config provisioning 'provisioning'
 	option enabled '1'
-	option allow_unsupported_as_bridge '0'
-	option fec_enabled '0'
+	option allow_unsupported_as_bridge '1'
 	option mode 'manual'
 	option freshness '180'
 	option interval_minutes '30'

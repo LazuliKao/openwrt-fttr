@@ -1,5 +1,7 @@
 //! Verified HL202 service configuration; verify each accepted write by GET.
+use crate::controller::business as me;
 use crate::controller::business::{assign_tcont, create_gem, create_verified, verify};
+use crate::pon_engine::omci::attributes::AttributeValue as V;
 use crate::pon_engine::omci::{
     error::is_unknown_instance,
     platform::leases::{lock_onu, ChannelLease, StockOmccLease},
@@ -141,7 +143,7 @@ pub fn configure(
     if let Some(token) = cancellation {
         session.cancel_when(token);
     }
-    let _lease = StockOmccLease::open(id)?;
+    let mut lease = StockOmccLease::open(id)?;
     let port = 0x100u16 + id as u16;
     let _channel = ChannelLease::open(id, 0)?;
     if restore_initial {
@@ -198,44 +200,63 @@ pub fn configure(
     println!("STOCK_FTTR_AUTH_STATUS_READBACK_OK; existing credentials matched");
     // Assign Alloc-ID 0x100+ONU-ID to T-CONT 0x8000.
     // Create GAL profile 1 and bridge profile 1 first.
-    create_verified(&mut session, 272, 1, &[0, 48], 0x8000, &[0, 48])?;
-    let bridge = [0, 1, 0, 0x80, 0, 0x14, 0, 2, 0, 0x0f, 0, 0];
-    create_verified(&mut session, 45, 1, &bridge, 0xe000, &[0, 1, 0])?;
+    create_verified(&mut session, 272, 1, &me::gal(), &[1])?;
+    create_verified(&mut session, 45, 1, &me::bridge_profile(), &[1, 2, 3])?;
     assign_tcont(&mut session, 0x8000, port)?;
     // Use GEM-ID=0x100+ONU-ID, bidirectional, with queue pointers 0.
     // Bind MAC-bridged GEM interworking option 1 to bridge 1/GAL 1.
     create_gem(&mut session, port, port, 0x8000, 1, 1)?;
     retire_previous_ani(&mut session, port)?;
     // First Ethernet UNI from the actual MIB is 0x0101, not ONU-ID.
-    let uni = [0, 1, 1, 1, 1, 1, 0, 0, 0, 1, 0, 0, 0];
-    create_verified(&mut session, 47, 1, &uni, 0xf000, &uni[..6])?;
+    create_verified(
+        &mut session,
+        47,
+        1,
+        &me::bridge_port(1, 1, 1, 0x101),
+        &[1, 2, 3, 4],
+    )?;
     if session.get(47, port, 0x4000).is_ok() {
-        session.set(47, port, 0x4000, &[6])?;
+        session.set_attributes(47, port, &[(2, V::number(6))])?;
     }
-    let mut network = vec![0, 1, 6, 5];
-    network.extend(port.to_be_bytes());
-    network.extend([0, 0, 0, 1, 0, 0, 0]);
-    create_verified(&mut session, 47, port, &network, 0xf000, &network[..6])?;
+    create_verified(
+        &mut session,
+        47,
+        port,
+        &me::bridge_port(1, 6, 5, port),
+        &[1, 2, 3, 4],
+    )?;
     for index in 2..=4u16 {
         let pointer = 0x100 + index;
-        let mut uni = vec![0, 1, index as u8, 1];
-        uni.extend(pointer.to_be_bytes());
-        uni.extend([0, 0, 0, 1, 0, 0, 0]);
-        create_verified(&mut session, 47, index, &uni, 0xf000, &uni[..6])?;
+        create_verified(
+            &mut session,
+            47,
+            index,
+            &me::bridge_port(1, index as u8, 1, pointer),
+            &[1, 2, 3, 4],
+        )?;
     }
     // Bridge the MIB-discovered VEIP using TP type 11.
-    session.set(47, port, 0x4000, &[6])?;
+    session.set_attributes(47, port, &[(2, V::number(6))])?;
     verify(&mut session, 47, port, 0x4000, &[6])?;
-    let veip = [0, 1, 5, 11, 4, 1, 0, 0, 0, 1, 0, 0, 0];
-    create_verified(&mut session, 47, 5, &veip, 0xf000, &veip[..6])?;
+    create_verified(
+        &mut session,
+        47,
+        5,
+        &me::bridge_port(1, 5, 11, 0x401),
+        &[1, 2, 3, 4],
+    )?;
     for index in 1..=5u16 {
         let association = if index == 5 { 10 } else { 2 };
         let pointer = if index == 5 { 0x401u16 } else { 0x100 + index };
-        let mut attrs = vec![association];
-        attrs.extend(pointer.to_be_bytes());
-        create_verified(&mut session, 171, index, &attrs, 0x8200, &attrs)?;
+        create_verified(
+            &mut session,
+            171,
+            index,
+            &me::evto(association, pointer),
+            &[1, 7],
+        )?;
         // Use downstream transparent forwarding; do not guess a VLAN rule.
-        session.set(171, index, 0x0800, &[1])?;
+        session.set_attributes(171, index, &[(5, V::number(1))])?;
         verify(&mut session, 171, index, 0x0800, &[1])?;
         if transparent {
             let before = session.get_table(171, index, 0x0400)?;
@@ -250,7 +271,7 @@ pub fn configure(
                     for word in [outer, inner, 0x000f0000, 0x000f0000] {
                         row.extend(word.to_be_bytes());
                     }
-                    session.set(171, index, 0x0400, &row)?;
+                    session.set_attributes(171, index, &[(6, V::octets(&row))])?;
                     expected.extend(row);
                 }
                 let actual = session.get_table(171, index, 0x0400)?;
@@ -278,7 +299,7 @@ pub fn configure(
     // This HL202 rejects GET of the entry-count attribute (mask 0x2000,
     // result 9 with unsupported-mask 0x2000). Validate the supported list
     // and forward-operation attributes; do not treat the rejected GET as success.
-    create_verified(&mut session, 84, port, &[0; 26], 0xc000, &[0; 25])?;
+    create_verified(&mut session, 84, port, &me::vlan_filter(), &[1, 2])?;
     println!("STOCK_ANI_VLAN_FILTER_READBACK_OK instance={port:04x}; entry-count GET unsupported");
     println!("RESULT OMCI_service_entities_readback=true data_plane_verified=false");
     crate::controller::management::bootstrap(&mut session, id, 0x401);
@@ -313,5 +334,7 @@ pub fn configure(
             println!("OMCC_HEARTBEAT_OK channel={channel:04x}; data plane still requires packet evidence");
         }
     }
+    lease.disarm();
+    println!("HL202_LEASE_PERSISTED id={id}");
     Ok(())
 }

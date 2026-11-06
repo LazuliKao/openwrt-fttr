@@ -329,6 +329,10 @@ pub fn select_with_serial(
                 zte::profile(vendor, equipment, serial).unwrap_or(zte::Profile::G1612),
             );
         }
+        #[cfg(feature = "device-scty")]
+        if crate::provisioning::is_device_adapter(sn, "scty") {
+            return Adapter::Scty;
+        }
     }
     #[cfg(feature = "device-hl202")]
     if hl202::matches(vendor, equipment) {

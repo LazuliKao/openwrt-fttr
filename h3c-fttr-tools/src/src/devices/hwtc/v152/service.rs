@@ -30,7 +30,14 @@ pub(in crate::devices::hwtc) fn after_bridge(session: &mut OmciSession) -> io::R
     let before = session.get(329, 0x601, 0x8000)?;
     println!("V152_VEIP_ADMIN_BEFORE={}", before.payload[3]);
     if before.payload[3] != 0 {
-        session.set(329, 0x601, 0x8000, &[0])?;
+        session.set_attributes(
+            329,
+            0x601,
+            &[(
+                1,
+                crate::pon_engine::omci::attributes::AttributeValue::number(0),
+            )],
+        )?;
     }
     verify(session, 329, 0x601, 0x8000, &[0])?;
     // CurrentAddress is 0080; 00f8 includes current IP/mask/gateway/DNS.

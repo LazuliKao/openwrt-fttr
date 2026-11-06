@@ -117,6 +117,101 @@ fn active_operation_rejects_replacement_before_pruning() {
 }
 
 #[test]
+fn reload_queues_latest_revision_without_pruning_and_activates_after_drain() {
+    let mut c = configured();
+    c.operations
+        .insert("child".into(), operation(OperationPhase::Writing, false));
+    let old_revision = c.config.revision.clone();
+    c.config_error = Some("old reload error".into());
+    let mut config = c.config.clone();
+    config.revision = "next".into();
+    c.request_config(config.clone());
+    assert_eq!(c.config.revision, old_revision);
+    assert!(c.config_error.is_none());
+    assert_eq!(c.snapshot()["config_load"]["state"], "waiting");
+    assert_eq!(
+        c.snapshot()["config_load"]["blocking_operations"][0]["operation_id"],
+        c.operations["child"].id
+    );
+    assert!(c
+        .start("child", false, false)
+        .unwrap_err()
+        .contains("reload pending"));
+    config.revision = "latest".into();
+    c.request_config(config);
+    assert!(!c.activate_pending_config());
+    c.operations.get_mut("child").unwrap().complete(100);
+    c.attempts.insert("child".into(), 4);
+    c.next_retry_at.insert("child".into(), u64::MAX);
+    assert!(c.activate_pending_config());
+    assert_eq!(c.config.revision, "latest");
+    assert!(c.pending_config.is_none());
+    assert!(c.attempts.is_empty());
+    assert!(c.next_retry_at.is_empty());
+    assert!(c.owned.contains_key("id"));
+    assert_eq!(c.snapshot()["config_load"]["state"], "applied");
+    let wire: fttr_api::ConfigLoadStatus = serde_json::from_value(c.config_load_view()).unwrap();
+    assert_eq!(wire.requested_revision, "latest");
+}
+
+#[test]
+fn unstarted_offline_operations_do_not_delay_reload_but_started_work_does() {
+    let mut c = configured();
+    let mut unstarted = operation(OperationPhase::Waiting, false);
+    unstarted.task = None;
+    c.operations.insert("child".into(), unstarted);
+    let mut next = c.config.clone();
+    next.revision = "next".into();
+    c.request_config(next);
+    assert_eq!(c.config.revision, "next");
+    assert_eq!(c.operations["child"].stage, OperationPhase::Completed);
+
+    let mut op = operation(OperationPhase::Waiting, false);
+    op.work_started = true;
+    c.operations.insert("child".into(), op);
+    let mut next = c.config.clone();
+    next.revision = "latest".into();
+    c.request_config(next);
+    assert_eq!(c.config.revision, "next");
+    assert!(c.pending_config.is_some());
+}
+
+#[test]
+fn reverting_to_active_revision_cancels_queued_reload_and_interrupted_is_terminal() {
+    let mut c = configured();
+    c.operations
+        .insert("child".into(), operation(OperationPhase::Writing, false));
+    let active = c.config.clone();
+    let mut next = active.clone();
+    next.revision = "next".into();
+    c.request_config(next.clone());
+    c.request_config(active);
+    assert!(c.pending_config.is_none());
+    c.operations.get_mut("child").unwrap().stage = OperationPhase::Interrupted;
+    c.request_config(next);
+    assert_eq!(c.config.revision, "next");
+    assert!(c.pending_config.is_none());
+}
+
+#[test]
+fn unstarted_command_job_is_superseded_without_duplicate_item_results() {
+    let mut c = configured();
+    let mut op = operation(OperationPhase::Waiting, false);
+    op.task = None;
+    op.device.provisioning_method = "command".into();
+    c.config.devices[0] = op.device.clone();
+    c.operations.insert("child".into(), op);
+    let mut next = c.config.clone();
+    next.revision = "next".into();
+    c.request_config(next);
+    assert_eq!(c.config.revision, "next");
+    let view = c.operations["child"].view();
+    assert_eq!(view["items"].as_array().unwrap().len(), 1);
+    assert_eq!(view["items"][0]["state"], "blocked");
+    assert!(c.operations["child"].command_job.is_none());
+}
+
+#[test]
 fn unchanged_device_preserves_cleanup_ownership_on_reload() {
     let mut c = configured();
     let mut config = c.config.clone();

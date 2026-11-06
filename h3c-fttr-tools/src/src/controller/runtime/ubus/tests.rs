@@ -23,7 +23,12 @@ fn invalid_native_write_requests_never_reach_the_handler() {
     }
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     assert_eq!(
-        handler(&name, Some(&json!({"enabled": false, "bridge": "br-test"}))),
+        handler(
+            &name,
+            Some(
+                &json!({"enabled": false, "bridge": "br-test", "wan_upstream": false, "wan_downstream": false, "onu_bridge": true})
+            )
+        ),
         Ok(json!({"status": "success", "enabled": false}))
     );
     assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -37,7 +42,7 @@ fn native_dispatch_preserves_ubus_and_business_errors_without_retrying() {
         assert_eq!(calls.fetch_add(1, Ordering::SeqCst), 0);
         Err(4)
     });
-    let request = json!({"enabled": true, "bridge": "br-test"});
+    let request = json!({"enabled": true, "bridge": "br-test", "wan_upstream": false, "wan_downstream": false, "onu_bridge": true});
     assert_eq!(handler("npu_set", Some(&request)), Err(4));
 
     let (_, handler) = bind(&NPU_SET, |_| {

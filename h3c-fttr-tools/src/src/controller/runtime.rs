@@ -29,6 +29,7 @@ use fttr_api::{OpticalAction, OpticalError, OpticalReply, OpticalState, ReplySta
 
 #[derive(Clone, Copy)]
 enum OpticalCommand {
+    Set(fttr_api::OpticalSettings),
     On,
     Off,
     Status,
@@ -40,6 +41,7 @@ enum OpticalCommand {
 impl OpticalCommand {
     fn action(self) -> OpticalAction {
         match self {
+            Self::Set(_) => OpticalAction::OpticalReload,
             Self::On => OpticalAction::OpticalOn,
             Self::Off => OpticalAction::OpticalOff,
             Self::Status => OpticalAction::OpticalStatus,
@@ -61,6 +63,8 @@ impl OpticalReplyExt for OpticalReply {
     }
     fn unavailable(command: OpticalCommand, ready: bool, error: io::Error) -> serde_json::Value {
         Self {
+            settings: None,
+            pon_mac: None,
             schema_version: 1,
             status: ReplyStatus::Error,
             action: command.action(),
@@ -139,6 +143,15 @@ impl OpticalClient {
 }
 
 trait OpticalBackend {
+    fn save_settings(&mut self, _settings: fttr_api::OpticalSettings) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "optical settings are not writable",
+        ))
+    }
+    fn mac_tx_allowed(&self) -> bool {
+        true
+    }
     fn ready(&self) -> bool;
     fn cleanup_pending(&self) -> bool;
     fn quiesce(&mut self) -> io::Result<()>;
@@ -200,6 +213,15 @@ impl OpticalActor {
             ))
         } else {
             match command {
+                OpticalCommand::Set(settings) => match backend.save_settings(settings) {
+                    Ok(()) => return self.handle(OpticalCommand::Reload, backend),
+                    Err(error) => {
+                        let mut reply = self.handle(OpticalCommand::Status, backend);
+                        reply["status"] = "error".into();
+                        reply["error"] = serde_json::json!({"code":"Configuration", "message":error.to_string()});
+                        return reply;
+                    }
+                },
                 OpticalCommand::On
                 | OpticalCommand::Off
                 | OpticalCommand::Reload
@@ -327,6 +349,8 @@ impl OpticalActor {
             result => result,
         };
         OpticalReply {
+            settings: Some(crate::optical::settings()),
+            pon_mac: Some(super::pon_mac::snapshot()),
             schema_version: 1,
             status: if result.is_ok() {
                 ReplyStatus::Success
@@ -339,6 +363,7 @@ impl OpticalActor {
             actor_state: self.state,
             hardware_ready: backend.ready(),
             discovery_active: backend.ready()
+                && backend.mac_tx_allowed()
                 && self.state == OpticalState::Enabled
                 && !backend.cleanup_pending(),
             cleanup_pending: backend.cleanup_pending(),
@@ -390,6 +415,12 @@ impl RuntimeOptics<'_> {
 }
 
 impl OpticalBackend for RuntimeOptics<'_> {
+    fn save_settings(&mut self, settings: fttr_api::OpticalSettings) -> io::Result<()> {
+        crate::optical::save(settings)
+    }
+    fn mac_tx_allowed(&self) -> bool {
+        super::pon_mac::snapshot().tx_enabled == Some(true)
+    }
     fn ready(&self) -> bool {
         self.ready
     }
@@ -691,6 +722,15 @@ fn initialize_hardware(stopping: &AtomicBool) -> io::Result<OpticalState> {
         stopping,
         || {
             bosa::configure_discovery_timing()?;
+            let (tx, fec) = super::pon_mac::desired();
+            let applied = bosa::set_gpon_downstream(tx, fec);
+            super::pon_mac::record(
+                applied
+                    .as_ref()
+                    .map(|value| *value)
+                    .map_err(|error| io::Error::other(error.to_string())),
+            );
+            applied?;
             setup_bridge();
             for id in 0..crate::pon_engine::ONU_SLOTS {
                 clear_offline_hardware(id)?;
@@ -803,6 +843,9 @@ async fn run_async() {
             let mut services = super::service::Services::new(service_states);
             let mut grant_cycle = 0usize;
             let mut optics = OpticalActor { state };
+            let mut mac_allowed = false;
+            let mut last_mac_poll = Instant::now() - Duration::from_secs(2);
+            let mut last_mac_desired = None;
             loop {
                 let ready = hardware_ready.load(Ordering::Acquire);
                 {
@@ -817,8 +860,24 @@ async fn run_async() {
                             eprintln!("[-] Optical reply receiver unavailable: {error}");
                         }
                     }
+                    if last_mac_poll.elapsed() >= Duration::from_secs(1) {
+                        if let Err(error) = crate::optical::refresh() {
+                            eprintln!("[-] Optical configuration: {error}");
+                        }
+                    }
+                    let desired = super::pon_mac::desired();
+                    if ready && !stopping.load(Ordering::Acquire)
+                        && (last_mac_poll.elapsed() >= Duration::from_secs(1) || last_mac_desired != Some(desired))
+                    {
+                        // Invalidate workers and carrier before stopping GPON transmission.
+                        // Even failed cleanup must still permit disabling the MAC.
+                        let result = super::pon_mac::apply(desired, || backend.quiesce(), bosa::set_gpon_downstream);
+                        mac_allowed = super::pon_mac::record(result);
+                        last_mac_poll = Instant::now();
+                        last_mac_desired = Some(desired);
+                    }
                 }
-                if stopping.load(Ordering::Acquire) || !ready || optics.state != OpticalState::Enabled {
+                if stopping.load(Ordering::Acquire) || !ready || !mac_allowed || optics.state != OpticalState::Enabled {
                     thread::sleep(Duration::from_millis(10));
                     continue;
                 }

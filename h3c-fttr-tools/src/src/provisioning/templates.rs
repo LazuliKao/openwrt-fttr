@@ -68,7 +68,7 @@ pub fn compile(text: &str) -> Result<Config, String> {
             return Err(format!("unsupported section: {}", s.kind));
         }
         let allowed: &[&str] = match s.kind.as_str() {
-            "optical" => &["enabled"],
+            "optical" => &["enabled", "downstream_tx_enabled", "fec_enabled"],
             "device" => &[
                 "name",
                 "optical_sn",
@@ -111,7 +111,6 @@ pub fn compile(text: &str) -> Result<Config, String> {
             "provisioning" => &[
                 "enabled",
                 "allow_unsupported_as_bridge",
-                "fec_enabled",
                 "mode",
                 "trigger",
                 "interval_minutes",
@@ -422,10 +421,10 @@ pub fn compile(text: &str) -> Result<Config, String> {
         d.items
             .sort_by_key(|i| order[&d.id].iter().position(|id| id == &i.id).unwrap());
     }
-    // Do not include listener credentials in the business revision.
+    // Listener credentials and owner-managed optical policy do not schedule business sync.
     let mut canonical = String::new();
     for (id, s) in &all {
-        if s.kind != "acs" {
+        if s.kind != "acs" && s.kind != "optical" {
             let mut business = s.clone();
             if business.kind == "device" {
                 business.options.remove("onu_id");
@@ -600,13 +599,21 @@ mod tests {
 
     use crate::provisioning::model::ItemKind;
     #[test]
-    fn global_fec_policy_survives_validation_and_changes_revision() {
-        let disabled = super::compile("config provisioning 'global'\n").unwrap();
-        let enabled =
-            super::compile("config provisioning 'global'\n option fec_enabled '1'\n").unwrap();
-        assert!(!disabled.fec_enabled);
-        assert!(enabled.fec_enabled);
-        assert_ne!(disabled.revision, enabled.revision);
+    fn optical_policy_does_not_change_business_revision_and_legacy_fields_are_rejected() {
+        let disabled =
+            super::compile("config optical 'optical'\n option fec_enabled '0'\n").unwrap();
+        let enabled = super::compile("config optical 'optical'\n option fec_enabled '1'\n option downstream_tx_enabled '0'\n").unwrap();
+        assert_eq!(disabled.revision, enabled.revision);
+        for key in [
+            "fec_enabled",
+            "downstream_tx_enabled",
+            "downstream_fec_enabled",
+        ] {
+            assert!(super::compile(&format!(
+                "config provisioning 'global'\n option {key} '1'\n"
+            ))
+            .is_err());
+        }
     }
 
     #[test]

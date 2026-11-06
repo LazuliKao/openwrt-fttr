@@ -13,7 +13,7 @@ pub(in crate::controller) fn start(id: u8, token: Arc<AtomicBool>) {
         let mut collector = Collector::new(id, token.clone());
         let mut next = Instant::now();
         while !token.load(Ordering::Acquire) && !crate::runtime::is_stopping() {
-            if Instant::now() >= next {
+            if Instant::now() >= next || collector.configuration_changed() {
                 let work = crate::runtime::spawn_blocking(move || {
                     let result = (|| -> std::io::Result<()> {
                         let _owner = lock_onu(id)?;

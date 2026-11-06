@@ -8,7 +8,9 @@
 //! - Bridge Port instance: 0x0201 (port_num 1)
 //! - EVTO instance: 0x0201
 //! - ME 340 (TR-069) instance: 0x0301
+use crate::controller::business as me;
 use crate::controller::business::{assign_tcont, create_verified_lenient, verify};
+use crate::pon_engine::omci::attributes::AttributeValue as V;
 use crate::pon_engine::omci::{
     platform::leases::{lock_onu, ChannelLease, StockOmccLease},
     FmcsTransport, OmciSession,
@@ -39,7 +41,7 @@ pub fn configure(id: u8, cancellation: Option<Arc<AtomicBool>>) -> io::Result<()
     if let Some(token) = cancellation {
         session.cancel_when(token);
     }
-    let _lease = StockOmccLease::open(id)?;
+    let mut lease = StockOmccLease::open(id)?;
     let _channel = ChannelLease::open(id, 0)?;
 
     let port = 0x100u16 + id as u16;
@@ -61,7 +63,7 @@ pub fn configure(id: u8, cancellation: Option<Arc<AtomicBool>>) -> io::Result<()
     );
 
     // Set ONU-G credential status=1 if supported
-    let _ = session.set(256, 0, 0x0010, &[1]);
+    let _ = session.set_attributes(256, 0, &[(12, V::number(1))]);
 
     // Retire stale ANI/GEM entries from other slots
     retire_stale_ani(&mut session, port);
@@ -74,26 +76,19 @@ pub fn configure(id: u8, cancellation: Option<Arc<AtomicBool>>) -> io::Result<()
     }
 
     // GAL Ethernet profile (ME 272)
-    if let Err(error) = create_verified_lenient(
-        &mut session,
-        272,
-        G1612_GAL_PROFILE,
-        &[0, 48],
-        0x8000,
-        &[0, 48],
-    ) {
+    if let Err(error) =
+        create_verified_lenient(&mut session, 272, G1612_GAL_PROFILE, &me::gal(), &[1])
+    {
         println!("ZTE_G1612_GAL_REUSED instance={G1612_GAL_PROFILE:04x}: {error}");
     }
 
     // MAC Bridge Service Profile (ME 45)
-    let bridge_data = [0, 1, 0, 0x80, 0, 0x14, 0, 2, 0, 0x0f, 0, 0];
     if let Err(error) = create_verified_lenient(
         &mut session,
         45,
         G1612_BRIDGE_PROFILE,
-        &bridge_data,
-        0xe000,
-        &[0, 1, 0],
+        &me::bridge_profile(),
+        &[1, 2, 3],
     ) {
         println!("ZTE_G1612_BRIDGE_PROFILE_REUSED instance={G1612_BRIDGE_PROFILE:04x}: {error}");
     }
@@ -110,25 +105,27 @@ pub fn configure(id: u8, cancellation: Option<Arc<AtomicBool>>) -> io::Result<()
 
     // Uplink ANI Bridge Port (ME 47, tp=5 GEM IW TP, port_num=6)
     let ani_port_num = 6u8;
-    let mut network = G1612_BRIDGE_PROFILE.to_be_bytes().to_vec();
-    network.push(ani_port_num);
-    network.push(5);
-    network.extend(port.to_be_bytes());
-    network.extend([0, 0, 0, 1, 0, 0, 0]);
-    create_verified_lenient(&mut session, 47, port, &network, 0xf000, &network[..6])?;
+    create_verified_lenient(
+        &mut session,
+        47,
+        port,
+        &me::bridge_port(G1612_BRIDGE_PROFILE, ani_port_num, 5, port),
+        &[1, 2, 3, 4],
+    )?;
 
     // Optional VLAN Tagging Filter Data (ME 84)
-    let _ = create_verified_lenient(&mut session, 84, port, &[0; 26], 0xc000, &[0; 25]);
+    let _ = create_verified_lenient(&mut session, 84, port, &me::vlan_filter(), &[1, 2]);
 
     // Check or create VEIP Bridge Port (ME 47 instance 0x0201)
     let bp_inst = G1612_VEIP_BP;
     if session.get(47, bp_inst, 0x8000).is_err() {
-        let mut attrs = G1612_BRIDGE_PROFILE.to_be_bytes().to_vec();
-        attrs.push(1); // port_num 1
-        attrs.push(11); // tp_type 11 (VEIP)
-        attrs.extend(G1612_VEIP_ENDPOINT.to_be_bytes());
-        attrs.extend([0, 0, 0, 1, 0, 0, 0]);
-        create_verified_lenient(&mut session, 47, bp_inst, &attrs, 0xf000, &attrs[..6])?;
+        create_verified_lenient(
+            &mut session,
+            47,
+            bp_inst,
+            &me::bridge_port(G1612_BRIDGE_PROFILE, 1, 11, G1612_VEIP_ENDPOINT),
+            &[1, 2, 3, 4],
+        )?;
         println!("ZTE_G1612_VEIP_BP_CREATED instance={bp_inst:04x}");
     } else {
         println!("ZTE_G1612_VEIP_BP_REUSED instance={bp_inst:04x}");
@@ -137,16 +134,20 @@ pub fn configure(id: u8, cancellation: Option<Arc<AtomicBool>>) -> io::Result<()
     // Check or create EVTO (ME 171 instance 0x0201)
     let evto_inst = G1612_VEIP_EVTO;
     if session.get(171, evto_inst, 0x8000).is_err() {
-        let mut evto = vec![10]; // association type 10 (VEIP)
-        evto.extend(G1612_VEIP_ENDPOINT.to_be_bytes());
-        create_verified_lenient(&mut session, 171, evto_inst, &evto, 0x8200, &evto)?;
+        create_verified_lenient(
+            &mut session,
+            171,
+            evto_inst,
+            &me::evto(10, G1612_VEIP_ENDPOINT),
+            &[1, 7],
+        )?;
         println!("ZTE_G1612_EVTO_CREATED instance={evto_inst:04x}");
     } else {
         println!("ZTE_G1612_EVTO_REUSED instance={evto_inst:04x}");
     }
 
     // Downstream mode transparent
-    match session.set(171, evto_inst, 0x0800, &[1]) {
+    match session.set_attributes(171, evto_inst, &[(5, V::number(1))]) {
         Ok(()) => {
             let _ = verify(&mut session, 171, evto_inst, 0x0800, &[1]);
         }
@@ -165,6 +166,8 @@ pub fn configure(id: u8, cancellation: Option<Arc<AtomicBool>>) -> io::Result<()
 
     verify(&mut session, 256, 0, 0x8000, &vendor_bytes)?;
     println!("ZTE_G1612_BRIDGE_SERVICE_READBACK_OK gem={port:04x} veip={G1612_VEIP_ENDPOINT:04x}");
+    lease.disarm();
+    println!("ZTE_G1612_LEASE_PERSISTED id={id}");
     Ok(())
 }
 
@@ -188,33 +191,28 @@ fn create_gem_port(
     bridge: u16,
     gal: u16,
 ) -> io::Result<()> {
-    let mut ctp = Vec::with_capacity(16);
-    ctp.extend(port.to_be_bytes());
-    ctp.extend(tcont.to_be_bytes());
-    ctp.push(3);
-    ctp.extend(tcont.to_be_bytes());
-    ctp.extend([0, 0]);
-    ctp.push(0);
-    ctp.extend([0, 0]);
-    ctp.push(0);
-    ctp.extend([0, 0]);
-    ctp.push(0);
-    create_verified_lenient(session, 268, instance, &ctp, 0xe000, &ctp[..5])?;
+    create_verified_lenient(
+        session,
+        268,
+        instance,
+        &me::gem_ctp(port, tcont, tcont),
+        &[1, 2, 3],
+    )?;
     match session.get(268, instance, 0x1000) {
-        Ok(frame) if frame.payload.get(3..5) != Some(&ctp[5..7]) => {
-            session.set(268, instance, 0x1000, &ctp[5..7])?;
+        Ok(frame) if frame.payload[3..5] != tcont.to_be_bytes() => {
+            session.set_attributes(268, instance, &[(4, V::number(tcont.into()))])?;
             println!("GEM_UPSTREAM_TM_REPAIRED instance={instance:04x} tcont={tcont:04x}");
         }
         Ok(_) => {}
         Err(_) => {}
     }
-    let mut iw = Vec::new();
-    iw.extend(instance.to_be_bytes());
-    iw.push(1);
-    iw.extend(bridge.to_be_bytes());
-    iw.extend([0, 0]);
-    iw.extend(gal.to_be_bytes());
-    create_verified_lenient(session, 266, instance, &iw, 0xf200, &iw)
+    create_verified_lenient(
+        session,
+        266,
+        instance,
+        &me::gem_iw(instance, bridge, gal),
+        &[1, 2, 3, 4, 7],
+    )
 }
 
 fn apply_transparent_evto_table(session: &mut OmciSession, instance: u16) -> io::Result<()> {
@@ -230,7 +228,7 @@ fn apply_transparent_evto_table(session: &mut OmciSession, instance: u16) -> io:
                 .into_iter()
                 .flat_map(u32::to_be_bytes)
                 .collect();
-            session.set(171, instance, 0x0400, &row)?;
+            session.set_attributes(171, instance, &[(6, V::octets(&row))])?;
             expected.extend(row);
         }
         if session.get_table(171, instance, 0x0400)? != expected {

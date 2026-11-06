@@ -173,6 +173,68 @@ impl OmciSession {
         let (mask, data) = AttributeCodec::encode(def, values, AttributeContext::SetRequest)?;
         self.set(class_id, entity_id, mask, &data)
     }
+    pub fn create_attributes(
+        &mut self,
+        class_id: u16,
+        entity_id: u16,
+        values: &[(u8, AttributeValue)],
+    ) -> io::Result<()> {
+        let def = MeRegistry::get(class_id)
+            .filter(|d| d.layout_supported)
+            .ok_or_else(|| invalid("no complete ME layout"))?;
+        let (_, data) = AttributeCodec::encode(def, values, AttributeContext::CreateRequest)?;
+        self.create(class_id, entity_id, &data)
+    }
+    pub fn read_attributes(
+        &mut self,
+        class_id: u16,
+        entity_id: u16,
+        indices: &[u8],
+    ) -> io::Result<AttributeBlock> {
+        let def = MeRegistry::get(class_id)
+            .filter(|d| d.layout_supported && d.actions.contains(&9))
+            .ok_or_else(|| invalid("no complete readable ME layout"))?;
+        self.get_attributes(
+            class_id,
+            entity_id,
+            AttributeCodec::read_mask(def, indices)?,
+        )
+    }
+    /// Compare exact encoded octets, including fixed-width string padding. Never log values.
+    pub fn verify_attributes(
+        &mut self,
+        class_id: u16,
+        entity_id: u16,
+        values: &[(u8, AttributeValue)],
+    ) -> io::Result<()> {
+        let def = MeRegistry::get(class_id)
+            .filter(|d| d.layout_supported)
+            .ok_or_else(|| invalid("no complete ME layout"))?;
+        let indices: Vec<_> = values.iter().map(|(index, _)| *index).collect();
+        AttributeCodec::read_mask(def, &indices)?;
+        let expected: Vec<_> = values
+            .iter()
+            .map(|(index, value)| {
+                AttributeCodec::encode_value(def.attribute(*index).unwrap(), value)
+                    .map(|bytes| (*index, super::wire::hex(&bytes)))
+            })
+            .collect::<io::Result<_>>()?;
+        let block = self.read_attributes(class_id, entity_id, &indices)?;
+        for (index, expected) in expected {
+            let attr = def.attribute(index).unwrap();
+            if !block
+                .attributes
+                .iter()
+                .any(|a| a.definition.index == index && a.raw_hex == expected)
+            {
+                return Err(invalid(format!(
+                    "readback mismatch class={class_id} instance={entity_id:04x} attribute={}",
+                    attr.name
+                )));
+            }
+        }
+        Ok(())
+    }
     pub fn set(&mut self, class_id: u16, entity_id: u16, mask: u16, data: &[u8]) -> io::Result<()> {
         let frame = self.request(
             Action::Set,

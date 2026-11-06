@@ -23,8 +23,10 @@ fn optical_wire_enums_and_boolean_input_are_strict() {
         assert!(serde_json::from_str::<OpticalSetRequest>(invalid).is_err());
     }
     assert!(
-        !serde_json::from_str::<OpticalSetRequest>("{\"enabled\":false}")
-            .unwrap()
-            .enabled
+        !serde_json::from_str::<OpticalSetRequest>(
+            "{\"enabled\":false,\"downstream_tx_enabled\":true,\"fec_enabled\":false}"
+        )
+        .unwrap()
+        .enabled
     );
 }

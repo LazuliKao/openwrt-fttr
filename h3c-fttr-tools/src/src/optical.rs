@@ -30,6 +30,57 @@ fn claim_owner_at(path: &std::path::Path) -> io::Result<File> {
 
 const CONFIG: &str = "/etc/config/fttr";
 
+pub fn settings() -> fttr_api::OpticalSettings {
+    cache().read().unwrap().settings
+}
+
+pub fn fec_generation() -> u64 {
+    cache().read().unwrap().generation
+}
+
+struct Configuration {
+    settings: fttr_api::OpticalSettings,
+    generation: u64,
+}
+
+pub fn fec_enabled() -> bool {
+    let settings = settings();
+    settings.enabled && settings.downstream_tx_enabled && settings.fec_enabled
+}
+
+fn cache() -> &'static std::sync::RwLock<Configuration> {
+    static CACHE: std::sync::OnceLock<std::sync::RwLock<Configuration>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| {
+        std::sync::RwLock::new(Configuration {
+            generation: 0,
+            settings: fttr_api::OpticalSettings {
+                enabled: false,
+                downstream_tx_enabled: false,
+                fec_enabled: false,
+            },
+        })
+    })
+}
+
+pub fn refresh() -> io::Result<fttr_api::OpticalSettings> {
+    let settings = load_settings_from(std::path::Path::new(CONFIG));
+    let next = settings
+        .as_ref()
+        .copied()
+        .unwrap_or(fttr_api::OpticalSettings {
+            enabled: false,
+            downstream_tx_enabled: false,
+            fec_enabled: false,
+        });
+    let mut state = cache().write().unwrap();
+    if state.settings != next {
+        state.generation = state.generation.wrapping_add(1);
+        state.settings = next;
+    }
+    settings
+}
+
 struct UciSession {
     dir: PathBuf,
     conf_dir: PathBuf,
@@ -50,25 +101,35 @@ impl UciSession {
                 std::env::temp_dir().join(format!("fttr-optical-{}-{nonce}", std::process::id()));
             match fs::DirBuilder::new().mode(0o700).create(&path) {
                 Ok(()) => {
-                    let conf_dir = path.join("config");
-                    let delta_dir = path.join("delta");
-                    fs::create_dir(&conf_dir)?;
-                    fs::create_dir(&delta_dir)?;
-                    let package = format!("optical_{}_{stamp}_{nonce}", std::process::id());
-                    fs::write(conf_dir.join(&package), &original)?;
-                    let mut uci =
-                        openwrt_uci::Uci::new().map_err(|e| io::Error::other(e.to_string()))?;
-                    uci.set_confdir(&conf_dir)
-                        .map_err(|e| io::Error::other(e.to_string()))?;
-                    uci.set_savedir(&delta_dir)
-                        .map_err(|e| io::Error::other(e.to_string()))?;
-                    return Ok(Self {
-                        dir: path,
-                        conf_dir,
-                        package,
-                        original,
-                        uci,
-                    });
+                    let setup = (|| -> io::Result<Self> {
+                        let conf_dir = path.join("config");
+                        let delta_dir = path.join("delta");
+                        fs::create_dir(&conf_dir)?;
+                        fs::create_dir(&delta_dir)?;
+                        let package = format!("optical_{}_{stamp}_{nonce}", std::process::id());
+                        fs::write(conf_dir.join(&package), &original)?;
+                        let mut uci = openwrt_uci::Uci::new()
+                            .map_err(|e| io::Error::other(format!("Uci::new: {e}")))?;
+                        uci.set_confdir(&conf_dir)
+                            .map_err(|e| io::Error::other(format!("set_confdir: {e}")))?;
+                        uci.set_savedir(&delta_dir)
+                            .map_err(|e| io::Error::other(format!("set_savedir: {e}")))?;
+                        Ok(Self {
+                            dir: path.clone(),
+                            conf_dir,
+                            package,
+                            original,
+                            uci,
+                        })
+                    })();
+                    match setup {
+                        Ok(session) => return Ok(session),
+                        Err(e) => {
+                            let _ = fs::remove_dir_all(&path);
+                            eprintln!("[-] UciSession setup failed at {path:?}: {e}");
+                            return Err(e);
+                        }
+                    }
                 }
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
                 Err(e) => return Err(e),
@@ -77,26 +138,27 @@ impl UciSession {
         Err(io::Error::other("cannot allocate optical UCI savedir"))
     }
 
-    fn load(&mut self) -> io::Result<bool> {
+    fn load(&mut self) -> io::Result<fttr_api::OpticalSettings> {
         let text = self
             .uci
             .export_package(&self.package)
             .map_err(|e| io::Error::other(e.to_string()))?;
-        parse_export(&text)
+        parse_settings(&text)
     }
 
-    fn set_optical(&mut self, enabled: bool) -> io::Result<()> {
+    fn set_optical(&mut self, settings: fttr_api::OpticalSettings) -> io::Result<()> {
         self.uci
             .ensure_section(&self.package, "optical", "optical")
             .map_err(|e| io::Error::other(e.to_string()))?;
-        self.uci
-            .set(
-                &self.package,
-                "optical",
-                "enabled",
-                if enabled { "1" } else { "0" },
-            )
-            .map_err(|e| io::Error::other(e.to_string()))?;
+        for (key, value) in [
+            ("enabled", settings.enabled),
+            ("downstream_tx_enabled", settings.downstream_tx_enabled),
+            ("fec_enabled", settings.fec_enabled),
+        ] {
+            self.uci
+                .set(&self.package, "optical", key, if value { "1" } else { "0" })
+                .map_err(|e| io::Error::other(e.to_string()))?;
+        }
         self.uci
             .commit(&self.package)
             .map_err(|e| io::Error::other(e.to_string()))?;
@@ -110,45 +172,37 @@ impl Drop for UciSession {
 }
 
 pub fn load_enabled() -> io::Result<bool> {
-    load_enabled_from(std::path::Path::new(CONFIG))
+    refresh().map(|settings| settings.enabled)
 }
 
 pub fn load_enabled_from(config_path: &std::path::Path) -> io::Result<bool> {
-    if !config_path.exists() {
-        return Ok(true);
-    }
-    let original = fs::read(config_path)?;
-    // Create an isolated temporary session without reading shared /tmp/.uci deltas
-    let temp_dir = std::env::temp_dir().join(format!("fttr-optical-load-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&temp_dir);
-    fs::create_dir_all(&temp_dir)?;
-    let conf_dir = temp_dir.join("config");
-    let delta_dir = temp_dir.join("delta");
-    fs::create_dir_all(&conf_dir)?;
-    fs::create_dir_all(&delta_dir)?;
-    let package = "fttr";
-    fs::write(conf_dir.join(package), &original)?;
+    load_settings_from(config_path).map(|settings| settings.enabled)
+}
 
-    let res = (|| -> io::Result<bool> {
-        let mut uci = openwrt_uci::Uci::new().map_err(|e| io::Error::other(e.to_string()))?;
-        uci.set_confdir(&conf_dir)
-            .map_err(|e| io::Error::other(e.to_string()))?;
-        uci.set_savedir(&delta_dir)
-            .map_err(|e| io::Error::other(e.to_string()))?;
-        let text = uci
-            .export_package(package)
-            .map_err(|e| io::Error::other(e.to_string()))?;
-        parse_export(&text)
-    })();
-    let _ = fs::remove_dir_all(&temp_dir);
-    res
+pub fn load_settings_from(config_path: &std::path::Path) -> io::Result<fttr_api::OpticalSettings> {
+    if !config_path.exists() {
+        return parse_settings("");
+    }
+    UciSession::new(config_path)?.load()
 }
 
 pub fn save_enabled(enabled: bool) -> io::Result<()> {
     save_at(std::path::Path::new(CONFIG), enabled)
 }
 
+pub fn save(settings: fttr_api::OpticalSettings) -> io::Result<()> {
+    save_settings_at(std::path::Path::new(CONFIG), Some(settings), None)
+}
+
 fn save_at(config: &std::path::Path, enabled: bool) -> io::Result<()> {
+    save_settings_at(config, None, Some(enabled))
+}
+
+fn save_settings_at(
+    config: &std::path::Path,
+    settings: Option<fttr_api::OpticalSettings>,
+    enabled: Option<bool>,
+) -> io::Result<()> {
     let source = OpenOptions::new().read(true).write(true).open(config)?;
     if unsafe { libc::flock(source.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         return Err(io::Error::new(
@@ -158,11 +212,15 @@ fn save_at(config: &std::path::Path, enabled: bool) -> io::Result<()> {
     }
     let mut session = UciSession::new(config)?;
     let current = session.load()?;
-    if current == enabled {
+    let mut settings = settings.unwrap_or(current);
+    if let Some(enabled) = enabled {
+        settings.enabled = enabled;
+    }
+    if current == settings {
         return Ok(());
     }
-    session.set_optical(enabled)?;
-    if session.load()? != enabled {
+    session.set_optical(settings)?;
+    if session.load()? != settings {
         return Err(io::Error::other("optical configuration readback mismatch"));
     }
     let bytes = fs::read(session.conf_dir.join(&session.package))?;
@@ -210,9 +268,18 @@ fn replace_config(
 }
 
 pub(crate) fn parse_export(text: &str) -> io::Result<bool> {
+    parse_settings(text).map(|settings| settings.enabled)
+}
+
+pub(crate) fn parse_settings(text: &str) -> io::Result<fttr_api::OpticalSettings> {
     let mut optical = false;
+    let mut provisioning = false;
     let mut seen = false;
-    let mut enabled = true; // Upgrade compatibility: old configurations have no optical section.
+    let mut settings = fttr_api::OpticalSettings {
+        enabled: true,
+        downstream_tx_enabled: true,
+        fec_enabled: false,
+    };
     for line in text.lines() {
         let words = crate::provisioning::uci_words(line).map_err(io::Error::other)?;
         match words.first().map(String::as_str) {
@@ -220,6 +287,7 @@ pub(crate) fn parse_export(text: &str) -> io::Result<bool> {
                 let kind = words.get(1).map(String::as_str);
                 let name = words.get(2).map(String::as_str);
                 optical = kind == Some("optical");
+                provisioning = kind == Some("provisioning");
                 if optical {
                     if seen || name != Some("optical") {
                         return Err(io::Error::other(
@@ -232,25 +300,51 @@ pub(crate) fn parse_export(text: &str) -> io::Result<bool> {
                 }
             }
             Some("option" | "list")
-                if optical && words.get(1).map(String::as_str) == Some("enabled") =>
+                if provisioning
+                    && words.get(1).is_some_and(|key| {
+                        matches!(
+                            key.as_str(),
+                            "fec_enabled" | "downstream_tx_enabled" | "downstream_fec_enabled"
+                        )
+                    }) =>
             {
-                enabled = match (words[0].as_str(), words.get(2).map(String::as_str)) {
+                return Err(io::Error::other(
+                    "optical controls must be configured in fttr.optical, not provisioning",
+                ));
+            }
+            Some("option" | "list") if optical => {
+                let key = words.get(1).map(String::as_str).unwrap_or("");
+                let value = match (words[0].as_str(), words.get(2).map(String::as_str)) {
                     ("option", Some("1")) => true,
                     ("option", Some("0")) => false,
-                    _ => return Err(io::Error::other("fttr.optical.enabled must be 0 or 1")),
+                    _ => {
+                        return Err(io::Error::other(format!(
+                            "fttr.optical.{key} must be 0 or 1"
+                        )))
+                    }
                 };
+                match key {
+                    "enabled" => settings.enabled = value,
+                    "downstream_tx_enabled" => settings.downstream_tx_enabled = value,
+                    "fec_enabled" => settings.fec_enabled = value,
+                    _ => {
+                        return Err(io::Error::other(format!(
+                            "unsupported optical option {key}"
+                        )))
+                    }
+                }
             }
             _ => (),
         }
     }
-    Ok(enabled)
+    Ok(settings)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
-    fn old_configuration_and_strict_optical_settings() {
+    fn optical_defaults_and_strict_settings() {
         assert!(parse_export("package fttr\nconfig acs 'acs'\n option enabled '0'\n").unwrap());
         assert!(!parse_export("config optical 'optical'\n option enabled '0'\n").unwrap());
         assert!(parse_export("config optical 'optical'\n option enabled '1'\n").unwrap());
@@ -260,8 +354,30 @@ mod tests {
             "config optical 'optical'\noption enabled 'yes'",
             "config optical 'optical'\nlist enabled '1'",
             "config optical 'optical'\nconfig optical 'optical'",
+            "config optical 'optical'\noption downstream_fec_enabled '1'",
+            "config provisioning 'provisioning'\noption fec_enabled '1'",
+            "config provisioning 'provisioning'\noption downstream_tx_enabled '0'",
+            "config provisioning 'provisioning'\noption downstream_fec_enabled '1'",
         ] {
             assert!(parse_export(text).is_err(), "{text}");
+        }
+    }
+
+    #[test]
+    fn grouped_optical_controls_keep_subordinate_intent_and_defaults() {
+        let defaults = parse_settings("").unwrap();
+        assert!(defaults.enabled && defaults.downstream_tx_enabled && !defaults.fec_enabled);
+        for mask in 0..8 {
+            let text = format!("config optical 'optical'\noption enabled '{}'\noption downstream_tx_enabled '{}'\noption fec_enabled '{}'\n", mask & 1, (mask >> 1) & 1, (mask >> 2) & 1);
+            let settings = parse_settings(&text).unwrap();
+            assert_eq!(settings.enabled, mask & 1 != 0);
+            assert_eq!(settings.downstream_tx_enabled, mask & 2 != 0);
+            assert_eq!(settings.fec_enabled, mask & 4 != 0);
+        }
+        for key in ["enabled", "downstream_tx_enabled", "fec_enabled"] {
+            assert!(
+                parse_settings(&format!("config optical 'optical'\noption {key} 'yes'\n")).is_err()
+            );
         }
     }
 

@@ -140,7 +140,83 @@ impl Controller {
         }
     }
 
+    fn config_blocked(&self) -> bool {
+        self.operations.values().any(|op| {
+            !matches!(
+                op.stage,
+                OperationPhase::Completed | OperationPhase::Interrupted
+            )
+        }) || self
+            .config
+            .devices
+            .iter()
+            .any(|d| self.resets.blocks(&d.optical_sn))
+    }
+
+    pub(super) fn request_config(&mut self, config: Config) {
+        if config.revision == self.config.revision {
+            self.pending_config = None;
+            self.config_error = None;
+            return;
+        }
+        // Never wait for an offline device's old, entirely unstarted plan.
+        // Once discovery or a transport job starts, its owner must drain it.
+        for op in self.operations.values_mut().filter(|op| {
+            !op.work_started
+                && op.index == 0
+                && op.task.is_none()
+                && op.submission.is_none()
+                && op.command_job.is_none()
+                && matches!(
+                    op.stage,
+                    OperationPhase::Waiting | OperationPhase::WanReconciling
+                )
+        }) {
+            op.supersede_remaining();
+            self.dirty = true;
+        }
+        // Repeated reloads of the same revision retain the original wait time.
+        let requested_at = self
+            .pending_config
+            .as_ref()
+            .filter(|(previous, _)| previous.revision == config.revision)
+            .map_or_else(now, |(_, at)| *at);
+        self.pending_config = Some((config, requested_at));
+        self.config_error = None;
+        self.activate_pending_config();
+    }
+
+    pub(super) fn activate_pending_config(&mut self) -> bool {
+        if self.pending_config.is_none() || self.config_blocked() {
+            return false;
+        }
+        let (config, _) = self.pending_config.take().unwrap();
+        // The controller mutex covers both the eligibility check and replacement.
+        self.replace_config(config)
+            .expect("configuration eligibility checked under lock");
+        self.config_error = None;
+        self.failure = None;
+        self.attempts.clear();
+        self.next_retry_at.clear();
+        true
+    }
+
+    pub(super) fn config_load_view(&self) -> Value {
+        let blockers: Vec<_> = self.operations.values()
+            .filter(|op| !matches!(op.stage, OperationPhase::Completed | OperationPhase::Interrupted))
+            .map(|op| json!({"operation_id":op.id,"device":op.device.id,"state":op.stage,"started_at":op.started}))
+            .collect();
+        json!({"state":if self.pending_config.is_some() {"waiting"} else {"applied"},
+            "requested_revision":self.pending_config.as_ref().map_or(&self.config.revision, |(cfg, _)| &cfg.revision),
+            "requested_at":self.pending_config.as_ref().map(|(_, at)| at),
+            "blocking_operations":blockers,
+            "reset_pending":self.config.devices.iter().any(|d| self.resets.blocks(&d.optical_sn))})
+    }
+
     pub(super) fn replace_config(&mut self, mut config: Config) -> Result<(), String> {
+        if self.pending_config.is_some() {
+            return Err("configuration reload pending; wait for automatic activation".into());
+        }
         if self
             .config
             .devices
@@ -149,11 +225,12 @@ impl Controller {
         {
             return Err("device reset pending; retry reset before reload".into());
         }
-        if self
-            .operations
-            .values()
-            .any(|op| op.stage != OperationPhase::Completed)
-        {
+        if self.operations.values().any(|op| {
+            !matches!(
+                op.stage,
+                OperationPhase::Completed | OperationPhase::Interrupted
+            )
+        }) {
             return Err("active synchronization: finish operation before reload".into());
         }
         for device in &mut config.devices {

@@ -1,6 +1,8 @@
 //! Generic standard G.988 OMCI transparent bridge profile.
 use super::inventory::BridgeInventory;
+use crate::controller::business as me;
 use crate::controller::business::{assign_tcont, create_verified_lenient, verify};
+use crate::pon_engine::omci::attributes::AttributeValue as V;
 use crate::pon_engine::omci::{
     platform::leases::{lock_onu, ChannelLease, StockOmccLease},
     FmcsTransport, OmciSession,
@@ -32,7 +34,7 @@ pub(crate) fn configure_with_evto(
     if let Some(token) = cancellation {
         session.cancel_when(token);
     }
-    let _lease = StockOmccLease::open(id)?;
+    let mut lease = StockOmccLease::open(id)?;
     let _channel = ChannelLease::open(id, 0)?;
 
     let port = 0x100u16 + id as u16;
@@ -80,7 +82,7 @@ pub(crate) fn configure_with_evto(
     );
 
     // Set ONU-G credential status=1 if supported; ignore if rejected in SN mode
-    let _ = session.set(256, 0, 0x0010, &[1]);
+    let _ = session.set_attributes(256, 0, &[(12, V::number(1))]);
 
     // T-CONT allocation. Some ONUs refuse to rewrite Alloc-ID; the GEM port can
     // still be created against the existing T-CONT, so a refusal is not fatal.
@@ -89,7 +91,7 @@ pub(crate) fn configure_with_evto(
     }
 
     // GAL Ethernet profile (ME 272): reuse a factory profile when present.
-    if let Err(error) = create_verified_lenient(&mut session, 272, 1, &[0, 48], 0x8000, &[0, 48]) {
+    if let Err(error) = create_verified_lenient(&mut session, 272, 1, &me::gal(), &[1]) {
         println!("GENERIC_GAL_REUSED instance=0001: {error}");
     }
 
@@ -101,14 +103,12 @@ pub(crate) fn configure_with_evto(
     } else {
         1u16
     };
-    let bridge_data = [0, 1, 0, 0x80, 0, 0x14, 0, 2, 0, 0x0f, 0, 0];
     if let Err(error) = create_verified_lenient(
         &mut session,
         45,
         bridge_inst,
-        &bridge_data,
-        0xe000,
-        &[0, 1, 0],
+        &me::bridge_profile(),
+        &[1, 2, 3],
     ) {
         println!("GENERIC_BRIDGE_PROFILE_REUSED instance={bridge_inst:04x}: {error}");
     }
@@ -131,15 +131,16 @@ pub(crate) fn configure_with_evto(
             .find(|number| !inventory.used_port_numbers.contains(number))
             .unwrap_or(6),
     };
-    let mut network = bridge_inst.to_be_bytes().to_vec();
-    network.push(ani_port_num);
-    network.push(5);
-    network.extend(port.to_be_bytes());
-    network.extend([0, 0, 0, 1, 0, 0, 0]);
-    create_verified_lenient(&mut session, 47, port, &network, 0xf000, &network[..6])?;
+    create_verified_lenient(
+        &mut session,
+        47,
+        port,
+        &me::bridge_port(bridge_inst, ani_port_num, 5, port),
+        &[1, 2, 3, 4],
+    )?;
 
     // Optional VLAN Tagging Filter Data (ME 84)
-    let _ = create_verified_lenient(&mut session, 84, port, &[0; 26], 0xc000, &[0; 25]);
+    let _ = create_verified_lenient(&mut session, 84, port, &me::vlan_filter(), &[1, 2]);
 
     let mut used_port_numbers = inventory.used_port_numbers.clone();
     used_port_numbers.push(ani_port_num);
@@ -169,12 +170,18 @@ pub(crate) fn configure_with_evto(
                         io::Error::new(io::ErrorKind::AlreadyExists, "no free bridge port number")
                     })?;
                 let instance = 0x200u16 + u16::from(port_num);
-                let mut attrs = bridge_inst.to_be_bytes().to_vec();
-                attrs.push(port_num);
-                attrs.push(if is_veip { 11 } else { 1 });
-                attrs.extend(endpoint.to_be_bytes());
-                attrs.extend([0, 0, 0, 1, 0, 0, 0]);
-                create_verified_lenient(&mut session, 47, instance, &attrs, 0xf000, &attrs[..6])?;
+                create_verified_lenient(
+                    &mut session,
+                    47,
+                    instance,
+                    &me::bridge_port(
+                        bridge_inst,
+                        port_num,
+                        if is_veip { 11 } else { 1 },
+                        endpoint,
+                    ),
+                    &[1, 2, 3, 4],
+                )?;
                 used_port_numbers.push(port_num);
                 instance
             }
@@ -190,13 +197,17 @@ pub(crate) fn configure_with_evto(
                 instance
             }
             None => {
-                let mut evto = vec![if is_veip { 10 } else { 2 }];
-                evto.extend(endpoint.to_be_bytes());
-                create_verified_lenient(&mut session, 171, bp_inst, &evto, 0x8200, &evto)?;
+                create_verified_lenient(
+                    &mut session,
+                    171,
+                    bp_inst,
+                    &me::evto(if is_veip { 10 } else { 2 }, endpoint),
+                    &[1, 7],
+                )?;
                 bp_inst
             }
         };
-        match session.set(171, evto_inst, 0x0800, &[1]) {
+        match session.set_attributes(171, evto_inst, &[(5, V::number(1))]) {
             Ok(()) => {
                 let _ = verify(&mut session, 171, evto_inst, 0x0800, &[1]);
             }
@@ -229,6 +240,8 @@ pub(crate) fn configure_with_evto(
         "GENERIC_BRIDGE_SERVICE_READBACK_OK gem={port:04x} endpoints={:?}; data evidence still required",
         inventory.endpoints
     );
+    lease.disarm();
+    println!("GENERIC_LEASE_PERSISTED id={id}");
     Ok(())
 }
 
@@ -247,38 +260,30 @@ fn create_gem_port(
     bridge: u16,
     gal: u16,
 ) -> io::Result<()> {
-    // 1 Port-ID, 2 T-CONT pointer, 3 Direction, 4 TM pointer upstream,
-    // 5 TD profile upstream, 6 UNI counter, 7 priority queue downstream,
-    // 8 encryption state, 9 TD profile downstream, 10 encryption key ring.
-    let mut ctp = Vec::with_capacity(16);
-    ctp.extend(port.to_be_bytes());
-    ctp.extend(tcont.to_be_bytes());
-    ctp.push(3);
-    ctp.extend(tcont.to_be_bytes());
-    ctp.extend([0, 0]);
-    ctp.push(0);
-    ctp.extend([0, 0]);
-    ctp.push(0);
-    ctp.extend([0, 0]);
-    ctp.push(0);
-    create_verified_lenient(session, 268, instance, &ctp, 0xe000, &ctp[..5])?;
+    create_verified_lenient(
+        session,
+        268,
+        instance,
+        &me::gem_ctp(port, tcont, tcont),
+        &[1, 2, 3],
+    )?;
     // Earlier firmware created this GEM port with TM pointer 0. Repair it when
     // the ONU lets us read the attribute; ignore ONUs that reject the mask.
     match session.get(268, instance, 0x1000) {
-        Ok(frame) if frame.payload[3..5] != ctp[5..7] => {
-            session.set(268, instance, 0x1000, &ctp[5..7])?;
+        Ok(frame) if frame.payload[3..5] != tcont.to_be_bytes() => {
+            session.set_attributes(268, instance, &[(4, V::number(tcont.into()))])?;
             println!("GEM_UPSTREAM_TM_REPAIRED instance={instance:04x} tcont={tcont:04x}");
         }
         Ok(_) => {}
         Err(_) => {}
     }
-    let mut iw = Vec::new();
-    iw.extend(instance.to_be_bytes());
-    iw.push(1);
-    iw.extend(bridge.to_be_bytes());
-    iw.extend([0, 0]);
-    iw.extend(gal.to_be_bytes());
-    create_verified_lenient(session, 266, instance, &iw, 0xf200, &iw)
+    create_verified_lenient(
+        session,
+        266,
+        instance,
+        &me::gem_iw(instance, bridge, gal),
+        &[1, 2, 3, 4, 7],
+    )
 }
 
 fn apply_transparent_evto_table(session: &mut OmciSession, instance: u16) -> io::Result<()> {
@@ -294,7 +299,7 @@ fn apply_transparent_evto_table(session: &mut OmciSession, instance: u16) -> io:
                 .into_iter()
                 .flat_map(u32::to_be_bytes)
                 .collect();
-            session.set(171, instance, 0x0400, &row)?;
+            session.set_attributes(171, instance, &[(6, V::octets(&row))])?;
             expected.extend(row);
         }
         if session.get_table(171, instance, 0x0400)? != expected {

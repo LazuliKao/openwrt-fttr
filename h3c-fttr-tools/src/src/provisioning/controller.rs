@@ -84,6 +84,7 @@ pub(crate) fn wake_device(device: &str) {
 
 #[derive(Clone)]
 struct Operation {
+    work_started: bool,
     command_job: Option<crate::devices::command_provisioning::Job>,
     command_result: Option<Value>,
     full_sync: bool,
@@ -117,6 +118,7 @@ struct Controller {
     pub(super) dirty: bool,
     resets: reset::Resets,
     config: Config,
+    pending_config: Option<(Config, u64)>,
     failure: Option<String>,
     config_error: Option<String>,
     next_id: u64,
@@ -140,10 +142,6 @@ static CONTROLLER: OnceLock<Mutex<Controller>> = OnceLock::new();
 fn controller() -> &'static Mutex<Controller> {
     CONTROLLER.get_or_init(|| Mutex::new(Controller::default()))
 }
-pub(crate) fn fec_enabled() -> bool {
-    controller().lock().unwrap().config.fec_enabled
-}
-
 pub(crate) fn allows_generic_bridge(serial: &str) -> bool {
     let c = controller().lock().unwrap();
     if c.config.allow_unsupported_as_bridge {
@@ -246,6 +244,9 @@ impl Controller {
         management: bool,
         item: Option<&str>,
     ) -> Result<Vec<u64>, String> {
+        if self.pending_config.is_some() {
+            return Err("configuration reload pending; new synchronization will use the latest configuration".into());
+        }
         if apply && !self.config.enabled {
             return Err("provisioning disabled by UCI".into());
         }
@@ -353,6 +354,7 @@ impl Controller {
         let mut status = self.business_snapshot();
         status["onu_pins"] = json!(self.config.onu_pins);
         status["config_error"] = json!(self.config_error);
+        status["config_load"] = self.config_load_view();
         status
     }
 
@@ -495,16 +497,13 @@ pub fn control(request: &str) -> String {
                 Ok(json!({"valid":true,"revision":cfg.revision,"devices":cfg.devices.len()}))
             }
             "reload" => {
-                let cfg = config::load().inspect_err(|error| {
-                    controller().lock().unwrap().config_error = Some(error.clone());
-                })?;
                 let mut c = controller().lock().unwrap();
-                if let Err(error) = c.replace_config(cfg) {
+                let cfg = config::load().inspect_err(|error| {
+                    // An invalid newer commit must not activate an older queued revision.
+                    c.pending_config = None;
                     c.config_error = Some(error.clone());
-                    return Err(error);
-                }
-                c.config_error = None;
-                c.failure = None;
+                })?;
+                c.request_config(cfg);
                 // The scheduler compares each device's operation revision with
                 // the desired revision. One unavailable device must not consume
                 // the config-change trigger for every other device.

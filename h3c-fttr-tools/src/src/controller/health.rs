@@ -369,7 +369,12 @@ fn run(
         // Establish the link using the bounded health GET before starting a
         // potentially slow full MIB upload. Otherwise an ONU needing DHCP can
         // remain closed for the entire inventory collection.
-        if carrier_lease.is_some() && Instant::now() >= next_telemetry {
+        if carrier_lease.is_some()
+            && (Instant::now() >= next_telemetry
+                || telemetry
+                    .as_ref()
+                    .is_some_and(|collector| collector.configuration_changed()))
+        {
             if let Some(collector) = telemetry.as_mut() {
                 let responsive = collector.refresh();
                 next_get = resume_after_omci(&mut last_get, &mut watchdog_start, responsive);

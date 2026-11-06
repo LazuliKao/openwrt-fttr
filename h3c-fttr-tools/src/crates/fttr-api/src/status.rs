@@ -1,5 +1,17 @@
 //! Owned status wire models. Nullable measurements never imply observed zero.
 use serde::{Deserialize, Serialize};
+
+/// Board-specific register readback, not proof of optical error correction.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
+pub struct PonMacStatus {
+    pub desired_tx_enabled: bool,
+    pub desired_fec_enabled: bool,
+    pub register: Option<u32>,
+    pub tx_enabled: Option<bool>,
+    pub fec_enabled: Option<bool>,
+    pub error: Option<String>,
+}
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

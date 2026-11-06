@@ -295,14 +295,7 @@ impl Handlers {
         optical(&self.optics, OpticalCommand::Status)
     }
     fn optical_set(&self, request: OpticalSetRequest) -> Result<OpticalReply, i32> {
-        optical(
-            &self.optics,
-            if request.enabled {
-                OpticalCommand::On
-            } else {
-                OpticalCommand::Off
-            },
-        )
+        optical(&self.optics, OpticalCommand::Set(request))
     }
     fn get_status(&self, _: EmptyRequest) -> Result<StatusReply, i32> {
         let provisioning =

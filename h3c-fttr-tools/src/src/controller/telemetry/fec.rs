@@ -1,4 +1,4 @@
-//! Read-only ONU downstream FEC PM. No inferred FPGA enable state or automatic CREATE.
+//! ONU downstream FEC PM, automatically prepared while optical FEC is enabled.
 use crate::pon_engine::omci::{attributes::AttributeBlock, OmciSession};
 use fttr_api::{FecPmCounters, FecStatus, MeasurementEvidence};
 use std::time::{Duration, Instant};
@@ -7,10 +7,11 @@ const MASK: u16 = 0xbe00;
 const SOURCE: &str = "OMCI GET class=312 (completed downstream 15-minute interval)";
 
 pub(super) fn unavailable(reason: impl Into<String>) -> FecStatus {
+    let mac = crate::controller::pon_mac::snapshot();
     FecStatus {
         ani_entity_id: None,
-        control_supported: false,
-        downstream_enabled: None,
+        control_supported: true,
+        downstream_enabled: mac.fec_enabled,
         upstream_enabled: None,
         downstream_pm: None,
         measurement: MeasurementEvidence::unavailable(SOURCE, "PM interval counters", reason),
@@ -35,11 +36,11 @@ impl Poll {
                 return unavailable(reason.clone());
             }
         }
-        // A missing PM instance is not proof of absent FEC support. Probing it does
-        // not change ONU configuration; failures back off independently of liveness.
+        // A missing PM instance is not proof of absent FEC support. Only result 5
+        // permits automatic preparation; failures back off independently of liveness.
         let result = session
             .with_timeout(Duration::from_secs(2), |session| {
-                session.get_attributes(312, ani, MASK)
+                read_counters(session, ani, crate::optical::fec_enabled())
             })
             .and_then(|block| {
                 let counters = parse(ani, &block)?;
@@ -64,11 +65,25 @@ impl Poll {
                 }
             }
             Err(error) => {
-                let reason = format!("pm_get_failed (support and enablement unknown): {error}");
+                let reason = format!("omci_fec_pm_unavailable: {error}");
                 self.retry = Some((Instant::now() + Duration::from_secs(300), reason.clone()));
                 unavailable(reason)
             }
         }
+    }
+}
+
+fn read_counters(
+    session: &mut OmciSession,
+    ani: u16,
+    create: bool,
+) -> std::io::Result<AttributeBlock> {
+    match session.get_attributes(312, ani, MASK) {
+        Err(error) if create && crate::pon_engine::omci::error::is_unknown_instance(&error) => {
+            super::super::fec::ensure_pm(session, ani, true)?;
+            session.get_attributes(312, ani, MASK)
+        }
+        result => result,
     }
 }
 
@@ -113,7 +128,7 @@ mod tests {
     }
     impl OmciTransport for Reply {
         fn send(&mut self, frame: &BaselineFrame) -> std::io::Result<()> {
-            // FEC collection must never silently create or set PM entities.
+            // Existing instances only require the counter GET, never a write.
             assert_eq!(frame.message_type, 0x49);
             assert_eq!(frame.class_id, 312);
             assert_eq!(&frame.payload[..2], &[0xbe, 0]);
@@ -158,7 +173,7 @@ mod tests {
         assert_eq!(counters.uncorrectable_code_words, 3);
         assert_eq!(counters.total_code_words, u32::MAX);
         assert_eq!(counters.fec_seconds, 4);
-        assert!(!status.control_supported);
+        assert!(status.control_supported);
         assert_eq!(status.downstream_enabled, None);
         assert_eq!(status.upstream_enabled, None);
         assert_eq!(sends.load(Ordering::Relaxed), 1);
@@ -186,5 +201,60 @@ mod tests {
             AttributeContext::GetResponse,
         );
         assert!(parse(0, &block).is_err());
+    }
+
+    #[test]
+    fn automatic_pm_preparation_creates_only_missing_instance_and_verifies_it() {
+        struct Missing {
+            pending: Option<BaselineFrame>,
+            created: bool,
+            result: u8,
+            requests: Arc<std::sync::Mutex<Vec<u8>>>,
+        }
+        impl OmciTransport for Missing {
+            fn send(&mut self, frame: &BaselineFrame) -> std::io::Result<()> {
+                assert_eq!(frame.class_id, 312);
+                assert_eq!(frame.instance_id, 0x8001);
+                self.requests.lock().unwrap().push(frame.message_type);
+                if frame.message_type == 0x44 {
+                    assert!(!self.created);
+                    assert_eq!(&frame.payload[..2], &[0, 0]);
+                    self.created = true;
+                }
+                self.pending = Some(frame.clone());
+                Ok(())
+            }
+            fn receive(&mut self) -> std::io::Result<Option<BaselineFrame>> {
+                Ok(self.pending.take().map(|mut frame| {
+                    let get = frame.message_type == 0x49;
+                    let mask = [frame.payload[0], frame.payload[1]];
+                    frame.message_type = if get { 0x29 } else { 0x24 };
+                    frame.payload = [0; 32];
+                    if get {
+                        frame.payload[0] = if self.created { 0 } else { self.result };
+                        frame.payload[1..3].copy_from_slice(&mask);
+                    }
+                    frame
+                }))
+            }
+        }
+        for (result, create, expected) in [
+            (5, true, vec![0x49, 0x49, 0x44, 0x49, 0x49]),
+            (5, false, vec![0x49]),
+            (4, true, vec![0x49]),
+            (2, true, vec![0x49]),
+            (0, true, vec![0x49]),
+        ] {
+            let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let mut session = OmciSession::new(Missing {
+                pending: None,
+                created: false,
+                result,
+                requests: requests.clone(),
+            });
+            let sample = read_counters(&mut session, 0x8001, create);
+            assert_eq!(sample.is_ok(), result == 0 || result == 5 && create);
+            assert_eq!(*requests.lock().unwrap(), expected);
+        }
     }
 }

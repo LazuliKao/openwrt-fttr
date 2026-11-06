@@ -57,6 +57,7 @@ impl Snapshot {
 }
 
 struct Cached {
+    fec_generation: u64,
     snapshot: Snapshot,
     at: Instant,
     token: Arc<AtomicBool>,
@@ -69,9 +70,10 @@ fn cache() -> &'static Mutex<BTreeMap<u8, Cached>> {
 
 pub(super) fn snapshot(id: u8, online: bool) -> Snapshot {
     let mut snapshot = cached_snapshot(id, online);
-    if !crate::provisioning::controller::fec_enabled() {
+    if !crate::optical::fec_enabled() {
         snapshot.fec = fec::unavailable("fec_support_disabled");
     }
+    snapshot.fec.downstream_enabled = super::pon_mac::snapshot().fec_enabled;
     snapshot
 }
 
@@ -88,6 +90,9 @@ fn cached_snapshot(id: u8, online: bool) -> Snapshot {
                 && sample.at.elapsed() < Duration::from_secs(90) =>
         {
             let mut snapshot = sample.snapshot.clone();
+            if sample.fec_generation != crate::optical::fec_generation() {
+                snapshot.fec = fec::unavailable("awaiting_current_fec_configuration");
+            }
             if snapshot.fec.measurement.age_seconds.is_some() {
                 snapshot.fec.measurement.age_seconds = Some(sample.at.elapsed().as_secs());
             }
@@ -107,9 +112,13 @@ pub(super) struct Collector {
     ani: Option<Result<u16, String>>,
     inventory: Option<inventory::InventorySample>,
     fec: fec::Poll,
+    fec_generation: u64,
 }
 
 impl Collector {
+    pub fn configuration_changed(&self) -> bool {
+        self.fec_generation != crate::optical::fec_generation()
+    }
     pub fn new(id: u8, token: Arc<AtomicBool>) -> Self {
         Self {
             id,
@@ -117,6 +126,7 @@ impl Collector {
             ani: None,
             inventory: None,
             fec: fec::Poll::default(),
+            fec_generation: crate::optical::fec_generation(),
         }
     }
 
@@ -154,6 +164,11 @@ impl Collector {
                 Err(_) => {}
             }
         }
+        let fec_generation = crate::optical::fec_generation();
+        if self.fec_generation != fec_generation {
+            self.fec = fec::Poll::default();
+            self.fec_generation = fec_generation;
+        }
         let snapshot = match FmcsTransport::open(self.id) {
             Ok(transport) => {
                 let mut session = OmciSession::new(transport);
@@ -179,8 +194,14 @@ impl Collector {
                         snapshot
                             .measurements
                             .insert("optical_tx_power_dbm".into(), evidence);
-                        session.finish_before(Instant::now() + Duration::from_secs(2));
-                        if crate::provisioning::controller::fec_enabled() {
+                        session.finish_before(Instant::now() + Duration::from_secs(8));
+                        if crate::optical::fec_enabled() {
+                            let id = self.id;
+                            session.guard_registration(move || {
+                                super::service::operation_confirmed(id)
+                                    && crate::optical::fec_enabled()
+                                    && crate::optical::fec_generation() == fec_generation
+                            });
                             snapshot.fec = self.fec.read(&mut session, *entity);
                         } else {
                             self.fec = fec::Poll::default();
@@ -214,6 +235,7 @@ impl Collector {
             cache.insert(
                 self.id,
                 Cached {
+                    fec_generation,
                     snapshot,
                     at: Instant::now(),
                     token: self.token.clone(),

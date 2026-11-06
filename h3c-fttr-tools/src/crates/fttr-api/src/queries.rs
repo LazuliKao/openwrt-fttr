@@ -12,6 +12,9 @@ pub struct StatusReply {
     #[cfg_attr(feature = "codegen", ts(optional))]
     pub onu_pinning: Option<crate::OnuPinning>,
     pub fpga_status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "codegen", ts(optional))]
+    pub pon_mac: Option<crate::PonMacStatus>,
     pub provisioning: Option<SyncStatusReply>,
     pub optical_transceiver: crate::OpticalTransceiverStatus,
     pub switch_ports: Vec<crate::SwitchPortStatus>,
@@ -48,6 +51,39 @@ pub struct SyncStatusReply {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "codegen", ts(optional = nullable))]
     pub config_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "codegen", ts(optional))]
+    pub config_load: Option<ConfigLoadStatus>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
+pub struct ConfigLoadStatus {
+    pub state: ConfigLoadState,
+    pub requested_revision: String,
+    #[cfg_attr(feature = "codegen", ts(type = "number | null"))]
+    pub requested_at: Option<u64>,
+    pub blocking_operations: Vec<ConfigLoadBlocker>,
+    pub reset_pending: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+#[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigLoadState {
+    Waiting,
+    Applied,
+}
+
+#[derive(Serialize, Deserialize)]
+#[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
+pub struct ConfigLoadBlocker {
+    #[cfg_attr(feature = "codegen", ts(type = "number"))]
+    pub operation_id: u64,
+    pub device: String,
+    pub state: crate::OperationPhase,
+    #[cfg_attr(feature = "codegen", ts(type = "number"))]
+    pub started_at: u64,
 }
 
 #[derive(Serialize, Deserialize)]

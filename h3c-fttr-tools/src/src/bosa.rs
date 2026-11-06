@@ -101,6 +101,19 @@ fn mci_file() -> io::Result<&'static std::fs::File> {
 }
 
 pub fn write_fpga_reg(addr: u32, val: u32) -> io::Result<()> {
+    let _guard = if addr == FPGA_GPON_CONTROL {
+        Some(
+            GPON_CONTROL_LOCK
+                .lock()
+                .map_err(|_| io::Error::other("GPON control lock poisoned"))?,
+        )
+    } else {
+        None
+    };
+    write_fpga_reg_unlocked(addr, val)
+}
+
+fn write_fpga_reg_unlocked(addr: u32, val: u32) -> io::Result<()> {
     #[cfg(unix)]
     {
         let file = mci_file()?;
@@ -118,6 +131,47 @@ pub fn write_fpga_reg(addr: u32, val: u32) -> io::Result<()> {
         let _ = (addr, val);
         Ok(())
     }
+}
+
+pub const FPGA_GPON_CONTROL: u32 = 0x01000004;
+const GPON_TX: u32 = 0x02;
+const GPON_FEC: u32 = 0x08;
+static GPON_CONTROL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Board-specific GPON control bits. Serializes in-process RMW with raw writes.
+/// External raw ioctl writers must not run concurrently with the daemon.
+pub fn set_gpon_downstream(tx: bool, fec: bool) -> io::Result<u32> {
+    let _guard = GPON_CONTROL_LOCK
+        .lock()
+        .map_err(|_| io::Error::other("GPON control lock poisoned"))?;
+    update_gpon_control(
+        tx,
+        fec,
+        || read_fpga_reg(FPGA_GPON_CONTROL),
+        |value| write_fpga_reg_unlocked(FPGA_GPON_CONTROL, value),
+    )
+}
+
+fn update_gpon_control(
+    tx: bool,
+    fec: bool,
+    mut read: impl FnMut() -> io::Result<u32>,
+    mut write: impl FnMut(u32) -> io::Result<()>,
+) -> io::Result<u32> {
+    let before = read()?;
+    let target = (before & !(GPON_TX | GPON_FEC))
+        | if tx { GPON_TX } else { 0 }
+        | if fec { GPON_FEC } else { 0 };
+    if before != target {
+        write(target)?;
+    }
+    let actual = read()?;
+    if actual != target {
+        return Err(io::Error::other(format!(
+            "GPON control readback mismatch: wanted {target:#010x}, got {actual:#010x}"
+        )));
+    }
+    Ok(actual)
 }
 
 /// Explicit driver mapping after a verified Alloc-ID channel transition.
@@ -1008,6 +1062,60 @@ pub fn set_fttr_carrier(onu_id: u32, carrier: bool) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn gpon_control_bits_are_independent_and_preserve_other_bits() {
+        use std::cell::Cell;
+        for tx in [false, true] {
+            for fec in [false, true] {
+                for before in [0, 2, 8, 10, 0xffff_ffff, 0xa5a5_5555] {
+                    let value = Cell::new(before);
+                    let actual = super::update_gpon_control(
+                        tx,
+                        fec,
+                        || Ok(value.get()),
+                        |v| {
+                            value.set(v);
+                            Ok(())
+                        },
+                    )
+                    .unwrap();
+                    assert_eq!(actual & !10, before & !10);
+                    assert_eq!(actual & 2 != 0, tx);
+                    assert_eq!(actual & 8 != 0, fec);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn gpon_control_rejects_readback_mismatch_and_transport_errors() {
+        assert!(super::update_gpon_control(true, true, || Ok(0), |_| Ok(())).is_err());
+        assert!(super::update_gpon_control(
+            true,
+            true,
+            || Err(std::io::Error::other("read failed")),
+            |_| panic!("must not write without baseline")
+        )
+        .is_err());
+        assert!(super::update_gpon_control(
+            true,
+            true,
+            || Ok(0),
+            |_| Err(std::io::Error::other("write failed"))
+        )
+        .is_err());
+        assert_eq!(
+            super::update_gpon_control(
+                true,
+                true,
+                || Ok(10),
+                |_| panic!("unchanged state must not write")
+            )
+            .unwrap(),
+            10
+        );
+    }
+
     use super::*;
 
     #[test]

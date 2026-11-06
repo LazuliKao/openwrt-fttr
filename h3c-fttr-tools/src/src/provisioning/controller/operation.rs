@@ -48,6 +48,7 @@ impl Operation {
         let wan = wan::Reconciler::new(&device, BTreeMap::new(), false);
         let wifi = wifi::Reconciler::new(&device, wifi::Registry::default(), false);
         Self {
+            work_started: false,
             command_job: None,
             command_result: None,
             full_sync: true,
@@ -124,6 +125,17 @@ impl Operation {
         self.submission = None;
         self.stage = OperationPhase::Completed;
         self.completed_at.get_or_insert(time);
+    }
+
+    pub(super) fn supersede_remaining(&mut self) {
+        if self.device.backend() == "command" && self.command_result.is_none() {
+            self.command_result = Some(json!({"items":[]}));
+        }
+        for item in self.device.items.iter().skip(self.index) {
+            self.results.insert(item.id.clone(), json!({"id":item.id,"kind":item.kind,"service_type":item.service_type,"state":"blocked","reason":"superseded at a safe boundary by a newer configuration","revision":self.revision}));
+        }
+        self.index = self.device.items.len();
+        self.complete(now());
     }
 
     pub(super) fn view(&self) -> Value {

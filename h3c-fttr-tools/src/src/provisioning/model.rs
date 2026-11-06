@@ -276,7 +276,6 @@ pub struct Config {
     pub management: Option<Management>,
     pub management_network: Option<super::management_network::Desired>,
     pub allow_unsupported_as_bridge: bool,
-    pub fec_enabled: bool,
     pub labels: BTreeMap<String, String>,
 }
 

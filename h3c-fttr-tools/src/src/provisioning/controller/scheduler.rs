@@ -19,6 +19,7 @@ pub(super) fn tick(engine: &Arc<Mutex<crate::pon_engine::PonEngine>>, batch: Rea
     }
     let devices = acs(Command::Devices);
     let acs_status = acs(Command::Status);
+    controller().lock().unwrap().activate_pending_config();
     let desired = controller()
         .lock()
         .unwrap()
@@ -79,6 +80,7 @@ pub(super) fn tick(engine: &Arc<Mutex<crate::pon_engine::PonEngine>>, batch: Rea
                         history_changed = true;
                     }
                 } else if op.stage != OperationPhase::Completed && reachable {
+                    op.work_started = true;
                     op.command_job = Some(crate::devices::command_provisioning::Job::start(
                         op.device.clone(),
                         op.apply,
@@ -162,6 +164,7 @@ pub(super) fn tick(engine: &Arc<Mutex<crate::pon_engine::PonEngine>>, batch: Rea
             .hash(&mut epoch_hash);
         let capability_epoch = epoch_hash.finish();
         let availability_changed = reachable != c.last_online.contains(&d.id);
+        let reload_pending = c.pending_config.is_some();
         if let Some(op) = c.operations.get_mut(&d.id) {
             if op.stage == OperationPhase::Completed
                 && (new_boot
@@ -209,7 +212,14 @@ pub(super) fn tick(engine: &Arc<Mutex<crate::pon_engine::PonEngine>>, batch: Rea
                     op.wan.progress(),
                     op.wifi.progress(),
                 );
-                let publish = reconcile(op, capability_identity, capability_epoch, reachable);
+                op.work_started = true;
+                let publish = reconcile(
+                    op,
+                    capability_identity,
+                    capability_epoch,
+                    reachable,
+                    reload_pending,
+                );
                 let after = (
                     op.stage,
                     op.index,
@@ -252,6 +262,11 @@ pub(super) fn tick(engine: &Arc<Mutex<crate::pon_engine::PonEngine>>, batch: Rea
     c.persist_history(|data| {
         storage::write_atomic("/var/lib/fttr/provisioning-state.json", data, false)
     });
+    if c.activate_pending_config() {
+        // Do not wait for the periodic sweep after the final old operation finishes.
+        wake();
+        return Duration::ZERO;
+    }
     // State remains authoritative; the low-frequency sweep also detects optical
     // changes from backends that do not publish CWMP events.
     let deadline = c
@@ -269,6 +284,9 @@ pub(super) fn tick(engine: &Arc<Mutex<crate::pon_engine::PonEngine>>, batch: Rea
 }
 
 fn schedule(c: &mut Controller, d: &Device, reachable: bool, new_boot: bool, time: u64) {
+    if c.pending_config.is_some() {
+        return;
+    }
     let previous = c
         .operations
         .get(&d.id)
@@ -432,6 +450,24 @@ mod config_change_tests {
         schedule(&mut c, &device, true, false, 101);
         assert_eq!(c.operations[&device.id].revision, "rev");
     }
+
+    #[test]
+    fn pending_reload_prevents_old_revision_rescheduling_then_starts_latest_immediately() {
+        let (mut c, device) = fixture();
+        let mut blocker = super::super::tests::operation(OperationPhase::Writing, false);
+        blocker.device.id = "busy".into();
+        let mut next = c.config.clone();
+        next.revision = "latest".into();
+        c.operations.insert("busy".into(), blocker);
+        c.request_config(next);
+        schedule(&mut c, &device, true, false, 100);
+        assert_eq!(c.operations[&device.id].revision, "rev");
+        c.operations.get_mut("busy").unwrap().complete(101);
+        assert!(c.activate_pending_config());
+        schedule(&mut c, &device, true, false, 101);
+        assert_eq!(c.operations[&device.id].revision, "latest");
+        assert!(c.operations[&device.id].apply);
+    }
 }
 
 fn identity(d: &Device, observed: &Value) -> crate::devices::cwmp::identity::Identity {
@@ -462,6 +498,7 @@ fn reconcile(
     identity: crate::devices::cwmp::identity::Identity,
     epoch: u64,
     reachable: bool,
+    reload_pending: bool,
 ) -> bool {
     op.capabilities
         .tick(&op.device.cwmp_id, identity, epoch, reachable, acs);
@@ -567,7 +604,7 @@ fn reconcile(
                 ) {
                     op.stage = OperationPhase::Waiting;
                 }
-                advance(op, reachable);
+                advance_or_supersede(op, reachable, reload_pending);
             }
         } else {
             op.stage = OperationPhase::WifiReconciling;
@@ -590,4 +627,52 @@ fn reconcile(
         op.stage = OperationPhase::WanReconciling;
     }
     true
+}
+
+// Called only after WAN and Wi-Fi lifecycle transactions are drained.
+fn advance_or_supersede(op: &mut Operation, reachable: bool, reload_pending: bool) {
+    if reload_pending
+        && op.stage == OperationPhase::Waiting
+        && op.task.is_none()
+        && op.submission.is_none()
+    {
+        op.supersede_remaining();
+    } else {
+        advance(op, reachable);
+    }
+}
+
+#[cfg(test)]
+mod reload_boundary_tests {
+    use super::*;
+
+    #[test]
+    fn safe_boundary_skips_old_work_even_offline_without_losing_unknown_results() {
+        let mut op = super::super::tests::operation(OperationPhase::Waiting, false);
+        op.task = None;
+        op.results.insert(
+            "previous".into(),
+            json!({"id":"previous","state":"unknown"}),
+        );
+        advance_or_supersede(&mut op, false, true);
+        assert_eq!(op.stage, OperationPhase::Completed);
+        assert_eq!(op.results["previous"]["state"], "unknown");
+        assert_eq!(op.results["wifi"]["state"], "blocked");
+        assert!(op.task.is_none());
+    }
+
+    #[test]
+    fn reload_never_discards_an_inflight_write() {
+        let mut op = super::super::tests::operation(OperationPhase::Writing, false);
+        RPC.with(|r| {
+            *r.borrow_mut() = (
+                std::collections::VecDeque::from([json!({"state":"sent"})]),
+                Vec::new(),
+            )
+        });
+        advance_or_supersede(&mut op, true, true);
+        assert_eq!(op.stage, OperationPhase::Writing);
+        assert_eq!(op.task, Some(1));
+        assert!(op.completed_at.is_none());
+    }
 }

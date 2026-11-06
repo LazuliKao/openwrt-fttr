@@ -1,4 +1,4 @@
-//! Serialized, identity-bound downstream FEC PM diagnostics; no FPGA control.
+//! Serialized, identity-bound downstream FEC PM lifecycle and diagnostics.
 use crate::pon_engine::omci::{error, FmcsTransport, OmciSession};
 use std::{
     io,
@@ -17,6 +17,7 @@ pub(super) struct Command {
     create_pm: bool,
 }
 pub(super) struct Request {
+    fec_generation: u64,
     command: Command,
     deadline: Instant,
     pub reply: std::sync::mpsc::Sender<io::Result<serde_json::Value>>,
@@ -37,7 +38,7 @@ pub fn read(id: u8, create_pm: bool) -> io::Result<()> {
         .as_ref()
         .and_then(|fec| fec.ani_entity_id)
         .ok_or_else(|| {
-            io::Error::other("FEC support disabled or awaiting current ANI-G discovery; check provisioning.fec_enabled and retry after telemetry poll")
+            io::Error::other("FEC disabled or awaiting current ANI-G discovery; check optical.fec_enabled and retry after telemetry poll")
         })?;
     let command = Command {
         onu_id: id,
@@ -82,6 +83,7 @@ pub(super) fn control(
     let (reply, receive) = std::sync::mpsc::channel();
     sender
         .try_send(super::inventory::WorkerRequest::Fec(Request {
+            fec_generation: crate::optical::fec_generation(),
             command,
             deadline: Instant::now() + Duration::from_secs(60),
             reply,
@@ -100,6 +102,7 @@ pub(super) fn run(
     require_enabled()?;
     let c = &request.command;
     if Instant::now() >= request.deadline
+        || request.fec_generation != crate::optical::fec_generation()
         || super::service::onu_serial(c.onu_id).as_deref() != Some(c.serial.as_str())
     {
         return Err(io::Error::other(
@@ -109,9 +112,12 @@ pub(super) fn run(
     let mut session = OmciSession::new(FmcsTransport::open(c.onu_id)?);
     let id = c.onu_id;
     let serial = c.serial.clone();
+    let fec_generation = request.fec_generation;
     session.guard_registration(move || {
         super::service::operation_confirmed(id)
             && super::service::onu_serial(id).as_deref() == Some(serial.as_str())
+            && crate::optical::fec_enabled()
+            && crate::optical::fec_generation() == fec_generation
     });
     if let Some(token) = cancellation {
         session.cancel_when(token);
@@ -127,22 +133,30 @@ pub(super) fn run(
 }
 
 fn require_enabled() -> io::Result<()> {
-    if crate::provisioning::controller::fec_enabled() {
+    if crate::optical::fec_enabled() {
         Ok(())
     } else {
         Err(io::Error::other(
-            "FEC support is disabled; enable provisioning.fec_enabled first",
+            "FEC is disabled; enable optical.fec_enabled with optical transmission first",
         ))
     }
 }
 
-fn ensure_pm(session: &mut OmciSession, ani: u16, create_pm: bool) -> io::Result<bool> {
+pub(super) fn ensure_pm(session: &mut OmciSession, ani: u16, create_pm: bool) -> io::Result<bool> {
     // Only explicit opt-in and a protocol unknown-instance result permit CREATE.
     // Never reset existing counters, modify thresholds or delete a foreign instance.
     match session.get_attributes(312, ani, 0x8000) {
         Ok(_) => Ok(false),
         Err(error) if create_pm && error::is_unknown_instance(&error) => {
-            session.create(312, ani, &[0, 0])?;
+            session.create_attributes(
+                312,
+                ani,
+                &[(
+                    2,
+                    crate::pon_engine::omci::attributes::AttributeValue::number(0),
+                )],
+            )?;
+            session.get_attributes(312, ani, 0x8000)?;
             Ok(true)
         }
         Err(error) => Err(error),
@@ -158,6 +172,7 @@ mod tests {
         requests: Arc<Mutex<Vec<u8>>>,
         pending: Option<BaselineFrame>,
         result: u8,
+        created: bool,
     }
     impl OmciTransport for Transport {
         fn send(&mut self, frame: &BaselineFrame) -> io::Result<()> {
@@ -165,6 +180,7 @@ mod tests {
             if frame.message_type == 0x44 {
                 assert_eq!(frame.class_id, 312);
                 assert_eq!(&frame.payload[..2], &[0, 0]);
+                self.created = true;
             }
             self.pending = Some(frame.clone());
             Ok(())
@@ -174,7 +190,7 @@ mod tests {
                 let get = frame.message_type == 0x49;
                 frame.message_type = if get { 0x29 } else { 0x24 };
                 frame.payload = [0; 32];
-                frame.payload[0] = if get { self.result } else { 0 };
+                frame.payload[0] = if get && !self.created { self.result } else { 0 };
                 frame.payload[1..3].copy_from_slice(&0x8000u16.to_be_bytes());
                 frame
             }))
@@ -185,7 +201,7 @@ mod tests {
         for (result, create, expected_ok, expected_actions) in [
             (0, true, true, vec![0x49]),
             (5, false, false, vec![0x49]),
-            (5, true, true, vec![0x49, 0x44]),
+            (5, true, true, vec![0x49, 0x44, 0x49]),
             (4, true, false, vec![0x49]),
             (9, true, false, vec![0x49]),
         ] {
@@ -194,6 +210,7 @@ mod tests {
                 requests: requests.clone(),
                 pending: None,
                 result,
+                created: false,
             });
             assert_eq!(ensure_pm(&mut session, 0x8001, create).is_ok(), expected_ok);
             assert_eq!(*requests.lock().unwrap(), expected_actions);

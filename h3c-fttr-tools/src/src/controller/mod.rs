@@ -11,6 +11,7 @@ mod lifetime;
 pub mod management;
 #[cfg(feature = "mqtt")]
 pub mod mqtt;
+mod pon_mac;
 pub mod profile;
 mod runtime;
 pub(crate) mod service;

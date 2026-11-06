@@ -122,6 +122,7 @@ fn unavailable_when_cached_registration_cancelled() {
     cache().lock().unwrap().insert(
         249,
         Cached {
+            fec_generation: crate::optical::fec_generation(),
             snapshot: Snapshot {
                 fec: fec::unavailable("test_sample"),
                 rx: Some(-12.5),

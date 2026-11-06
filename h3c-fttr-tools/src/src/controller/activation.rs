@@ -46,6 +46,7 @@ pub(super) fn grant_target(
 
 pub(super) fn clear_offline_hardware(id: u8) -> io::Result<()> {
     // Caller holds this ONU's lock after cancellation and worker lease release.
+    crate::pon_engine::omci::platform::leases::forget_business_allocation(id);
     bosa::set_fttr_carrier(id as u32, false)?;
     for _ in 0..3 {
         bosa::send_ploam_msg(&PloamFrame::new(id, 5, [0; 10]).to_bytes())?;

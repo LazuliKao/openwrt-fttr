@@ -27,6 +27,9 @@ pub enum AttributeValue {
     TableLength { bytes: u32 },
 }
 impl AttributeValue {
+    pub fn octets(bytes: &[u8]) -> Self {
+        Self::Octets { hex: hex(bytes) }
+    }
     pub fn number(value: u32) -> Self {
         Self::Unsigned { value }
     }
@@ -67,6 +70,32 @@ pub struct AttributeBlock {
 /// <https://github.com/opencord/omci-lib-go/blob/v2.2.4/generated/attribute.go#L136-L214>
 pub struct AttributeCodec;
 impl AttributeCodec {
+    pub fn read_mask(def: &MeDefinition, indices: &[u8]) -> io::Result<u16> {
+        if !def.layout_supported || !def.actions.contains(&9) {
+            return Err(invalid("ME does not support schema GET"));
+        }
+        let mut mask = 0;
+        let mut size = 0;
+        for &index in indices {
+            let attr = def
+                .attribute(index)
+                .filter(|a| a.index != 0 && a.read)
+                .ok_or_else(|| invalid("unknown/unreadable attribute"))?;
+            if mask & attr.mask != 0 {
+                return Err(invalid("duplicate read attribute"));
+            }
+            mask |= attr.mask;
+            size += if attr.kind == AttributeKind::Table {
+                4
+            } else {
+                attr.size
+            };
+        }
+        if mask == 0 || size > 29 {
+            return Err(invalid("empty/oversized baseline GET"));
+        }
+        Ok(mask)
+    }
     pub fn decode(
         def: &'static MeDefinition,
         mask: u16,
@@ -188,6 +217,17 @@ impl AttributeCodec {
         values: &[(u8, AttributeValue)],
         context: AttributeContext,
     ) -> io::Result<(u16, Vec<u8>)> {
+        let action = match context {
+            AttributeContext::SetRequest => 8,
+            AttributeContext::CreateRequest => 4,
+            _ => return Err(invalid("encoding requires request context")),
+        };
+        if !def.layout_supported || !def.actions.contains(&action) {
+            return Err(invalid("ME does not support schema request"));
+        }
+        if action == 8 && values.is_empty() {
+            return Err(invalid("empty SET"));
+        }
         let mut inputs = BTreeMap::new();
         for (index, value) in values {
             if *index == 0 || inputs.insert(*index, value).is_some() {
@@ -232,7 +272,10 @@ impl AttributeCodec {
         }
         Ok((mask, bytes))
     }
-    fn encode_value(attr: &AttributeDefinition, value: &AttributeValue) -> io::Result<Vec<u8>> {
+    pub(super) fn encode_value(
+        attr: &AttributeDefinition,
+        value: &AttributeValue,
+    ) -> io::Result<Vec<u8>> {
         let numeric = !matches!(
             attr.kind,
             AttributeKind::String

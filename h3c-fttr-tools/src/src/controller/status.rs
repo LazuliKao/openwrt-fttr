@@ -224,6 +224,7 @@ pub(super) fn snapshot(
         jobs: None,
         ipc: None,
         fpga_status: fpga::get_fpga_status().to_string(),
+        pon_mac: Some(super::pon_mac::snapshot()),
         optical_transceiver: bosa::get_optical_status(),
         switch_ports,
         sub_gateways,

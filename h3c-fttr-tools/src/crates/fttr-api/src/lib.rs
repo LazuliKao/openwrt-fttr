@@ -97,6 +97,12 @@ impl CapabilityPages {
 #[derive(Serialize, Deserialize)]
 #[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
 pub struct OpticalReply {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "codegen", ts(optional))]
+    pub settings: Option<OpticalSettings>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "codegen", ts(optional))]
+    pub pon_mac: Option<PonMacStatus>,
     #[cfg_attr(feature = "codegen", ts(type = "1"))]
     #[serde(deserialize_with = "crate::results::version_one")]
     pub schema_version: u8,
@@ -151,11 +157,16 @@ pub enum OpticalState {
 #[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
 pub struct EmptyRequest {}
 
-#[derive(Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
-pub struct OpticalSetRequest {
+#[serde(deny_unknown_fields)]
+pub struct OpticalSettings {
     pub enabled: bool,
+    pub downstream_tx_enabled: bool,
+    pub fec_enabled: bool,
 }
+
+pub type OpticalSetRequest = OpticalSettings;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Access {
@@ -206,7 +217,7 @@ macro_rules! fttr_methods {
         $consumer! {
             GET_CAPABILITIES, get_capabilities, getCapabilities, EmptyRequest, Capabilities, Read, Always, [];
             OPTICAL_STATUS, optical_status, opticalStatus, EmptyRequest, OpticalReply, Read, Always, [];
-            OPTICAL_SET, optical_set, opticalSet, OpticalSetRequest, OpticalReply, Write, Always, [enabled];
+            OPTICAL_SET, optical_set, opticalSet, OpticalSettings, OpticalReply, Write, Always, [enabled, downstream_tx_enabled, fec_enabled];
             GET_STATUS, get_status, getStatus, EmptyRequest, StatusReply, Read, Always, [];
             GET_SYNC, get_sync, getSync, EmptyRequest, SyncStatusReply, Read, Always, [];
             CONFIG_CHECK, config_check, configCheck, EmptyRequest, ConfigCheckReply, Read, Always, [];

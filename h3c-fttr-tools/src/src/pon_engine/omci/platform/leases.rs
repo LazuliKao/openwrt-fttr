@@ -1,5 +1,24 @@
 use crate::{bosa, pon_engine::ploam::PloamFrame};
-use std::{io, os::fd::AsRawFd, time::Duration};
+use std::{
+    io,
+    os::fd::AsRawFd,
+    sync::atomic::{AtomicU16, Ordering},
+    time::Duration,
+};
+
+// Daemon-owned business allocations outlive a temporary OMCC diagnostic lease.
+// Access is serialized by lock_onu; offline cleanup clears ownership before reuse.
+static BUSINESS_ALLOCATIONS: AtomicU16 = AtomicU16::new(0);
+
+pub fn forget_business_allocation(id: u8) {
+    if id < 16 {
+        BUSINESS_ALLOCATIONS.fetch_and(!(1u16 << id), Ordering::SeqCst);
+    }
+}
+
+fn allocation_enabled_after_lease(owned: u16, id: u8) -> bool {
+    owned & (1u16 << id) != 0
+}
 extern "C" {
     fn flock(fd: i32, operation: i32) -> i32;
 }
@@ -64,6 +83,7 @@ impl Drop for ChannelLease {
 pub struct StockOmccLease {
     id: u8,
     saved: Vec<(u32, u32)>,
+    disarmed: bool,
 }
 impl StockOmccLease {
     pub fn open(id: u8) -> io::Result<Self> {
@@ -81,7 +101,11 @@ impl StockOmccLease {
         ] {
             saved.push((addr, bosa::read_fpga_reg(addr)?));
         }
-        let lease = Self { id, saved };
+        let lease = Self {
+            id,
+            saved,
+            disarmed: false,
+        };
         for (i, &(addr, old)) in lease.saved.iter().enumerate() {
             let value = if i == 0 { old | (1 << id) } else { 0x11000000 };
             println!("STOCK_OMCC {addr:08x}: {old:08x}->{value:08x}");
@@ -95,6 +119,14 @@ impl StockOmccLease {
         std::thread::sleep(Duration::from_millis(500));
         Ok(lease)
     }
+
+    /// Disarm the lease teardown when transitioning to a persistent business service.
+    /// This prevents dropping the Alloc-ID and FPGA hardware mappings when configuration succeeds.
+    pub fn disarm(&mut self) {
+        BUSINESS_ALLOCATIONS.fetch_or(1u16 << self.id, Ordering::SeqCst);
+        self.disarmed = true;
+    }
+
     fn configure_port(&self, enable: bool) -> io::Result<()> {
         let port = 0x100u16 + self.id as u16;
         let mut p = [0; 10];
@@ -109,8 +141,13 @@ impl StockOmccLease {
 }
 impl Drop for StockOmccLease {
     fn drop(&mut self) {
-        if let Err(e) = self.configure_port(false) {
-            eprintln!("OMCC disable failed: {e}");
+        if self.disarmed {
+            return;
+        }
+        let enabled =
+            allocation_enabled_after_lease(BUSINESS_ALLOCATIONS.load(Ordering::SeqCst), self.id);
+        if let Err(e) = self.configure_port(enabled) {
+            eprintln!("OMCC allocation restore failed: {e}");
         }
         for &(addr, value) in self.saved.iter().rev() {
             let result = if addr == 0x01000008 {
@@ -126,6 +163,31 @@ impl Drop for StockOmccLease {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn temporary_diagnostics_preserve_only_owned_business_allocations() {
+        use super::*;
+        let mut service = StockOmccLease {
+            id: 15,
+            saved: Vec::new(),
+            disarmed: false,
+        };
+        forget_business_allocation(15);
+        assert!(!allocation_enabled_after_lease(
+            BUSINESS_ALLOCATIONS.load(Ordering::SeqCst),
+            15
+        ));
+        service.disarm();
+        drop(service); // Persistent service must not run temporary teardown.
+        assert!(allocation_enabled_after_lease(
+            BUSINESS_ALLOCATIONS.load(Ordering::SeqCst),
+            15
+        ));
+        forget_business_allocation(15);
+        assert!(!allocation_enabled_after_lease(
+            BUSINESS_ALLOCATIONS.load(Ordering::SeqCst),
+            15
+        ));
+    }
     #[test]
     fn disabling_one_slot_preserves_other_live_slots() {
         let both = super::enable_bit(super::enable_bit(0x80000000, 1, true), 2, true);

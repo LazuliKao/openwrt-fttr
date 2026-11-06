@@ -213,8 +213,10 @@ mod tests {
         assert!(types.contains("desired_enabled: boolean | null"));
         assert!(types.contains("error: OpticalError | null"));
         let client = &files["luci-client.ts"];
-        assert!(client.contains("[OpticalSetRequest[\"enabled\"]]"));
-        assert!(client.contains("raw_opticalSet(request.enabled)"));
+        assert!(client.contains("[OpticalSettings[\"enabled\"], OpticalSettings[\"downstream_tx_enabled\"], OpticalSettings[\"fec_enabled\"]]"));
+        assert!(client.contains(
+            "raw_opticalSet(request.enabled, request.downstream_tx_enabled, request.fec_enabled)"
+        ));
         assert!(client.contains("object: \"fttr\""));
         assert!(types.contains("total_packets: number"));
         assert!(!types.contains("bigint"));
