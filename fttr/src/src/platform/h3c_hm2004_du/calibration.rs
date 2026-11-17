@@ -312,8 +312,17 @@ fn compensate(
     // No gate or 0x27 latch: mirrors the observed stock tlut write helper.
     io.write(6, target[0])?;
     io.write(7, target[1])?;
+    // The code pair shares the I2C bus with telemetry reads, so an immediate readback
+    // can observe a torn value and report a false failure. Settle briefly, then retry
+    // the write once before treating the mismatch as real.
+    std::thread::sleep(std::time::Duration::from_millis(2));
     if [io.read(6)?, io.read(7)?] != target {
-        return Err(io::Error::other("temperature code pair readback mismatch"));
+        io.write(6, target[0])?;
+        io.write(7, target[1])?;
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        if [io.read(6)?, io.read(7)?] != target {
+            return Err(io::Error::other("temperature code pair readback mismatch"));
+        }
     }
     status.reason = "updated".into();
     Ok(true)
