@@ -4,6 +4,7 @@ use std::{io, path::Path};
 
 const USAGE: &str = "Usage: fttrctl hardware DEVICE COMMAND [ARGS]
   status
+  init
   reg-read ADDRESS WORDS
   reg-write ADDRESS WORD...
   mem-read ADDRESS ROW WORDS
@@ -17,6 +18,7 @@ Output is JSON register evidence, not optical/link readiness.";
 #[derive(Debug)]
 enum Command {
     Status,
+    Init,
     Tx(bool),
     Fec(bool),
     Read(RegisterSpace, u32, u32, usize),
@@ -45,6 +47,7 @@ fn parse(args: &[String]) -> io::Result<Command> {
     };
     match (command, args.len()) {
         ("status", 1) => Ok(Command::Status),
+        ("init", 1) => Ok(Command::Init),
         ("tx" | "fec", 2) => {
             let enabled = match args[1].as_str() {
                 "on" => true,
@@ -127,6 +130,17 @@ pub(super) fn handle(args: &[String]) -> io::Result<()> {
             let mac = session.pon_mac_readback()?;
             serde_json::json!({"tx_enabled": mac.tx_enabled, "downstream_fec_enabled": mac.fec_enabled,
                 "raw_optical_register": mac.raw})
+        }
+        Command::Init => {
+            let ev = session.initialize_olt()?;
+            serde_json::json!({
+                "onu_id_offset": ev.onu_id_offset,
+                "serdes_status": ev.serdes_status,
+                "ram_init_status": ev.ram_init_status,
+                "nni_eth_tpid": ev.nni_eth_tpid,
+                "nni_gem_port_offset": ev.nni_gem_port_offset,
+                "vlan_type_cfg": ev.vlan_type_cfg,
+            })
         }
         Command::Read(space, address, row, count) => {
             serde_json::json!({"address": address, "row": row, "words": session.read(space, address, row, count)?})

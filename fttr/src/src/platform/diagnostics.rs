@@ -11,6 +11,16 @@ pub enum RegisterSpace {
     Memory,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OltInitEvidence {
+    pub onu_id_offset: u8,
+    pub serdes_status: u32,
+    pub ram_init_status: u32,
+    pub nni_eth_tpid: u32,
+    pub nni_gem_port_offset: u32,
+    pub vlan_type_cfg: u32,
+}
+
 /// One platform-owned session, including multiword and memory-row operations.
 /// Addresses belong to the selected platform's protocol, never CPU MMIO.
 pub trait RegisterSession {
@@ -36,6 +46,9 @@ pub trait RegisterSession {
     }
     fn set_downstream_fec_enable(&mut self, _enabled: bool) -> io::Result<()> {
         Err(unsupported("downstream FEC encoder control"))
+    }
+    fn initialize_olt(&mut self) -> io::Result<OltInitEvidence> {
+        Err(unsupported("OLT initialization"))
     }
 }
 

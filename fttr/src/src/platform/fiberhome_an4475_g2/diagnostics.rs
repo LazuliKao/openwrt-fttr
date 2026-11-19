@@ -1,4 +1,12 @@
 use super::{
+    initialization::{
+        self,
+        defaults::{
+            apply_gpon_defaults, configure_nni_vport, DEFAULT_NNI_ETH_TPID,
+            DEFAULT_NNI_GEMPORT_OFFSET, NNI_ETH_TPID_CFG, NNI_GEMPORT_OFFSET_CFG, VLAN_TYPE_CFG,
+        },
+        InitConfig, RAM_INIT_STATUS, SERDES_STATUS,
+    },
     optical::{i2c_dev::I2cDevice, OpticalBus},
     profile::UX3326S_DEVICE_ADDRESS,
     protocol::{self, Fsl},
@@ -6,7 +14,7 @@ use super::{
 };
 use crate::platform::{
     backend::PlatformDiagnostics,
-    diagnostics::{RegisterSession, RegisterSpace},
+    diagnostics::{OltInitEvidence, RegisterSession, RegisterSpace},
     resources::PonMacReadback,
 };
 use std::{io, path::Path};
@@ -90,5 +98,22 @@ impl RegisterSession for Fsl<Device> {
     }
     fn set_downstream_fec_enable(&mut self, enabled: bool) -> io::Result<()> {
         self.set_fec_enabled(enabled)
+    }
+    fn initialize_olt(&mut self) -> io::Result<OltInitEvidence> {
+        let init = InitConfig::default();
+        initialization::release_reset(self, &init, &mut |delay| {
+            std::thread::sleep(delay);
+            Ok(())
+        })?;
+        let onu_id_offset = apply_gpon_defaults(self, init.max_onu_id)?;
+        configure_nni_vport(self, DEFAULT_NNI_GEMPORT_OFFSET, DEFAULT_NNI_ETH_TPID)?;
+        Ok(OltInitEvidence {
+            onu_id_offset,
+            serdes_status: self.read_register(SERDES_STATUS)?,
+            ram_init_status: self.read_register(RAM_INIT_STATUS)?,
+            nni_eth_tpid: self.read_register(NNI_ETH_TPID_CFG)? & 0xffff,
+            nni_gem_port_offset: self.read_register(NNI_GEMPORT_OFFSET_CFG)? & 0x0fff,
+            vlan_type_cfg: self.read_register(VLAN_TYPE_CFG)? & 0xffff,
+        })
     }
 }
