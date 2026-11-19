@@ -26,6 +26,7 @@ use std::{
 };
 
 const DOWNSTREAM_OPTICAL_I2C_DEV: &str = "/dev/i2c-0";
+const FSL_DEVICE_PATH: &str = "/dev/fsl-1fbd4000.fsl";
 
 pub(crate) struct FslDiagnostics;
 impl PlatformDiagnostics for FslDiagnostics {
@@ -90,6 +91,14 @@ impl PlatformDiagnostics for FslDiagnostics {
             page: chip.current_page(),
             table_bytes: raw.len(),
         })
+    }
+    fn set_optical_tx_enable(&self, enabled: bool) -> io::Result<()> {
+        let mut fsl = Fsl::new(Device::open(Path::new(FSL_DEVICE_PATH))?);
+        fsl.set_tx_enabled(enabled)
+    }
+    fn get_optical_tx_enable(&self) -> io::Result<bool> {
+        let mut fsl = Fsl::new(Device::open(Path::new(FSL_DEVICE_PATH))?);
+        fsl.is_tx_enabled()
     }
 }
 

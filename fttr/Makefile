@@ -32,7 +32,7 @@ define Package/openwrt-fttr/config
     depends on PACKAGE_openwrt-fttr
     default y
   config FTTR_PLATFORM_FIBERHOME_AN4475_G2
-    bool "Compile FiberHome AN4475-G2 register diagnostics (runtime pending)"
+    bool "Compile FiberHome AN4475-G2 platform backend"
     depends on PACKAGE_openwrt-fttr
     default n
   config FTTR_PLATFORM_TIANYI_TYFZA1

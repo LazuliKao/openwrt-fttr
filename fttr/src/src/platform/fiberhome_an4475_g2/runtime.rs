@@ -329,7 +329,7 @@ fn format_serial(sn: &[u8; 8]) -> String {
 
 fn ipc_handler(
     devices: Arc<Mutex<Vec<SubDevice>>>,
-    pon_engine: Arc<Mutex<PonEngine>>,
+    _pon_engine: Arc<Mutex<PonEngine>>,
     services: service::States,
     optics: OpticalClient,
 ) -> impl Fn(UnixStream, &str) + Send + Sync + 'static {
@@ -387,6 +387,9 @@ fn ipc_handler(
                 "ON" => Ok(OpticalCommand::On),
                 "OFF" => Ok(OpticalCommand::Off),
                 "STATUS" => Ok(OpticalCommand::Status),
+                "RELOAD" => Ok(OpticalCommand::Reload),
+                "REINITIALIZE" => Ok(OpticalCommand::Reinitialize),
+                "SHUTDOWN" => Ok(OpticalCommand::Shutdown),
                 other => Err(format!("unknown optical command: {other}")),
             };
             match req {
