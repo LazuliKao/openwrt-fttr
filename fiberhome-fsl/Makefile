@@ -19,8 +19,8 @@ endef
 
 define KernelPackage/fiberhome-fsl/description
   Bounded TX/RX SPI messages with exclusive open and device removal handling.
-  FSL protocol and optical policy live in openwrt-fttr userspace. Requires a
-  working SPI controller and an explicit fiberhome,an4475-g2-fsl board node.
+  FSL protocol and optical policy live in openwrt-fttr userspace. Requires an
+  explicit fiberhome,an4475-fsl board node.
 endef
 
 define Build/Prepare
