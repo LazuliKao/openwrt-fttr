@@ -332,15 +332,19 @@ fn optional_diagnostics_do_not_require_fpga_or_bosa_and_never_fall_back_to_h3c()
 
 #[test]
 fn resolver_rejects_stubs_and_uncompiled_platforms() {
-    for id in [PlatformId::FiberhomeAn4475G2, PlatformId::TianyiTyfza1] {
-        let error = PlatformContext::resolve(id).unwrap_err();
-        assert_eq!(
-            error,
-            if crate::platform::runtime::is_compiled(id) {
-                SelectionError::BackendNotImplemented(id)
-            } else {
-                SelectionError::PlatformNotCompiled(id)
-            }
-        );
-    }
+    let stub = PlatformId::TianyiTyfza1;
+    let error = PlatformContext::resolve(stub).unwrap_err();
+    assert_eq!(
+        error,
+        if crate::platform::runtime::is_compiled(stub) {
+            SelectionError::BackendNotImplemented(stub)
+        } else {
+            SelectionError::PlatformNotCompiled(stub)
+        }
+    );
+    let an4475 = PlatformId::FiberhomeAn4475G2;
+    assert_eq!(
+        PlatformContext::resolve(an4475).is_ok(),
+        crate::platform::runtime::is_compiled(an4475)
+    );
 }

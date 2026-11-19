@@ -171,6 +171,21 @@ impl<B: Bus> FslOltSession<B> {
         &mut self.mgmt.fsl.bus
     }
 
+    pub(crate) fn fsl_mut(&mut self) -> &mut Fsl<B> {
+        &mut self.mgmt.fsl
+    }
+
+    pub(crate) fn send_ploam(
+        &mut self,
+        frame: &[u8; 12],
+        checkpoint: &mut impl FnMut(Duration) -> io::Result<()>,
+    ) -> io::Result<()> {
+        self.require_initialized()?;
+        self.mgmt
+            .send_ploam(frame, self.config.tx_poll, checkpoint)
+            .map_err(map_send_err)
+    }
+
     pub fn config(&self) -> &OltSessionConfig {
         &self.config
     }

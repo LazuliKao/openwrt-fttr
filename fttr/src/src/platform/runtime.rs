@@ -302,7 +302,7 @@ mod tests {
     }
 
     #[test]
-    fn fiberhome_diagnostics_never_authorize_the_runtime_or_generic_evb() {
+    fn fiberhome_diagnostics_never_authorize_generic_evb() {
         let id = PlatformId::FiberhomeAn4475G2;
         let expected = if cfg!(feature = "platform-fiberhome-an4475-g2") {
             Ok(id)
@@ -315,17 +315,16 @@ mod tests {
         );
         assert_eq!(
             identify_from_values(Some("fiberhome,an4475-g2"), b""),
-            Err(if cfg!(feature = "platform-fiberhome-an4475-g2") {
-                SelectionError::BackendNotImplemented(id)
-            } else {
-                SelectionError::PlatformNotCompiled(id)
-            })
+            expected
         );
         assert_eq!(
             identify_diagnostics_from_values(None, b"airoha,an7581-evb\0airoha,an7581\0"),
             Err(SelectionError::UnknownPlatform)
         );
-        assert!(super::super::context::PlatformContext::resolve(id).is_err());
+        assert_eq!(
+            super::super::context::PlatformContext::resolve(id).is_ok(),
+            cfg!(feature = "platform-fiberhome-an4475-g2")
+        );
     }
 
     #[test]

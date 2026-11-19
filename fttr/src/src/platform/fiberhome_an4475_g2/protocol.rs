@@ -143,6 +143,10 @@ impl<B: Bus> Fsl<B> {
         self.update_bit(OPT_CONFIG, TX_DISABLE, !enabled)
     }
 
+    pub fn is_tx_enabled(&mut self) -> io::Result<bool> {
+        Ok(self.read_register(OPT_CONFIG)? & TX_DISABLE == 0)
+    }
+
     pub fn set_fec_enabled(&mut self, enabled: bool) -> io::Result<()> {
         self.update_bit(DS_FEC_CONFIG, DS_FEC_ENABLE, enabled)
     }

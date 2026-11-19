@@ -91,13 +91,10 @@ mod tests {
     }
 
     #[test]
-    fn fiberhome_source_identity_does_not_advertise_a_runtime() {
+    fn fiberhome_source_identity_advertises_runtime() {
         let descriptor = An4475G2::DESCRIPTOR;
         assert_eq!(descriptor.device_tree_compatibles, &["fiberhome,an4475-g2"]);
         assert_eq!(descriptor.board_names, &["fiberhome,an4475-g2"]);
-        assert_eq!(
-            descriptor.implementation,
-            PlatformImplementation::DiagnosticsOnly
-        );
+        assert_eq!(descriptor.implementation, PlatformImplementation::Runtime);
     }
 }

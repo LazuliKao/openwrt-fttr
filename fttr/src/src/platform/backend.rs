@@ -117,6 +117,8 @@ pub(crate) fn resolve(id: PlatformId) -> Result<&'static dyn PlatformBackend, Se
     match id {
         #[cfg(feature = "platform-h3c-hm2004-du")]
         PlatformId::H3cHm2004Du => Ok(&super::h3c_hm2004_du::Hm2004Du),
+        #[cfg(feature = "platform-fiberhome-an4475-g2")]
+        PlatformId::FiberhomeAn4475G2 => Ok(&super::fiberhome_an4475_g2::An4475G2),
         _ => Err(SelectionError::BackendNotImplemented(id)),
     }
 }
