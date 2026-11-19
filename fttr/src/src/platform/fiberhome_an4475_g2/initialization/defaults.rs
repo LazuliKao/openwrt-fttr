@@ -54,14 +54,22 @@ pub const BMP_OMCI_ALLOC_VALUE: u32 = 0x60a;
 pub const BMP_CFG_BOUNDS: u32 = 0x617;
 pub const BMP_CFG_PLOAMU_CTRL: u32 = 0x637;
 
+pub const VLAN_TYPE_CFG: u32 = 0x106;
+
 pub const NNI_OMCI_DA_CFG: u32 = 0x900;
 pub const NNI_OMCI_TYPE_CFG: u32 = 0x905;
+pub const NNI_ETH_TPID_CFG: u32 = 0x906;
 pub const NNI_ETH_SIZE_CFG: u32 = 0x907;
 pub const NNI_ERR_DROP_CFG: u32 = 0x90a;
 pub const NNI_TX_PAUSE_THD_CFG: u32 = 0x90b;
 pub const NNI_OMCI_WMCI_SPI_CFG: u32 = 0x913;
 pub const NNI_INT_MASK: u32 = 0x915;
 pub const NNI_WMCI_TYPE_CFG: u32 = 0x91e;
+pub const NNI_GEMPORT_OFFSET_CFG: u32 = 0x9e6;
+
+pub const DEFAULT_NNI_ETH_TPID: u16 = 0x8200;
+pub const STANDARD_8021Q_TPID: u16 = 0x8100;
+pub const DEFAULT_NNI_GEMPORT_OFFSET: u16 = 255;
 
 pub const TOD_UART_BAUD_RATE_CFG: u32 = 0x1203;
 pub const TOD_NS_CARRY_LENGTH_CFG: u32 = 0x1204;
@@ -223,6 +231,40 @@ pub fn apply_gemport_defaults<B: Bus>(fsl: &mut Fsl<B>, max_onu_id: u16) -> io::
         configure_gem_port(fsl, onu_idx, 0, onu_idx, true)?;
     }
     Ok(())
+}
+
+/// Configures the NNI Ethernet TPID (`fsldrv_gpon_common_setnniethtpid`).
+/// Stock `fh_olt_pon_vport_init` programs `0x8200`; standard Linux 802.1Q uses `0x8100`.
+pub fn set_nni_eth_tpid<B: Bus>(fsl: &mut Fsl<B>, tpid: u16) -> io::Result<()> {
+    rmw_fields(fsl, NNI_ETH_TPID_CFG, 1, &[(0, 16, u32::from(tpid))])?;
+    write_reg_u32(fsl, VLAN_TYPE_CFG, u32::from(tpid))
+}
+
+/// Configures the NNI GEM-port-to-VID offset (`fsldrv_gpon_common_setnnigemportoffset`).
+/// Stock `fh_olt_pon_vport_init` programs `255` (`0x0ff`), 12-bit max `0xfff`.
+pub fn set_nni_gem_port_offset<B: Bus>(fsl: &mut Fsl<B>, offset: u16) -> io::Result<()> {
+    if offset > 0x0fff {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "NNI GEM port offset must fit in 12 bits (<= 0xfff)",
+        ));
+    }
+    rmw_fields(
+        fsl,
+        NNI_GEMPORT_OFFSET_CFG,
+        1,
+        &[(0, 12, u32::from(offset))],
+    )
+}
+
+/// Applies NNI virtual-port encapsulation parameters (`fh_olt_pon_vport_init`).
+pub fn configure_nni_vport<B: Bus>(
+    fsl: &mut Fsl<B>,
+    gem_port_offset: u16,
+    eth_tpid: u16,
+) -> io::Result<()> {
+    set_nni_gem_port_offset(fsl, gem_port_offset)?;
+    set_nni_eth_tpid(fsl, eth_tpid)
 }
 
 /// Runs the full `fslstack_gpon_reg_config` sequence and returns `ONUID_OFFSET_CFG`.

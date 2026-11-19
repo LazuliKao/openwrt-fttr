@@ -17,7 +17,14 @@ use super::{
         configure_alloc, read_b_all_set_thd, read_eight_times_dba_granularity,
         recalculate_b_all_bandwidth, GdbaAllocConfig, GdbaGapConfig,
     },
-    initialization::{self, defaults::apply_gpon_defaults, InitConfig},
+    initialization::{
+        self,
+        defaults::{
+            apply_gpon_defaults, configure_nni_vport, DEFAULT_NNI_ETH_TPID,
+            DEFAULT_NNI_GEMPORT_OFFSET,
+        },
+        InitConfig,
+    },
     interrupts::{
         poll_and_clear_pending, set_all_gpon_int_masks, set_mask, GponInterrupt, SOFT_RDWR_OMCI_STA,
     },
@@ -75,6 +82,8 @@ pub struct OltPollReport {
 #[derive(Clone, Copy, Debug)]
 pub struct OltSessionConfig {
     pub init: InitConfig,
+    pub nni_gem_port_offset: u16,
+    pub nni_eth_tpid: u16,
     pub tx_poll: PollPolicy,
     pub rx_poll: PollPolicy,
     pub clear_poll: PollPolicy,
@@ -92,6 +101,8 @@ impl Default for OltSessionConfig {
         };
         Self {
             init: InitConfig::default(),
+            nni_gem_port_offset: DEFAULT_NNI_GEMPORT_OFFSET,
+            nni_eth_tpid: DEFAULT_NNI_ETH_TPID,
             tx_poll: fast_poll,
             rx_poll: PollPolicy {
                 max_reads: NonZeroU16::new(2).unwrap(),
@@ -222,6 +233,11 @@ impl<B: Bus> FslOltSession<B> {
     ) -> io::Result<()> {
         initialization::release_reset(&mut self.mgmt.fsl, &self.config.init, checkpoint)?;
         self.onu_id_offset = apply_gpon_defaults(&mut self.mgmt.fsl, self.config.init.max_onu_id)?;
+        configure_nni_vport(
+            &mut self.mgmt.fsl,
+            self.config.nni_gem_port_offset,
+            self.config.nni_eth_tpid,
+        )?;
         self.base_b_all_set_thd = read_b_all_set_thd(&mut self.mgmt.fsl)?;
         self.dba_granularity_8x = read_eight_times_dba_granularity(&mut self.mgmt.fsl)?;
         set_mask(&mut self.mgmt.fsl, GponInterrupt::PloamRx, true)?;

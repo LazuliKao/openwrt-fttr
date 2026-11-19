@@ -321,3 +321,26 @@ fn release_reset_pre_writes_expected_sequence() {
     release_reset_pre(&mut fsl).unwrap();
     assert_eq!(bus.0.borrow().calls, 3);
 }
+
+#[test]
+fn configure_nni_vport_programs_gem_offset_and_tpid_preserving_upper_bits() {
+    let chip = FakeChip::new(0, SERDES_LOCK_MASK, GPON_RAM_INIT_MASK, 12);
+    {
+        let mut st = chip.0.borrow_mut();
+        st.regs.insert(NNI_GEMPORT_OFFSET_CFG, vec![0xabcd_f000]);
+        st.regs.insert(NNI_ETH_TPID_CFG, vec![0x000d_0000]);
+    }
+    let mut fsl = Fsl::new(chip.clone());
+    configure_nni_vport(&mut fsl, DEFAULT_NNI_GEMPORT_OFFSET, DEFAULT_NNI_ETH_TPID).unwrap();
+
+    let st = chip.0.borrow();
+    assert_eq!(
+        st.regs.get(&NNI_GEMPORT_OFFSET_CFG).unwrap(),
+        &vec![0xabcd_f0ff]
+    );
+    assert_eq!(st.regs.get(&NNI_ETH_TPID_CFG).unwrap(), &vec![0x000d_8200]);
+    assert_eq!(st.regs.get(&VLAN_TYPE_CFG).unwrap(), &vec![0x8200]);
+
+    let err = set_nni_gem_port_offset(&mut fsl, 0x1000).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+}
