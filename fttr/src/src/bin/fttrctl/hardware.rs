@@ -2,9 +2,13 @@
 use openwrt_fttr::platform::diagnostics::{HardwareDiagnostics, RegisterSpace};
 use std::{io, path::Path};
 
+const DEFAULT_BOSA_CAL_SOURCE: &str = "/dev/ubi0_3";
+const DEFAULT_BOSA_CAL_OFFSET: u64 = 0x1a_5000;
+
 const USAGE: &str = "Usage: fttrctl hardware DEVICE COMMAND [ARGS]
   status
   init
+  calibrate-bosa [SOURCE [OFFSET]]
   reg-read ADDRESS WORDS
   reg-write ADDRESS WORD...
   mem-read ADDRESS ROW WORDS
@@ -19,6 +23,7 @@ Output is JSON register evidence, not optical/link readiness.";
 enum Command {
     Status,
     Init,
+    CalibrateBosa(String, u64),
     Tx(bool),
     Fec(bool),
     Read(RegisterSpace, u32, u32, usize),
@@ -48,6 +53,18 @@ fn parse(args: &[String]) -> io::Result<Command> {
     match (command, args.len()) {
         ("status", 1) => Ok(Command::Status),
         ("init", 1) => Ok(Command::Init),
+        ("calibrate-bosa", 1) => Ok(Command::CalibrateBosa(
+            DEFAULT_BOSA_CAL_SOURCE.into(),
+            DEFAULT_BOSA_CAL_OFFSET,
+        )),
+        ("calibrate-bosa", 2) => Ok(Command::CalibrateBosa(
+            args[1].clone(),
+            DEFAULT_BOSA_CAL_OFFSET,
+        )),
+        ("calibrate-bosa", 3) => Ok(Command::CalibrateBosa(
+            args[1].clone(),
+            u64::from(number(&args[2])?),
+        )),
         ("tx" | "fec", 2) => {
             let enabled = match args[1].as_str() {
                 "on" => true,
@@ -142,6 +159,16 @@ pub(super) fn handle(args: &[String]) -> io::Result<()> {
                 "vlan_type_cfg": ev.vlan_type_cfg,
             })
         }
+        Command::CalibrateBosa(source, offset) => {
+            let ev = hardware.calibrate_bosa(Path::new(&source), offset)?;
+            serde_json::json!({
+                "source": source,
+                "offset": offset,
+                "chip_id": ev.chip_id,
+                "page": ev.page,
+                "table_bytes": ev.table_bytes,
+            })
+        }
         Command::Read(space, address, row, count) => {
             serde_json::json!({"address": address, "row": row, "words": session.read(space, address, row, count)?})
         }
@@ -195,6 +222,14 @@ mod tests {
         assert!(matches!(
             parse(&args(&["reg-write", "0x102", "0X10"])).unwrap(),
             Command::Write(RegisterSpace::Register, 0x102, 0, _)
+        ));
+        assert!(matches!(
+            parse(&args(&["calibrate-bosa"])).unwrap(),
+            Command::CalibrateBosa(ref src, 0x1a_5000) if src == "/dev/ubi0_3"
+        ));
+        assert!(matches!(
+            parse(&args(&["calibrate-bosa", "/tmp/cal.bin", "0x100"])).unwrap(),
+            Command::CalibrateBosa(ref src, 0x100) if src == "/tmp/cal.bin"
         ));
     }
 }

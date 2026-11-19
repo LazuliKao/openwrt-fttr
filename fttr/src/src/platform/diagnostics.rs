@@ -12,6 +12,13 @@ pub enum RegisterSpace {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BosaCalibrationEvidence {
+    pub chip_id: u8,
+    pub page: u8,
+    pub table_bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OltInitEvidence {
     pub onu_id_offset: u8,
     pub serdes_status: u32,
@@ -106,5 +113,8 @@ impl HardwareDiagnostics {
     }
     pub fn get_optical_tx_enable(self) -> io::Result<bool> {
         self.operations()?.get_optical_tx_enable()
+    }
+    pub fn calibrate_bosa(self, source: &Path, offset: u64) -> io::Result<BosaCalibrationEvidence> {
+        self.operations()?.calibrate_bosa(source, offset)
     }
 }

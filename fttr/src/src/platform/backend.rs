@@ -98,6 +98,13 @@ pub(crate) trait PlatformDiagnostics: Sync {
     fn set_optical_tx_enable(&self, _enabled: bool) -> io::Result<()> {
         Err(unsupported("optical TX control"))
     }
+    fn calibrate_bosa(
+        &self,
+        _source: &Path,
+        _offset: u64,
+    ) -> io::Result<super::diagnostics::BosaCalibrationEvidence> {
+        Err(unsupported("BOSA calibration"))
+    }
     fn get_optical_tx_enable(&self) -> io::Result<bool> {
         Err(unsupported("optical TX readback"))
     }

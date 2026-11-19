@@ -1,4 +1,5 @@
 use super::{
+    calibration::{self, CalibrationTable},
     initialization::{
         self,
         defaults::{
@@ -8,16 +9,21 @@ use super::{
         InitConfig, RAM_INIT_STATUS, SERDES_STATUS,
     },
     optical::{i2c_dev::I2cDevice, OpticalBus},
-    profile::UX3326S_DEVICE_ADDRESS,
+    profile::{initialize_ux3326s, StockPacer, UX3326S_DEVICE_ADDRESS},
     protocol::{self, Fsl},
     transport::Device,
 };
 use crate::platform::{
     backend::PlatformDiagnostics,
-    diagnostics::{OltInitEvidence, RegisterSession, RegisterSpace},
+    diagnostics::{BosaCalibrationEvidence, OltInitEvidence, RegisterSession, RegisterSpace},
     resources::PonMacReadback,
 };
-use std::{io, path::Path};
+use std::{
+    fs::File,
+    io::{self, Read, Seek, SeekFrom},
+    path::Path,
+    time::Duration,
+};
 
 const DOWNSTREAM_OPTICAL_I2C_DEV: &str = "/dev/i2c-0";
 
@@ -62,6 +68,28 @@ impl PlatformDiagnostics for FslDiagnostics {
         })?;
         let mut bus = OpticalBus::new(I2cDevice::open(Path::new(DOWNSTREAM_OPTICAL_I2C_DEV))?);
         bus.write(UX3326S_DEVICE_ADDRESS, reg, &[byte])
+    }
+    fn calibrate_bosa(&self, source: &Path, offset: u64) -> io::Result<BosaCalibrationEvidence> {
+        let mut file = File::open(source)?;
+        file.seek(SeekFrom::Start(offset))?;
+        let mut raw = [0u8; calibration::TABLE_BYTES];
+        file.read_exact(&mut raw)?;
+        let table = CalibrationTable::parse(&raw)?;
+        let mut bus = OpticalBus::new(I2cDevice::open(Path::new(DOWNSTREAM_OPTICAL_I2C_DEV))?);
+        struct SleepPacer;
+        impl StockPacer for SleepPacer {
+            fn after_write(&mut self, _loop_iterations: u32) -> io::Result<()> {
+                std::thread::sleep(Duration::from_micros(200));
+                Ok(())
+            }
+        }
+        let mut pacer = SleepPacer;
+        let chip = initialize_ux3326s(&mut bus, &table, &mut pacer, || Ok(()))?;
+        Ok(BosaCalibrationEvidence {
+            chip_id: chip.discriminator(),
+            page: chip.current_page(),
+            table_bytes: raw.len(),
+        })
     }
 }
 

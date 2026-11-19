@@ -54,7 +54,7 @@ pub const BMP_OMCI_ALLOC_VALUE: u32 = 0x60a;
 pub const BMP_CFG_BOUNDS: u32 = 0x617;
 pub const BMP_CFG_PLOAMU_CTRL: u32 = 0x637;
 
-pub const VLAN_TYPE_CFG: u32 = 0x106;
+pub const VLAN_TYPE_CFG: u32 = 0x6;
 
 pub const NNI_OMCI_DA_CFG: u32 = 0x900;
 pub const NNI_OMCI_TYPE_CFG: u32 = 0x905;
