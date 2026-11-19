@@ -160,6 +160,15 @@ impl Controller {
                 return;
             }
         }
+        // Credential revocation cannot wait for a business transaction to drain.
+        // Adapter changes still follow business configuration activation below.
+        let mut auth = config.omci_auth.clone();
+        auth.selections = self.config.omci_auth.selections.clone();
+        if let Err(error) = crate::omci_auth::configure(&auth) {
+            self.config_error = Some(error);
+            return;
+        }
+        self.config.omci_auth = auth;
         if config.revision == self.config.revision {
             self.pending_config = None;
             self.config_error = None;
@@ -174,9 +183,7 @@ impl Controller {
                 .any(|d| self.resets.blocks(&d.optical_sn))
         {
             self.pending_config = None;
-            self.replace_config(config)
-                .expect("unchanged business configuration");
-            self.config_error = None;
+            self.config_error = self.replace_config(config).err();
             return;
         }
         // Never wait for an offline device's old, entirely unstarted plan.
@@ -212,8 +219,11 @@ impl Controller {
         }
         let (config, _) = self.pending_config.take().unwrap();
         // The controller mutex covers both the eligibility check and replacement.
-        self.replace_config(config)
-            .expect("configuration eligibility checked under lock");
+        if let Err(error) = self.replace_config(config.clone()) {
+            self.pending_config = Some((config, now()));
+            self.config_error = Some(error);
+            return false;
+        }
         self.config_error = None;
         self.failure = None;
         self.attempts.clear();
@@ -268,6 +278,7 @@ impl Controller {
                 }
             }
         }
+        crate::omci_auth::configure(&config.omci_auth)?;
         for previous in &self.config.devices {
             if !config.devices.iter().any(|d| {
                 d.id == previous.id
@@ -286,6 +297,7 @@ impl Controller {
                 .authorization
                 .store(false, std::sync::atomic::Ordering::Release);
         }
+        crate::omci_auth::bind(&config.devices);
         self.config = config;
         super::super::bootstrap::configure(&self.config.devices);
         super::super::health_watch::config(

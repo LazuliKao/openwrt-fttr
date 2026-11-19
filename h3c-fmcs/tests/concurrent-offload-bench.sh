@@ -1,9 +1,14 @@
 #!/bin/sh
 set -e
 
-ONU_MAC="${1:-02:00:00:00:00:01}"
-WAN_IP="${2:-192.0.2.1}"
-FS_IP="${3:-192.0.2.2}"
+if [ "$#" -lt 3 ]; then
+    echo "usage: $0 ONU_MAC WAN_IP FS_IP [WAN_PORT=50010] [BYTES=30000000]" >&2
+    exit 2
+fi
+
+ONU_MAC="$1"
+WAN_IP="$2"
+FS_IP="$3"
 WAN_PORT="${4:-50010}"
 BYTES="${5:-30000000}"
 LOGFILE="/tmp/concurrent_dual_stream.log"

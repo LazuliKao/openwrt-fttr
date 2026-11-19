@@ -3,6 +3,7 @@ include $(TOPDIR)/rules.mk
 PKG_NAME:=openwrt-fttr
 PKG_VERSION:=0.1.0
 PKG_RELEASE:=1
+PKG_LICENSE:=Apache-2.0
 PKG_URL:=https://github.com/LazuliKao/openwrt-fttr/tree/main/fttr
 
 PKG_BUILD_DEPENDS:=rust/host

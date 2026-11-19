@@ -5,6 +5,7 @@ include $(INCLUDE_DIR)/kernel.mk
 
 PKG_NAME:=h3c-fmcs
 PKG_RELEASE:=1
+PKG_LICENSE:=GPL-2.0-only
 PKG_URL:=https://github.com/LazuliKao/openwrt-fttr/tree/main/h3c-fmcs
 
 include $(INCLUDE_DIR)/package.mk

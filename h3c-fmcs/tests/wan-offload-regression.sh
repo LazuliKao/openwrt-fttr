@@ -1,8 +1,13 @@
 #!/bin/sh
 set -e
 
-ONU_MAC="${1:-020000000001}"
-WAN_IP="${2:-192.168.22.50}"
+if [ "$#" -lt 2 ]; then
+    echo "usage: $0 ONU_MAC WAN_IP [PORT=49361]" >&2
+    exit 2
+fi
+
+ONU_MAC="$1"
+WAN_IP="$2"
 PORT="${3:-49361}"
 SAMPLE_LOG='/tmp/wan_regression_samples.log'
 CLIENT_OUT='/tmp/wan_client.out'

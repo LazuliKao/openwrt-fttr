@@ -29,6 +29,9 @@ pub(crate) trait PlatformBackend: Debug + Sync {
     fn channel(&self, id: u8, channel: u16) -> io::Result<Box<dyn ChannelGuard>>;
     fn exchange_channel(&self, id: u8, channel: u16) -> io::Result<u16>;
     fn send_ploam(&self, frame: &PloamFrame) -> io::Result<()>;
+    fn revoke_business(&self, _id: u8) -> io::Result<()> {
+        Err(unsupported("business forwarding revocation"))
+    }
     fn run(&self, platform: PlatformContext) -> Result<(), SelectionError>;
 
     fn diagnostics(&self) -> Option<&dyn PlatformDiagnostics> {

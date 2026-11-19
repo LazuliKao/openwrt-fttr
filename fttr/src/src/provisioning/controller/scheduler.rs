@@ -40,6 +40,7 @@ pub(super) fn tick(engine: &Arc<Mutex<crate::pon_engine::PonEngine>>, batch: Rea
     let mut c = controller().lock().unwrap();
     c.acs_status = acs_status.into_metadata();
     c.resolve_pending_identities(&devices);
+    crate::omci_auth::bind(&c.config.devices);
     let config = c.config.clone();
     bootstrap::retain_devices(
         &config
@@ -72,6 +73,9 @@ pub(super) fn tick(engine: &Arc<Mutex<crate::pon_engine::PonEngine>>, batch: Rea
     c.begin_history_tick();
     let mut history_changed = false;
     for d in &config.devices {
+        if !crate::omci_auth::allowed(&d.optical_sn) {
+            continue;
+        }
         if c.resets.blocks(&d.optical_sn) {
             continue;
         }
@@ -471,6 +475,7 @@ mod config_change_tests {
         op.results
             .insert("wifi".into(), json!({"id":"wifi","state":"verified"}));
         let device = op.device.clone();
+        crate::omci_auth::test_authorize(&device.optical_sn);
         let mut c = Controller::default();
         c.config.enabled = true;
         c.config.automatic = true;
@@ -504,6 +509,7 @@ mod config_change_tests {
         schedule(&mut c, &ready, true, false, 101);
         assert_eq!(c.operations[&ready.id].id, id);
 
+        crate::omci_auth::test_authorize(&offline.optical_sn);
         schedule(&mut c, &offline, true, false, 102);
         assert_eq!(c.operations[&offline.id].revision, "new-revision");
     }

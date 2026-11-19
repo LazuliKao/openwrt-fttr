@@ -2,6 +2,7 @@
 name = "openwrt-fttr"
 version = "0.1.0"
 edition = "2021"
+license = "Apache-2.0"
 autobins = false
 description = "OpenWrt FTTR controller and multi-vendor device management tools"
 repository = "https://github.com/LazuliKao/openwrt-fttr"

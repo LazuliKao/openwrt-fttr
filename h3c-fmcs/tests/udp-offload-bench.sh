@@ -1,8 +1,13 @@
 #!/bin/sh
 set -e
 
-ONU_MAC="${1:-02:00:00:00:00:01}"
-WAN_IP="${2:-192.0.2.1}"
+if [ "$#" -lt 2 ]; then
+    echo "usage: $0 ONU_MAC WAN_IP [PORT=50001] [DURATION=15]" >&2
+    exit 2
+fi
+
+ONU_MAC="$1"
+WAN_IP="$2"
 PORT="${3:-50001}"
 DURATION="${4:-15}"
 LOGFILE="/tmp/udp_bench_samples.log"

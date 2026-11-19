@@ -325,6 +325,7 @@ impl Adapter {
         id: u8,
         token: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> std::io::Result<()> {
+        crate::omci_auth::authenticate(platform, id, token.clone(), self.auth_layout())?;
         match self {
             #[cfg(feature = "device-hl202")]
             Self::Hl202 => {
@@ -356,6 +357,13 @@ impl Adapter {
             }
         }
     }
+    pub(crate) fn auth_layout(self) -> crate::omci_auth::Layout {
+        match self {
+            #[cfg(feature = "device-hl202")]
+            Self::Hl202 => hl202::AUTH_LAYOUT,
+            _ => crate::omci_auth::STANDARD,
+        }
+    }
 }
 pub fn select(vendor: &str, identity: &crate::model::OnuIdentity) -> Adapter {
     select_with_serial(vendor, identity, None)
@@ -368,7 +376,9 @@ pub fn select_with_serial(
 ) -> Adapter {
     let equipment = identity.equipment_id.as_deref();
     if let Some(id) = serial.and_then(crate::provisioning::configured_omci_adapter) {
-        return select_explicit(&id, vendor, identity, serial);
+        if id != "auto" && !id.is_empty() {
+            return select_explicit(&id, vendor, identity, serial);
+        }
     }
     #[cfg(feature = "device-hl202")]
     if hl202::matches(vendor, equipment) {
@@ -400,6 +410,10 @@ pub fn select_with_serial(
     if scty::matches(vendor, equipment) {
         return Adapter::Scty;
     }
+    #[cfg(feature = "device-fiberhome")]
+    if fiberhome::matches(vendor, equipment) {
+        return Adapter::Fiberhome;
+    }
     #[cfg(feature = "device-realtek")]
     if realtek::matches(vendor, equipment) {
         return Adapter::Realtek;
@@ -413,10 +427,11 @@ pub fn select_with_serial(
     Adapter::Unavailable
 }
 
-/// Explicit A selection never falls through to another device adapter.
+/// Explicit adapter selection forces the requested compiled adapter without
+/// rejecting mismatched equipment models; unknown or uncompiled IDs remain unavailable.
 pub(crate) fn select_explicit(
     id: &str,
-    vendor: &str,
+    _vendor: &str,
     identity: &crate::model::OnuIdentity,
     serial: Option<&str>,
 ) -> Adapter {
@@ -424,26 +439,23 @@ pub(crate) fn select_explicit(
     match id {
         "generic" => Adapter::GenericBridge,
         #[cfg(feature = "device-hl202")]
-        "hl202" if hl202::matches(vendor, equipment) => Adapter::Hl202,
+        "hl202" => Adapter::Hl202,
         #[cfg(feature = "device-hwtc")]
-        "hwtc" if vendor == "HWTC" => match hwtc::profile(equipment) {
-            profile @ (hwtc::Profile::K155 | hwtc::Profile::V152) => Adapter::Hwtc(profile),
-            hwtc::Profile::Standard => Adapter::Unavailable,
-        },
+        "hwtc" => Adapter::Hwtc(hwtc::profile(equipment)),
         #[cfg(feature = "device-star")]
-        "star" if vendor == "STAR" || equipment == Some("SG631Z-C") => Adapter::Star,
+        "star" => Adapter::Star,
         #[cfg(feature = "device-zte")]
-        "zte" => zte::profile(vendor, equipment, serial)
-            .map(Adapter::Zte)
-            .unwrap_or(Adapter::Unavailable),
+        "zte" => {
+            Adapter::Zte(zte::profile(_vendor, equipment, serial).unwrap_or(zte::Profile::G1612))
+        }
         #[cfg(feature = "device-scty")]
-        "scty" if scty::matches(vendor, equipment) => Adapter::Scty,
+        "scty" => Adapter::Scty,
         #[cfg(feature = "device-fiberhome")]
-        "fiberhome" if fiberhome::matches(vendor, equipment) => Adapter::Fiberhome,
+        "fiberhome" => Adapter::Fiberhome,
         #[cfg(feature = "device-realtek")]
-        "realtek" if realtek::matches(vendor, equipment) => Adapter::Realtek,
+        "realtek" => Adapter::Realtek,
         _ => {
-            let _ = (vendor, equipment, serial);
+            let _ = (equipment, serial);
             Adapter::Unavailable
         }
     }
@@ -688,19 +700,29 @@ mod tests {
     }
 
     #[test]
-    fn explicit_omci_selection_never_falls_back_to_another_adapter() {
-        let identity = crate::model::OnuIdentity::default();
+    fn explicit_omci_selection_forces_requested_adapter() {
+        let identity = crate::model::OnuIdentity {
+            equipment_id: Some("HG6371F-G-C".into()),
+            ..Default::default()
+        };
         assert_eq!(
             select_explicit("unknown", "H3CT", &identity, None),
             Adapter::Unavailable
         );
+        #[cfg(feature = "device-hwtc")]
         assert_eq!(
             select_explicit("hwtc", "H3CT", &identity, None),
-            Adapter::Unavailable
+            Adapter::Hwtc(hwtc::Profile::Standard)
         );
+        #[cfg(feature = "device-hl202")]
         assert_eq!(
             select_explicit("hl202", "HWTC", &identity, None),
-            Adapter::Unavailable
+            Adapter::Hl202
+        );
+        #[cfg(feature = "device-fiberhome")]
+        assert_eq!(
+            select_explicit("fiberhome", "FHTT", &identity, None),
+            Adapter::Fiberhome
         );
         assert_eq!(
             select_explicit("generic", "HWTC", &identity, None),

@@ -20,6 +20,7 @@ fn unsupported_platform_pin_is_rejected_before_reload_mutates_active_state() {
 fn configured() -> Controller {
     let op = operation(OperationPhase::Completed, false);
     let device = op.device.clone();
+    crate::omci_auth::test_authorize(&device.optical_sn);
     let mut c = Controller::default();
     c.config.devices.push(device.clone());
     c.recovered.insert(device.id.clone(), op.view());

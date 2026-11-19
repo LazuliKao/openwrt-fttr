@@ -62,6 +62,9 @@ impl PlatformBackend for Hm2004Du {
     fn health_diagnostic(&self, platform: PlatformContext) -> io::Result<()> {
         health::diagnostic(platform)
     }
+    fn revoke_business(&self, id: u8) -> io::Result<()> {
+        fmcs::set_fttr_carrier(u32::from(id), false)
+    }
     fn watch(
         &self,
         platform: PlatformContext,

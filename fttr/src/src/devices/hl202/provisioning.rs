@@ -528,7 +528,16 @@ pub async fn run(
     full: bool,
     revision: String,
     operation_id: u64,
+    auth_epoch: u64,
 ) -> Result<Value, String> {
+    let check_auth = || {
+        if crate::omci_auth::serial_epoch(&device.optical_sn) == Some(auth_epoch) {
+            Ok(())
+        } else {
+            Err("OMCI authentication generation changed".to_string())
+        }
+    };
+    check_auth()?;
     let (selection, target_mac) = {
         let registry = crate::mqtt_identity::shared().lock().unwrap();
         let targets: Vec<_> = registry
@@ -560,6 +569,7 @@ pub async fn run(
         Err(_) => return Err("cannot read command ownership journal".into()),
     };
     let inventory = parse(&execute(&selection, INVENTORY).await?)?;
+    check_auth()?;
     let mut desired = compile(&device, &inventory, owned, full)?;
     desired.owned.revision = revision;
     desired.owned.operation_id = operation_id;
@@ -601,9 +611,11 @@ pub async fn run(
         )
         .map_err(|_| "persist command write intent")?;
         let script = write_script(&diff, &desired.removed);
+        check_auth()?;
         uncertain = execute(&selection, &script)
             .await
             .map_or(true, |s| s.trim() != "FTTR_WRITE_COMPLETE");
+        check_auth()?;
         match execute(&selection, INVENTORY).await.and_then(|s| parse(&s)) {
             Ok(readback) => actual = readback,
             Err(_) => uncertain = true,

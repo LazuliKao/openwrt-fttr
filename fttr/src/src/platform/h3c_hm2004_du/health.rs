@@ -26,7 +26,13 @@ struct CarrierLease {
 }
 impl Drop for CarrierLease {
     fn drop(&mut self) {
-        if let Err(e) = bosa::set_fttr_carrier(self.id as u32, self.previous) {
+        let restore = || bosa::set_fttr_carrier(self.id as u32, self.previous);
+        let result = if self.previous {
+            crate::omci_auth::admit(self.id, restore)
+        } else {
+            restore()
+        };
+        if let Err(e) = result {
             eprintln!("carrier restore failed: {e}");
         }
     }
@@ -514,7 +520,7 @@ fn run(
                         ))?
                         .trim()
                             == "1";
-                    bosa::set_fttr_carrier(id as u32, true)?;
+                    crate::omci_auth::admit(id, || bosa::set_fttr_carrier(id as u32, true))?;
                     carrier_lease = Some(CarrierLease { id, previous });
                     println!("VERIFIED_LINK_ENABLED OMCI_GET=true GEM_RX={} watch={watch}; management/Wi-Fi requires separate verification", last_data.is_some());
                 }

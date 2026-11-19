@@ -27,3 +27,13 @@ pub(super) fn matches(vendor: &str, equipment: Option<&str>) -> bool {
 }
 #[cfg(feature = "mqtt")]
 pub mod accounts;
+pub(crate) const AUTH_LAYOUT: crate::omci_auth::Layout = crate::omci_auth::Layout {
+    name: "hl202-private",
+    class: 65530,
+    loid_mask: 0x4000,
+    password_mask: 0x2000,
+    status_mask: 0x1000,
+    loid_width: 10,
+    password_width: 10,
+    recover_alloc_channel: true,
+};

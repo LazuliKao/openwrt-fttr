@@ -213,6 +213,9 @@ pub(super) fn configure(devices: &[Device]) {
 
 /// Scheduler entry point. Remote commands execute outside controller and bootstrap locks.
 pub(super) fn tick(observation: Observation<'_>) {
+    let Some(auth_epoch) = crate::omci_auth::serial_epoch(&observation.device.optical_sn) else {
+        return;
+    };
     let Ok(sources) = crate::mqtt_identity::shared().lock() else {
         return;
     };
@@ -232,6 +235,7 @@ pub(super) fn tick(observation: Observation<'_>) {
                 job.vlans,
                 job.priority,
                 job.authorization_epoch,
+                auth_epoch,
             )
             .await
         });
@@ -478,11 +482,14 @@ impl Coordinator {
     }
 }
 
-fn progress(id: &str, generation: u64, state: Phase, reason: &str) -> bool {
+fn progress(id: &str, generation: u64, auth_epoch: u64, state: Phase, reason: &str) -> bool {
     let mut c = coordinator().lock().unwrap();
     let Some(r) = c.records.get_mut(id) else {
         return false;
     };
+    if crate::omci_auth::serial_epoch(&r.optical_sn) != Some(auth_epoch) {
+        return false;
+    }
     if r.generation != generation || r.worker != Some(generation) || r.state == Phase::Ready {
         return false;
     }
@@ -494,9 +501,15 @@ fn progress(id: &str, generation: u64, state: Phase, reason: &str) -> bool {
     true
 }
 
-async fn progress_async(id: &str, generation: u64, state: Phase, reason: &'static str) -> bool {
+async fn progress_async(
+    id: &str,
+    generation: u64,
+    auth_epoch: u64,
+    state: Phase,
+    reason: &'static str,
+) -> bool {
     let id = id.to_owned();
-    crate::runtime::spawn_blocking(move || progress(&id, generation, state, reason))
+    crate::runtime::spawn_blocking(move || progress(&id, generation, auth_epoch, state, reason))
         .await
         .unwrap_or(false)
 }
@@ -510,6 +523,7 @@ async fn run(
     vlans: Vec<u32>,
     priority: u32,
     authorization_epoch: u64,
+    auth_epoch: u64,
 ) {
     let result = async {
         let credentials = management_network::credentials(authorization_epoch)
@@ -517,6 +531,7 @@ async fn run(
         if !progress_async(
             &id,
             generation,
+            auth_epoch,
             Phase::DiscoveringManagementWan,
             "discovering the dedicated TR069 management WAN",
         )
@@ -540,6 +555,7 @@ async fn run(
                             progress_async(
                                 &id,
                                 generation,
+                                auth_epoch,
                                 Phase::ConfiguringManagementWan,
                                 "conditionally configuring and persisting the dedicated TR069 WAN",
                             )
@@ -548,6 +564,7 @@ async fn run(
                         crate::devices::ManagementWanStage::Verifying => progress_async(
                             &id,
                             generation,
+                            auth_epoch,
                             Phase::VerifyingManagementWan,
                             "reading back management VLAN, routing, DHCP and unbound interfaces",
                         )
@@ -578,6 +595,7 @@ async fn run(
         if !progress_async(
             &id,
             generation,
+            auth_epoch,
             Phase::Reading,
             "reading CWMP configuration after management WAN verification",
         )
@@ -592,6 +610,7 @@ async fn run(
             if !progress_async(
                 &id,
                 generation,
+                auth_epoch,
                 Phase::Configuring,
                 "conditionally correcting and persisting CWMP settings",
             )
@@ -612,6 +631,7 @@ async fn run(
         if !progress_async(
             &id,
             generation,
+            auth_epoch,
             Phase::Verifying,
             "independently reading back CWMP settings",
         )

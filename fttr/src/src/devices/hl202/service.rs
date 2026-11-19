@@ -193,19 +193,8 @@ pub fn configure(
             "HL202 profile requires verified HL202-DU-C equipment identity",
         ));
     }
-    // Verify the existing FTTR credentials before setting status=1.
-    // Do not overwrite the ONU's credentials.
-    let loid = session.get(65530, 0, 0x4000)?;
-    let password = session.get(65530, 0, 0x2000)?;
-    if &loid.payload[3..13] != b"subGateway" || &password.payload[3..13] != b"0000000000" {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "ONU credentials differ from verified stock FTTR profile",
-        ));
-    }
-    session.set(65530, 0, 0x1000, &[1])?;
-    verify(&mut session, 65530, 0, 0x1000, &[1])?;
-    println!("STOCK_FTTR_AUTH_STATUS_READBACK_OK; existing credentials matched");
+    // Authorization is performed by the adapter entry before business writes.
+    crate::omci_auth::admit(id, || Ok(()))?;
     // Assign the platform-owned Alloc-ID to the model's T-CONT 0x8000.
     // Create GAL profile 1 and bridge profile 1 first.
     create_verified(&mut session, 272, 1, &me::gal(), &[1])?;

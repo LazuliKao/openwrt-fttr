@@ -227,6 +227,7 @@ impl Device {
 
 #[derive(Clone, Default)]
 pub struct Config {
+    pub omci_auth: crate::omci_auth::Config,
     pub onu_pins: BTreeMap<String, u8>,
     pub revision: String,
     pub business_revision: Option<String>,

@@ -499,6 +499,17 @@ pub struct DeviceOmciManagement {
 }
 #[derive(Serialize, Deserialize)]
 #[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
+pub struct OmciAuthStatus {
+    pub mode: String,
+    pub source: String,
+    pub state: String,
+    pub backend: Option<String>,
+    /// Actual ONU-reported credentials, never the configured comparison values.
+    pub reported_loid: Option<String>,
+    pub reported_password: Option<String>,
+}
+#[derive(Serialize, Deserialize)]
+#[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
 pub struct DeviceSync {
     pub device: String,
     pub name: Option<String>,
@@ -508,6 +519,9 @@ pub struct DeviceSync {
     pub template_name: Option<String>,
     pub optical_sn: String,
     pub omci_adapter: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "codegen", ts(optional))]
+    pub omci_auth: Option<OmciAuthStatus>,
     pub bootstrap_adapter: String,
     pub provisioning_adapter: String,
     pub omci_management: DeviceOmciManagement,

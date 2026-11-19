@@ -67,13 +67,18 @@ pub fn compile(text: &str) -> Result<Config, String> {
                 | "wifi"
                 | "offload"
                 | "mqtt"
+                | "omci_auth"
         ) {
             return Err(format!("unsupported section: {}", s.kind));
         }
         let allowed: &[&str] = match s.kind.as_str() {
+            "omci_auth" => &["auth_mode", "auth_loid", "auth_password", "schema_version"],
             "optical" => &["enabled", "downstream_tx_enabled", "fec_enabled"],
             "calibration" => &["source"],
             "device" => &[
+                "auth_mode",
+                "auth_loid",
+                "auth_password",
                 "name",
                 "optical_sn",
                 "onu_id",
@@ -361,6 +366,7 @@ pub fn compile(text: &str) -> Result<Config, String> {
         order.insert(device.clone(), network_ids);
     }
     let mut cfg = config::compile_sections(expanded)?;
+    cfg.omci_auth = config::compile_auth(&all.iter().cloned().collect())?;
     if let Some((_, s)) = all.iter().find(|(_, s)| s.kind == "management") {
         let acs = all.iter().find(|(_, s)| s.kind == "acs").map(|(_, s)| s);
         let mut desired = super::management_network::Desired::parse(s, acs)?;
@@ -436,11 +442,12 @@ pub fn compile(text: &str) -> Result<Config, String> {
                 business.options.remove("onu_id");
             }
             canonical_section(&mut canonical, id, &business);
-            if !matches!(business.kind.as_str(), "management" | "acs") {
+            if !matches!(business.kind.as_str(), "management" | "acs" | "omci_auth") {
                 if business.kind == "device" {
                     business.options.retain(|key, _| {
                         !matches!(key.as_str(), "omci_adapter" | "bootstrap_adapter")
                             && !key.starts_with("connection_request")
+                            && !key.starts_with("auth_")
                     });
                 }
                 canonical_section(&mut business_canonical, id, &business);

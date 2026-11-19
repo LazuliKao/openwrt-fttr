@@ -94,6 +94,7 @@ impl Services {
         }
     }
     pub fn stop(&mut self, id: u8) {
+        crate::omci_auth::forget(id);
         if let Some(token) = self.tokens.remove(&id) {
             token.store(true, Ordering::Release);
         }
@@ -102,6 +103,19 @@ impl Services {
             state.mib = None;
             if let Some(wake) = state.wake.take() {
                 wake.notify();
+            }
+        }
+    }
+    pub fn refresh_auth(&mut self) {
+        let stale: Vec<_> = self
+            .tokens
+            .iter()
+            .filter(|(_, token)| token.load(Ordering::Acquire))
+            .map(|(&id, _)| id)
+            .collect();
+        for id in stale {
+            if let Some(serial) = onu_serial(id) {
+                self.start(id, serial[..4].to_owned());
             }
         }
     }
@@ -174,6 +188,7 @@ impl Services {
                 }
             };
             let mut wake = None;
+            let mut auth_failures = 0;
             while !token.load(Ordering::Acquire) {
                 set(BusinessPhase::Configuring, None);
                 let result = (|| {
@@ -200,6 +215,13 @@ impl Services {
                 if let Err(error) = result {
                     eprintln!("[-] ONU {id} generation={generation} service retry: {error}");
                     set(BusinessPhase::Retrying, Some(error.to_string()));
+                    if crate::omci_auth::exchange_failed(id) { auth_failures += 1; }
+                    if error.kind() == std::io::ErrorKind::PermissionDenied || auth_failures >= 3 {
+                        // A mismatch is stable for this registration and policy.
+                        // Keep the worker cancellable; reload creates a new generation.
+                        while !token.load(Ordering::Acquire) { thread::sleep(Duration::from_millis(100)); }
+                        break;
+                    }
                 }
                 for _ in 0..100 {
                     if token.load(Ordering::Acquire) { break; }

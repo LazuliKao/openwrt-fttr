@@ -20,15 +20,19 @@ impl Job {
     ) -> Self {
         let job = Self::default();
         let result = job.clone();
+        let auth_epoch = crate::omci_auth::serial_epoch(&device.optical_sn);
         crate::runtime::spawn(async move {
             #[cfg(all(feature = "device-hl202", feature = "mqtt"))]
-            let outcome = if device.provisioning_adapter == "hl202-mqtt" {
+            let outcome = if auth_epoch.is_none() {
+                Err("OMCI authentication pending".into())
+            } else if device.provisioning_adapter == "hl202-mqtt" {
                 crate::devices::hl202::provisioning::run(
                     device,
                     apply,
                     full,
                     revision,
                     operation_id,
+                    auth_epoch.unwrap(),
                 )
                 .await
             } else {
@@ -36,7 +40,7 @@ impl Job {
             };
             #[cfg(not(all(feature = "device-hl202", feature = "mqtt")))]
             let outcome = {
-                let _ = (device, apply, full, revision, operation_id);
+                let _ = (device, apply, full, revision, operation_id, auth_epoch);
                 Err("command provisioning not compiled".into())
             };
             *result.0.lock().unwrap() = Some(outcome);

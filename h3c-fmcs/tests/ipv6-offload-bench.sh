@@ -1,8 +1,13 @@
 #!/bin/sh
 set -e
 
-ONU_MAC="${1:-02:00:00:00:00:01}"
-WAN_IP6="${2:-2001:db8::1}"
+if [ "$#" -lt 2 ]; then
+    echo "usage: $0 ONU_MAC WAN_IP6 [PORT=50002] [BYTES=35000000]" >&2
+    exit 2
+fi
+
+ONU_MAC="$1"
+WAN_IP6="$2"
 PORT="${3:-50002}"
 BYTES="${4:-35000000}"
 LOGFILE="/tmp/ipv6_bench_samples.log"

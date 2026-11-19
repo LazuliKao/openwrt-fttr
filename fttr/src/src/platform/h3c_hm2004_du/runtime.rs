@@ -650,18 +650,14 @@ async fn run_async(platform: PlatformContext) {
                     ready && !stopping.load(Ordering::Acquire) && optics.state == OpticalState::Enabled,
                     &mut optical_calibration::Hardware,
                 ) {
-                    eprintln!("[-] Temperature compensation failed; resetting optical owner: {error}");
-                    let mut backend = RuntimeOptics {
-                        ready, ranging: &mut ranging, online: &mut online,
-                        pending_cleanup: &mut pending_cleanup, services: &mut services,
-                        engine: &pon_engine_ploam,
-                    };
-                    let _ = backend.quiesce();
-                    let reset = backend.set_tx(false);
-                    optics.state = OpticalState::Unknown;
+                    // Record the failure and retry on the next cycle. Resetting the
+                    // BOSA and forcing OpticalState::Unknown here would hold the optical
+                    // port in reset permanently: the loop below skips every state that
+                    // is not Enabled, so compensation would never be rescheduled.
+                    eprintln!("[-] Temperature compensation failed (kept optical state, will retry): {error}");
                     let mut runtime = optical_calibration::RUNTIME.write().unwrap();
-                    runtime.compensation.reason = "write_failed_owner_reset".into();
-                    runtime.compensation.error = Some(match reset { Ok(()) => error.to_string(), Err(reset) => format!("{error}; recovery reset failed: {reset}") });
+                    runtime.compensation.reason = "write_failed_retry".into();
+                    runtime.compensation.error = Some(error.to_string());
                 }
                 if stopping.load(Ordering::Acquire) || !ready || !mac_allowed || optics.state != OpticalState::Enabled {
                     thread::sleep(Duration::from_millis(10));
@@ -975,6 +971,7 @@ async fn run_async(platform: PlatformContext) {
                     println!("[+] ONU {id} moved to independent online set; discovery remains enabled (online={})", online.len());
                 }
                 let expired: Vec<_> = online
+                    // Authentication changes cancel workers without disturbing PLOAM.
                     .iter()
                     .filter(|(_, session)| session.expired(Instant::now()))
                     .map(|(&id, _)| id)
@@ -987,6 +984,7 @@ async fn run_async(platform: PlatformContext) {
                     pending_cleanup.insert(id);
                     println!("[-] ONU {id} online evidence expired; independent cleanup scheduled");
                 }
+                services.refresh_auth();
                 if let Some(session) = ranging.as_ref().filter(|s| s.expired(Instant::now())) {
                     let id = session.id;
                     println!("[-] ONU {id} activation expired (confirmed={}); revoke O5/EqD and re-register", session.confirmed);

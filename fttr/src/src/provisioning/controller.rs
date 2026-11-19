@@ -165,6 +165,9 @@ pub(crate) fn configured_omci_adapter(serial: &str) -> Option<String> {
 }
 
 pub(crate) fn management_desired(serial: &str) -> Option<(config::Management, String)> {
+    if !crate::omci_auth::allowed(serial) {
+        return None;
+    }
     if !controller()
         .lock()
         .unwrap()
@@ -300,6 +303,13 @@ impl Controller {
             return Err("device reset pending; retry reset before synchronization".into());
         }
         if apply
+            && devices
+                .iter()
+                .any(|d| !crate::omci_auth::allowed(&d.optical_sn))
+        {
+            return Err("OMCI authentication is not authorized for the selected device".into());
+        }
+        if apply
             && self.config.management_network.as_ref().is_some_and(|d| {
                 devices.iter().any(|device| device.backend() == "acs")
                     && !super::management_network::matches_desired(d)
@@ -417,12 +427,15 @@ impl Controller {
                 aggregate(&ssids)
             };
             let assignment=self.config.assignments.get(&d.id);
-            json!({"device":d.id,"name":self.config.labels.get(&d.id),"group":assignment.map(|a|&a.0),"group_name":assignment.and_then(|a|self.config.labels.get(&a.0)),"template":assignment.map(|a|&a.1),"template_name":assignment.and_then(|a|self.config.labels.get(&a.1)),"optical_sn":d.optical_sn,"omci_adapter":d.omci_adapter,"bootstrap_adapter":d.bootstrap_adapter,"provisioning_adapter":d.provisioning_adapter,"omci_management":self.omci_management_view(d),"management":self.management.get(&d.id),"mqtt":self.mqtt.get(&d.id),"acs_bootstrap":super::bootstrap::view(d,self.config.management.as_ref(),&self.acs_status),"provisioning":operation,"services":services,"ssids":ssids,"wifi_sync":wifi_sync})
+            json!({"device":d.id,"name":self.config.labels.get(&d.id),"group":assignment.map(|a|&a.0),"group_name":assignment.and_then(|a|self.config.labels.get(&a.0)),"template":assignment.map(|a|&a.1),"template_name":assignment.and_then(|a|self.config.labels.get(&a.1)),"optical_sn":d.optical_sn,"omci_adapter":d.omci_adapter,"bootstrap_adapter":d.bootstrap_adapter,"provisioning_adapter":d.provisioning_adapter,"omci_auth":crate::omci_auth::view(&d.optical_sn),"omci_management":self.omci_management_view(d),"management":self.management.get(&d.id),"mqtt":self.mqtt.get(&d.id),"acs_bootstrap":super::bootstrap::view(d,self.config.management.as_ref(),&self.acs_status),"provisioning":operation,"services":services,"ssids":ssids,"wifi_sync":wifi_sync})
         }).collect();
         json!({"enabled":self.config.enabled,"mode":if self.config.automatic {"auto"} else {"manual"},"method":"diff","revision":self.config.revision,"triggers":self.config.triggers,"interval_minutes":self.config.interval_seconds / 60,"omci_management":{"desired":self.config.management,"state":"not_verified"},"management_network":super::management_network::view(self.config.management_network.as_ref()),"groups":self.config.groups.iter().map(|(id,t)|json!({"id":id,"name":self.config.labels.get(id),"template":t})).collect::<Vec<_>>(),"error":self.failure,"devices":devices,"pending_devices":devices.iter().filter(|d| !matches!(d["provisioning"]["state"].as_str(),Some("completed" | "disabled"))).map(|d| d["device"].clone()).collect::<Vec<_>>()})
     }
 
     fn business_ready(&self, device: &Device) -> bool {
+        if !crate::omci_auth::allowed(&device.optical_sn) {
+            return false;
+        }
         match device.backend() {
             "command" => self
                 .mqtt
@@ -620,6 +633,7 @@ pub fn control(request: &str) -> String {
 }
 
 pub fn start(engine: Arc<Mutex<crate::pon_engine::PonEngine>>) {
+    crate::omci_auth::install();
     {
         let mut c = controller().lock().unwrap();
         c.resources = Some(engine.lock().unwrap().resources);
@@ -775,6 +789,8 @@ mod tests {
     fn business_status_uses_its_own_channel_and_disabled_devices_are_not_pending() {
         let mut c = Controller::default();
         let mut d = operation(OperationPhase::Completed, false).device;
+        assert!(!c.business_ready(&d));
+        crate::omci_auth::test_authorize(&d.optical_sn);
         c.management
             .insert(d.id.clone(), json!({"state":"waiting_inform"}));
         c.mqtt.insert(

@@ -148,7 +148,15 @@ impl State {
                 .interval_authorizations
                 .get(&task.id)
                 .is_some_and(|grant| grant.permits(task, self));
-            if let Err(reason) = if internal_interval {
+            let auth_valid = !matches!(
+                task.method.as_str(),
+                "SetParameterValues" | "AddObject" | "DeleteObject"
+            ) || crate::omci_auth::cwmp_epoch(device).is_some_and(|epoch| {
+                epoch == 0 || task.args["_omci_auth_epoch"].as_u64() == Some(epoch)
+            });
+            if let Err(reason) = if !auth_valid {
+                Err("OMCI authentication generation changed; queued write cancelled".into())
+            } else if internal_interval {
                 Ok(())
             } else {
                 protect_management(self, device, &task.method, &task.args)

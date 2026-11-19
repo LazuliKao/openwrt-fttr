@@ -795,7 +795,7 @@ static rx_handler_result_t fmcs_handle_frame(struct sk_buff **pskb)
 	if (priority == 0 && vlan_id >= 0x100 && vlan_id <= 0x10f) {
 		struct net_device *sub_dev = priv->fttr_devs[vlan_id - 0x100];
 
-		if (sub_dev && (sub_dev->flags & IFF_UP)) {
+		if (sub_dev && (sub_dev->flags & IFF_UP) && netif_carrier_ok(sub_dev)) {
 			if (!skb_mac_header_was_set(skb) ||
 			    skb_mac_header(skb) < skb->head ||
 			    skb_mac_header(skb) > skb->data)

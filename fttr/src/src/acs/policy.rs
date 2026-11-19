@@ -19,6 +19,9 @@ pub(super) fn protect_management(
         "AddObject" | "DeleteObject" => vec![args["object"].as_str().unwrap_or("")],
         _ => return Ok(()),
     };
+    if crate::omci_auth::cwmp_epoch(device).is_none() {
+        return Err("OMCI authentication does not authorize this write".into());
+    }
     if method == "SetParameterValues"
         && args["parameters"]
             .as_array()

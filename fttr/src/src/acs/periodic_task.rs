@@ -42,6 +42,10 @@ impl Authorization {
     }
 
     pub(super) fn permits(&self, task: &Task, state: &State) -> bool {
+        let mut args = task.args.clone();
+        if let Some(object) = args.as_object_mut() {
+            object.remove("_omci_auth_epoch");
+        }
         self.config.enabled
             && self.config.credentials_available()
             && self
@@ -50,7 +54,7 @@ impl Authorization {
                 .load(std::sync::atomic::Ordering::Acquire)
             && task.device == self.device
             && task.method == "SetParameterValues"
-            && task.args == self.args()
+            && args == self.args()
             && super::connection_request_proof::ready(state, &self.device, &self.config)
             && state
                 .connection_request_proofs
@@ -108,6 +112,10 @@ pub(super) fn enqueue(server: &Server, state: &mut State, job: (&str, Request)) 
             ("SetParameterValues", grant.args(), Some(grant))
         }
     };
+    let mut args = args;
+    if method == "SetParameterValues" {
+        args["_omci_auth_epoch"] = serde_json::json!(crate::omci_auth::cwmp_epoch(device)?);
+    }
     let task = Task {
         id,
         device: device.into(),

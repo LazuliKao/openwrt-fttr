@@ -2,21 +2,23 @@
 use fttr_api::AdapterCapability;
 
 pub fn available() -> Vec<AdapterCapability> {
-    let mut entries = vec![AdapterCapability {
-        id: "generic",
-        name: "Generic G.988 Bridge",
-    }];
+    let mut entries = vec![
+        AdapterCapability {
+            id: "auto",
+            name: "Auto",
+        },
+        AdapterCapability {
+            id: "generic",
+            name: "Generic G.988 Bridge",
+        },
+    ];
     for (enabled, id, name) in [
         (cfg!(feature = "device-hl202"), "hl202", "H3C HL202"),
         (cfg!(feature = "device-hwtc"), "hwtc", "Huawei HWTC"),
         (cfg!(feature = "device-star"), "star", "STAR SG631"),
         (cfg!(feature = "device-zte"), "zte", "ZTE G1612 / F650A"),
         (cfg!(feature = "device-scty"), "scty", "SCTY TY-FS803G"),
-        (
-            cfg!(feature = "device-fiberhome"),
-            "fiberhome",
-            "FiberHome experimental bridge",
-        ),
+        (cfg!(feature = "device-fiberhome"), "fiberhome", "FiberHome"),
         (
             cfg!(feature = "device-realtek"),
             "realtek",

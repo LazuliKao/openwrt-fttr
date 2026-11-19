@@ -136,6 +136,12 @@ pub(super) fn parse_sections(text: &str) -> Result<Vec<(String, Section)>, Strin
             }
             "option" | "list" if w.len() == 3 => {
                 let section = &mut sections.last_mut().ok_or("option without section")?.1;
+                if (section.kind == "omci_auth" || section.kind == "device")
+                    && (w[1].starts_with("auth_") || w[1] == "schema_version")
+                    && (w[0] != "option" || section.options.contains_key(&w[1]))
+                {
+                    return Err("OMCI authentication fields require unique scalar options".into());
+                }
                 if section.kind == "device"
                     && w[1] == "onu_id"
                     && (w[0] != "option" || section.options.contains_key("onu_id"))
@@ -189,6 +195,7 @@ pub(super) fn compile_sections(input: Vec<(String, Section)>) -> Result<Config, 
         allow_unsupported_as_bridge: true,
         ..Config::default()
     };
+    cfg.omci_auth = compile_auth(&sections)?;
     if let Some(s) = globals.first() {
         cfg.enabled = boolean(s.get("enabled"), false)?;
         cfg.allow_unsupported_as_bridge = boolean(s.get("allow_unsupported_as_bridge"), true)?;
@@ -280,7 +287,10 @@ pub(super) fn compile_sections(input: Vec<(String, Section)>) -> Result<Config, 
             cfg.onu_pins
                 .insert(s.get("optical_sn").to_ascii_uppercase(), slot);
         }
-        let omci_adapter = s.get("omci_adapter");
+        let omci_adapter = match s.get("omci_adapter") {
+            "" => "auto",
+            other => other,
+        };
         crate::adapters::omci::validate(omci_adapter).map_err(|e| format!("{id}: {e}"))?;
         let provisioning_adapter = s.get("provisioning_adapter");
         crate::adapters::provisioning::lookup(provisioning_adapter)
@@ -598,6 +608,51 @@ pub(super) fn compile_sections(input: Vec<(String, Section)>) -> Result<Config, 
     cfg.revision = format!("{hash:016x}");
     Ok(cfg)
 }
+
+pub(super) fn compile_auth(
+    sections: &BTreeMap<String, Section>,
+) -> Result<crate::omci_auth::Config, String> {
+    let mut auth = crate::omci_auth::Config::default();
+    let globals: Vec<_> = sections
+        .iter()
+        .filter(|(_, s)| s.kind == "omci_auth")
+        .collect();
+    if globals.len() > 1
+        || globals
+            .first()
+            .is_some_and(|(id, _)| !matches!(id.as_str(), "global" | "omci_auth_global"))
+    {
+        return Err("OMCI authentication requires one named global section".into());
+    }
+    if let Some((_, s)) = globals.first() {
+        if s.get("schema_version") != "1" {
+            return Err("OMCI authentication schema_version must be 1".into());
+        }
+        auth.global = crate::omci_auth::parse_policy(
+            s.get("auth_mode"),
+            s.get("auth_loid"),
+            s.get("auth_password"),
+            false,
+        )?
+        .unwrap();
+    }
+    for s in sections.values().filter(|s| s.kind == "device") {
+        auth.selections.insert(
+            s.get("optical_sn").to_ascii_uppercase(),
+            s.get("omci_adapter").into(),
+        );
+        if let Some(policy) = crate::omci_auth::parse_policy(
+            s.get("auth_mode"),
+            s.get("auth_loid"),
+            s.get("auth_password"),
+            true,
+        )? {
+            auth.devices
+                .insert(s.get("optical_sn").to_ascii_uppercase(), policy);
+        }
+    }
+    Ok(auth)
+}
 fn reference<'a>(
     sections: &'a BTreeMap<String, Section>,
     id: &str,
@@ -623,6 +678,39 @@ mod connection_request_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn auth_versions_and_atomic_overrides() {
+        use crate::omci_auth::Policy;
+        assert!(matches!(
+            parse_expanded("").unwrap().omci_auth.global,
+            Policy::Disabled
+        ));
+        let global = "config omci_auth 'omci_auth_global'\n option schema_version '1'\n option auth_mode 'loid_password'\n option auth_loid 'test-onu'\n option auth_password 'test-pass'\n";
+        let device = "config device 'child'\n option optical_sn 'TEST12345678'\n option cwmp_id 'child-id'\n option omci_adapter 'generic'\n option bootstrap_adapter 'none'\n option provisioning_adapter 'none'\n";
+        let inherited = parse_expanded(&format!("{global}{device}")).unwrap();
+        assert!(inherited.omci_auth.devices.is_empty());
+        assert!(inherited.omci_auth.effective("TEST12345678") == &inherited.omci_auth.global);
+        assert!(parse_expanded(&format!(
+            "{global}{device} option auth_mode 'loid_password'\n option auth_loid 'local'\n"
+        ))
+        .is_err());
+        let disabled =
+            parse_expanded(&format!("{global}{device} option auth_mode 'disabled'\n")).unwrap();
+        assert!(matches!(
+            disabled.omci_auth.effective("TEST12345678"),
+            Policy::Disabled
+        ));
+        let changed = parse_expanded(&format!("{global}{device} option auth_mode 'loid_password'\n option auth_loid 'local'\n option auth_password 'local-pass'\n")).unwrap();
+        assert_ne!(inherited.revision, changed.revision);
+        let before = parse(global).unwrap();
+        let after = parse(&global.replace("test-pass", "new-pass")).unwrap();
+        assert_eq!(before.business_revision(), after.business_revision());
+        assert!(parse_expanded(&global.replace("'1'", "'2'")).is_err());
+        assert!(parse_expanded(&global.replace("'1'", "'0'")).is_err());
+        assert!(parse_expanded(&global.replace("'loid_password'", "'legacy_v0'")).is_err());
+        assert!(parse_expanded(&format!("{global} option auth_mode 'disabled'\n")).is_err());
+        assert!(parse_expanded(&global.replace("option auth_loid", "list auth_loid")).is_err());
+    }
     #[test]
     fn service_list_tokens_are_normalized_and_tr069_is_reserved() {
         assert_eq!(

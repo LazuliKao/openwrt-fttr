@@ -239,7 +239,7 @@ impl Server {
             Command::Queue {
                 device,
                 method,
-                args,
+                mut args,
             } => {
                 if !self.enabled {
                     return error("ACS disabled by UCI");
@@ -252,6 +252,12 @@ impl Server {
                 }
                 if let Err(err) = protect_management(&state, &device, &method, &args) {
                     return error(&err);
+                }
+                if matches!(
+                    method.as_str(),
+                    "SetParameterValues" | "AddObject" | "DeleteObject"
+                ) {
+                    args["_omci_auth_epoch"] = json!(crate::omci_auth::cwmp_epoch(&device));
                 }
                 if state.tasks.values().filter(|t| t.state.is_active()).count() >= 128 {
                     return json!({"error":"ACS queue full", "code":"backpressure", "retryable":true});
