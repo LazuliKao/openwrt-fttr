@@ -819,7 +819,17 @@ async fn run_async(platform: PlatformContext) {
                                 String::from_utf8_lossy(&vendor),
                                 sn
                             );
-
+                            // Exact filter first: this OLT's own downstream
+                            // Upstream_Overhead is a broadcast 0x01 frame, so
+                            // its echo parses as a serial report. Compare the
+                            // bytes we transmitted instead of guessing.
+                            if bosa::is_downstream_echo(&rx_data) {
+                                eprintln!(
+                                    "[-] PLOAM: discarding own downstream frame (not an ONU report): {:02X?}",
+                                    &rx_data[..rx_data.len().min(13)]
+                                );
+                                continue;
+                            }
                             let mut engine = pon_engine_ploam.lock().unwrap();
                             let onu = match engine.try_register_onu(vendor, sn) {
                                 Ok(onu) => onu,
