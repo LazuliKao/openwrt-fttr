@@ -4,10 +4,10 @@
 //! Programming the FSL NNI TPID to `0x88a8` lets the standard Linux `8021q` stack demultiplex
 //! each ONU onto its own `fttr1..fttr16` netdev while preserving inner `0x8100` business/TR-069 VLANs.
 use super::RESOURCES;
+use crate::platform::openwrt::command::run_sync;
 use std::{
     fs, io,
     path::Path,
-    process::Command,
     sync::atomic::{AtomicBool, Ordering},
     thread,
     time::{Duration, Instant},
@@ -17,6 +17,7 @@ use std::{
 pub const NNI_MTU: u16 = 1508;
 const DEFAULT_BRIDGE: &str = "br-lan";
 const PORT_ALIAS: &str = "fttrd:fiberhome-vport";
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub fn gem_to_vid(gem_id: u16, offset: u16) -> io::Result<u16> {
     let vid = gem_id.checked_sub(offset).ok_or_else(|| {
@@ -43,16 +44,14 @@ fn valid_interface_name(name: &str) -> bool {
 }
 
 pub fn configured_bridge() -> String {
-    let Ok(output) = Command::new("uci")
-        .args(["-q", "get", "fttr.offload.bridge"])
-        .output()
-    else {
+    let Ok(output) = run_sync(
+        "uci",
+        &["-q", "get", "fttr.offload.bridge"],
+        COMMAND_TIMEOUT,
+    ) else {
         return DEFAULT_BRIDGE.into();
     };
-    if !output.status.success() {
-        return DEFAULT_BRIDGE.into();
-    }
-    let name = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    let name = output.trim().to_owned();
     if valid_interface_name(&name) {
         name
     } else {
@@ -61,18 +60,13 @@ pub fn configured_bridge() -> String {
 }
 
 fn run_ip_link(args: &[&str]) -> io::Result<()> {
-    let output = Command::new("ip").arg("link").args(args).output()?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(io::Error::other(format!(
-            "ip link {} failed ({}): {}",
-            args.join(" "),
-            output.status,
-            stderr.trim()
-        )))
-    }
+    let mut command = vec!["link"];
+    command.extend_from_slice(args);
+    run_sync("ip", &command, COMMAND_TIMEOUT)
+        .map(|_| ())
+        .map_err(|error| {
+            io::Error::new(error.kind(), format!("ip link {}: {error}", args.join(" ")))
+        })
 }
 
 fn matching_vlan_details(details: &str, vlan: &str, nni: &str, vid: u16) -> bool {
@@ -88,15 +82,10 @@ fn matching_vlan_details(details: &str, vlan: &str, nni: &str, vid: u16) -> bool
 }
 
 fn verify_existing_port(iface: &str, nni: &str, vid: u16) -> io::Result<()> {
-    let output = Command::new("ip")
-        .args(["-d", "link", "show", "dev", iface])
-        .output()?;
+    let output = run_sync("ip", &["-d", "link", "show", "dev", iface], COMMAND_TIMEOUT)?;
     let vlan = fs::read_to_string(format!("/proc/net/vlan/{iface}"))?;
     let alias = fs::read_to_string(format!("/sys/class/net/{iface}/ifalias"))?;
-    if alias.trim() == PORT_ALIAS
-        && output.status.success()
-        && matching_vlan_details(&String::from_utf8_lossy(&output.stdout), &vlan, nni, vid)
-    {
+    if alias.trim() == PORT_ALIAS && matching_vlan_details(&output, &vlan, nni, vid) {
         Ok(())
     } else {
         Err(io::Error::new(
@@ -117,6 +106,16 @@ fn attach_bridge(iface: &str, bridge: &str) -> io::Result<()> {
 }
 
 pub fn prepare_nni_and_ports(nni: &str, gem_offset: u16, stopping: &AtomicBool) -> io::Result<()> {
+    // Reject a foreign or legacy port before changing the NNI or any sibling.
+    for entry in RESOURCES.allocations {
+        let Some(iface) = entry.interface else {
+            continue;
+        };
+        let vid = gem_to_vid(entry.gem_id, gem_offset)?;
+        if Path::new(&format!("/sys/class/net/{iface}")).exists() {
+            verify_existing_port(iface, nni, vid)?;
+        }
+    }
     let mtu = NNI_MTU.to_string();
     run_ip_link(&["set", nni, "mtu", &mtu, "up"])?;
     let carrier_path = format!("/sys/class/net/{nni}/carrier");
@@ -166,6 +165,11 @@ pub fn set_port_up(onu_id: u8, up: bool) -> io::Result<()> {
         )
     })?;
     if !Path::new(&format!("/sys/class/net/{iface}")).exists() {
+        if !up {
+            // No interface means no carrier. Teardown need not wait for a
+            // concurrently removed VLAN to reappear before releasing ownership.
+            return Ok(());
+        }
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
             format!("VPORT interface {iface} does not exist"),

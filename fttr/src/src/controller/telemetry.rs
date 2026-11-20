@@ -17,6 +17,8 @@ use std::{
 pub(super) mod fec;
 mod inventory;
 mod poll;
+#[cfg(feature = "platform-fiberhome-an4475-g2")]
+mod segmented;
 pub(super) use poll::start;
 
 #[derive(Clone)]
@@ -112,6 +114,8 @@ pub(crate) struct Collector {
     inventory: Option<inventory::InventorySample>,
     fec: fec::Poll,
     fec_generation: u64,
+    #[cfg(feature = "platform-fiberhome-an4475-g2")]
+    upload: Option<segmented::Upload>,
 }
 
 impl Collector {
@@ -131,27 +135,71 @@ impl Collector {
             inventory: None,
             fec: fec::Poll::default(),
             fec_generation: crate::optical::fec_generation(),
+            #[cfg(feature = "platform-fiberhome-an4475-g2")]
+            upload: None,
         }
     }
 
     pub fn refresh(&mut self) -> bool {
+        self.refresh_inner(None)
+    }
+
+    /// Limit automatic polling on platforms whose port liveness must be checked
+    /// by the same serialized worker. Explicit MIB diagnostics remain separate.
+    #[cfg(feature = "platform-fiberhome-an4475-g2")]
+    pub fn refresh_bounded(&mut self, deadline: Instant) -> bool {
+        self.refresh_inner(Some(deadline))
+    }
+
+    #[cfg(feature = "platform-fiberhome-an4475-g2")]
+    pub fn interrupt_upload(&mut self) {
+        self.upload = None;
+    }
+
+    #[cfg(feature = "platform-fiberhome-an4475-g2")]
+    pub fn upload_pending(&self) -> bool {
+        self.upload.is_some()
+    }
+
+    fn refresh_inner(&mut self, deadline: Option<Instant>) -> bool {
+        // A segmented upload needs multiple poll slices. Start before the old
+        // inventory approaches its 90-second expiry, without extending freshness.
+        let inventory_interval = Duration::from_secs(if deadline.is_some() { 30 } else { 60 });
         if self.ani.is_none()
             || self
                 .inventory
                 .as_ref()
-                .is_none_or(|sample| sample.refresh_due())
+                .is_none_or(|sample| sample.refresh_due(inventory_interval))
         {
             let started = Instant::now();
-            match super::inventory::read_owned(
+            #[cfg(feature = "platform-fiberhome-an4475-g2")]
+            let result = if let Some(outer) = deadline {
+                self.segmented_upload(outer.min(started + Duration::from_secs(4)))
+            } else {
+                Some(super::inventory::read_owned(
+                    self.platform,
+                    self.id,
+                    true,
+                    Some(self.token.clone()),
+                    started + Duration::from_secs(600),
+                    None,
+                    None,
+                ))
+            };
+            #[cfg(not(feature = "platform-fiberhome-an4475-g2"))]
+            let result = Some(super::inventory::read_owned(
                 self.platform,
                 self.id,
                 true,
                 Some(self.token.clone()),
-                started + Duration::from_secs(600),
+                deadline
+                    .map(|outer| outer.min(started + Duration::from_secs(4)))
+                    .unwrap_or(started + Duration::from_secs(600)),
                 None,
                 None,
-            ) {
-                Ok(report) => {
+            ));
+            match result {
+                Some(Ok(report)) => {
                     self.inventory =
                         inventory::InventorySample::from_report(&report, Instant::now());
                     let entities: Vec<_> = report
@@ -165,8 +213,8 @@ impl Collector {
                         _ => Err("ani_g_entity_ambiguous_or_incomplete".into()),
                     });
                 }
-                Err(error) if self.ani.is_none() => self.ani = Some(Err(error.to_string())),
-                Err(_) => {}
+                Some(Err(error)) if self.ani.is_none() => self.ani = Some(Err(error.to_string())),
+                Some(Err(_)) | None => {}
             }
         }
         let fec_generation = crate::optical::fec_generation();
@@ -177,6 +225,9 @@ impl Collector {
         let snapshot = match self.platform.transport(self.id) {
             Ok(transport) => {
                 let mut session = OmciSession::new(transport);
+                if let Some(deadline) = deadline {
+                    session.finish_before(deadline);
+                }
                 let id = self.id;
                 session.guard_registration(move || super::service::operation_confirmed(id));
                 session.cancel_when(self.token.clone());
@@ -199,7 +250,6 @@ impl Collector {
                         snapshot
                             .measurements
                             .insert("optical_tx_power_dbm".into(), evidence);
-                        session.finish_before(Instant::now() + Duration::from_secs(8));
                         if crate::optical::fec_enabled() {
                             let id = self.id;
                             session.guard_registration(move || {
@@ -207,7 +257,11 @@ impl Collector {
                                     && crate::optical::fec_enabled()
                                     && crate::optical::fec_generation() == fec_generation
                             });
-                            snapshot.fec = self.fec.read(&mut session, *entity);
+                            snapshot.fec = session
+                                .with_timeout(Duration::from_secs(8), |session| {
+                                    Ok(self.fec.read(session, *entity))
+                                })
+                                .unwrap_or_else(|error| fec::unavailable(&error.to_string()));
                         } else {
                             self.fec = fec::Poll::default();
                             snapshot.fec = fec::unavailable("fec_support_disabled");
@@ -249,6 +303,42 @@ impl Collector {
         }
         responsive
     }
+
+    #[cfg(feature = "platform-fiberhome-an4475-g2")]
+    fn segmented_upload(
+        &mut self,
+        deadline: Instant,
+    ) -> Option<std::io::Result<crate::pon_engine::omci::mib::MibReport>> {
+        if self.upload.is_none() {
+            let transport = match self.platform.transport(self.id) {
+                Ok(transport) => transport,
+                Err(error) => return Some(Err(error)),
+            };
+            let mut session = OmciSession::new(transport);
+            let id = self.id;
+            session.guard_registration(move || super::service::operation_confirmed(id));
+            session.cancel_when(self.token.clone());
+            match segmented::Upload::begin(session, deadline) {
+                Ok(upload) => self.upload = Some(upload),
+                Err(error) => return Some(Err(error)),
+            }
+        }
+        match self.upload.as_mut().unwrap().step(deadline) {
+            Ok(false) => None,
+            Ok(true) => match self.upload.as_mut().unwrap().verify(deadline) {
+                Ok(()) => Some(Ok(self.upload.take().unwrap().finish())),
+                Err(error) if error.kind() == std::io::ErrorKind::TimedOut => None,
+                Err(error) => {
+                    self.upload = None;
+                    Some(Err(error))
+                }
+            },
+            Err(error) => {
+                self.upload = None;
+                Some(Err(error))
+            }
+        }
+    }
 }
 
 impl Drop for Collector {
@@ -269,11 +359,12 @@ fn read(
     target: (u16, u16, u16),
     optical: bool,
 ) -> (Option<f64>, MeasurementEvidence) {
-    session.finish_before(Instant::now() + Duration::from_secs(2));
     let (class, entity, mask) = target;
     let source = format!("OMCI GET class={class} entity=0x{entity:04x} mask=0x{mask:04x}");
     let unit = if optical { "dBm" } else { "seconds" };
-    match session.get_attributes(class, entity, mask) {
+    match session.with_timeout(Duration::from_secs(2), |session| {
+        session.get_attributes(class, entity, mask)
+    }) {
         Ok(block) => match parse(&block, optical) {
             Some((value, raw)) => (
                 Some(value),

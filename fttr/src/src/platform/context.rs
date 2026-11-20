@@ -33,6 +33,9 @@ impl OmciTransport for Transport {
     fn receive(&mut self) -> io::Result<Option<BaselineFrame>> {
         self.0.receive()
     }
+    fn set_deadline(&mut self, deadline: Option<std::time::Instant>) {
+        self.0.set_deadline(deadline);
+    }
 }
 
 impl PlatformContext {

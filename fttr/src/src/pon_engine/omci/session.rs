@@ -8,38 +8,155 @@ use super::{
     wire::BaselineFrame,
 };
 use std::{
+    collections::BTreeSet,
     io,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, Mutex, OnceLock,
     },
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
 /// Project transport boundary; returns only validated, ONU-isolated protocol frames.
 pub trait OmciTransport: Send {
     fn send(&mut self, frame: &BaselineFrame) -> io::Result<()>;
     fn receive(&mut self) -> io::Result<Option<BaselineFrame>>;
+    fn set_deadline(&mut self, _deadline: Option<Instant>) {}
+}
+
+#[cfg(test)]
+mod allocation_tests {
+    use super::*;
+
+    #[test]
+    fn allocator_wrap_skips_in_flight_transactions_and_can_reuse_released_tci() {
+        let mut pool = TciPool {
+            next: 0x7fff,
+            in_use: BTreeSet::from([1, 2, 0x7fff]),
+        };
+        assert_eq!(pool.reserve().unwrap(), 3);
+        pool.in_use.remove(&1);
+        pool.next = 0x7fff;
+        assert_eq!(pool.reserve().unwrap(), 1);
+        pool.in_use = (1..=0x7fff).collect();
+        assert_eq!(
+            pool.reserve().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    fn request_drop_releases_its_tci() {
+        let request = request_frame(0x49, 256, 0, [0; 32]).unwrap();
+        let tci = request.transaction_id;
+        assert!(tci_pool().lock().unwrap().in_use.contains(&tci));
+        drop(request);
+        // Other tests may allocate concurrently, but the round-robin allocator
+        // will not wrap thousands of requests within this assertion.
+        assert!(!tci_pool().lock().unwrap().in_use.contains(&tci));
+    }
 }
 
 /// OMCI-001/002/003/008 message semantics; retries/guards are project orchestration.
 /// No socket, FPGA register or device topology is owned by this object.
 pub struct OmciSession {
     transport: Box<dyn OmciTransport>,
-    next_tci: u16,
     registration: Option<Box<dyn Fn() -> bool + Send>>,
     cancellation: Option<Arc<AtomicBool>>,
     deadline: Option<Instant>,
 }
+
+/// An upload snapshot owned by one serialized ONU worker. It must be discarded
+/// if another MIB upload is started or the registration changes.
+#[cfg(feature = "platform-fiberhome-an4475-g2")]
+pub(crate) struct MibUpload {
+    assembler: Option<MibAssembler>,
+    next: u16,
+    count: u16,
+    pending: Option<MibTransaction>,
+}
+
+#[cfg(feature = "platform-fiberhome-an4475-g2")]
+struct MibTransaction {
+    request: RequestFrame,
+    sent_at: Option<Instant>,
+    attempts: u8,
+}
+
+struct TciPool {
+    next: u16,
+    in_use: BTreeSet<u16>,
+}
+
+impl TciPool {
+    fn reserve(&mut self) -> io::Result<u16> {
+        for _ in 0..0x7fff {
+            let tci = self.next;
+            self.next = (tci.wrapping_add(1) & 0x7fff).max(1);
+            if self.in_use.insert(tci) {
+                return Ok(tci);
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "OMCI TCI space exhausted",
+        ))
+    }
+}
+
+fn tci_pool() -> &'static Mutex<TciPool> {
+    static POOL: OnceLock<Mutex<TciPool>> = OnceLock::new();
+    POOL.get_or_init(|| {
+        Mutex::new(TciPool {
+            next: 1,
+            in_use: BTreeSet::new(),
+        })
+    })
+}
+
+/// Keep an in-flight TCI reserved even while other sessions wrap the allocator.
+struct RequestFrame(BaselineFrame);
+
+impl std::ops::Deref for RequestFrame {
+    type Target = BaselineFrame;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Drop for RequestFrame {
+    fn drop(&mut self) {
+        tci_pool()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .in_use
+            .remove(&self.transaction_id);
+    }
+}
+
+fn request_frame(
+    message_type: u8,
+    class_id: u16,
+    entity_id: u16,
+    payload: [u8; 32],
+) -> io::Result<RequestFrame> {
+    let tci = tci_pool()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .reserve()?;
+    Ok(RequestFrame(BaselineFrame::new(
+        tci,
+        message_type,
+        class_id,
+        entity_id,
+        payload,
+    )))
+}
+
 impl OmciSession {
     pub fn new(transport: impl OmciTransport + 'static) -> Self {
-        let seed = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u16;
         Self {
             transport: Box::new(transport),
-            next_tci: (seed & 0x7fff).max(1),
             registration: None,
             cancellation: None,
             deadline: None,
@@ -53,6 +170,7 @@ impl OmciSession {
     }
     pub fn finish_before(&mut self, deadline: Instant) {
         self.deadline = Some(deadline);
+        self.transport.set_deadline(self.deadline);
     }
     /// Bound an optional operation without extending or poisoning the caller's deadline.
     pub fn with_timeout<T>(
@@ -63,8 +181,10 @@ impl OmciSession {
         let previous = self.deadline;
         let deadline = Instant::now() + timeout;
         self.deadline = Some(previous.map_or(deadline, |outer| outer.min(deadline)));
+        self.transport.set_deadline(self.deadline);
         let result = operation(self);
         self.deadline = previous;
+        self.transport.set_deadline(previous);
         result
     }
     fn check_active(&self) -> io::Result<()> {
@@ -95,8 +215,7 @@ impl OmciSession {
         entity_id: u16,
         payload: [u8; 32],
     ) -> io::Result<BaselineFrame> {
-        let request = BaselineFrame::new(self.next_tci, message_type, class_id, entity_id, payload);
-        self.next_tci = (self.next_tci.wrapping_add(1) & 0x7fff).max(1);
+        let request = request_frame(message_type, class_id, entity_id, payload)?;
         for _ in 0..3 {
             self.check_active()?;
             self.transport.send(&request)?;
@@ -278,6 +397,96 @@ impl OmciSession {
     }
     pub fn upload_mib(&mut self) -> io::Result<MibReport> {
         self.upload_mib_with_progress(|_, _| Ok(()))
+    }
+
+    #[cfg(feature = "platform-fiberhome-an4475-g2")]
+    pub(crate) fn begin_mib_upload(&mut self) -> MibUpload {
+        MibUpload {
+            assembler: None,
+            next: 0,
+            count: 0,
+            pending: None,
+        }
+    }
+
+    /// Retain the exact request and retry state when an automatic poll slice ends.
+    #[cfg(feature = "platform-fiberhome-an4475-g2")]
+    fn resume_mib_transaction(
+        &mut self,
+        pending: &mut MibTransaction,
+    ) -> io::Result<BaselineFrame> {
+        let timeout = if pending.request.message_type == Action::MibUpload.request_type() {
+            Duration::from_secs(20)
+        } else {
+            Duration::from_secs(2)
+        };
+        loop {
+            self.check_active()?;
+            if pending.sent_at.is_some() {
+                if let Some(frame) = self.transport.receive()? {
+                    if frame.answers(&pending.request) {
+                        std::thread::sleep(Duration::from_millis(25));
+                        return Ok(frame);
+                    }
+                }
+            }
+            if pending.sent_at.is_none_or(|sent| sent.elapsed() >= timeout) {
+                if pending.attempts == 3 {
+                    // Distinguish exhausted retries from the resumable slice deadline.
+                    return Err(io::Error::other("MIB transaction exhausted retries"));
+                }
+                self.transport.send(&pending.request)?;
+                pending.sent_at = Some(Instant::now());
+                pending.attempts += 1;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    /// Fetch exactly one record; a failed request never advances the cursor.
+    #[cfg(feature = "platform-fiberhome-an4475-g2")]
+    pub(crate) fn next_mib_record(&mut self, upload: &mut MibUpload) -> io::Result<bool> {
+        if upload.assembler.is_some() && upload.next >= upload.count {
+            return Ok(true);
+        }
+        let sequence = upload.next;
+        let starting = upload.assembler.is_none();
+        if upload.pending.is_none() {
+            let (action, body) = if starting {
+                (Action::MibUpload, RequestBody::Empty)
+            } else {
+                (Action::MibUploadNext, RequestBody::UploadNext { sequence })
+            };
+            upload.pending = Some(MibTransaction {
+                request: request_frame(action.request_type(), 2, 0, body.encode()?)?,
+                sent_at: None,
+                attempts: 0,
+            });
+        }
+        let frame = self.resume_mib_transaction(upload.pending.as_mut().unwrap())?;
+        upload.pending = None;
+        if starting {
+            let count = u16::from_be_bytes([frame.payload[0], frame.payload[1]]);
+            if count == 0 || count > 2048 {
+                return Err(invalid(format!(
+                    "invalid/beyond supported MIB upload count: {count}"
+                )));
+            }
+            upload.count = count;
+            upload.assembler = Some(MibAssembler::new(count));
+            return Ok(false);
+        }
+        let record = MibRecord::decode(sequence, &frame.payload).map_err(|error| {
+            invalid(format!("MIB sequence={sequence}/{}: {error}", upload.count))
+        })?;
+        upload.assembler.as_mut().unwrap().push(record);
+        upload.next += 1;
+        Ok(upload.next == upload.count)
+    }
+
+    #[cfg(feature = "platform-fiberhome-an4475-g2")]
+    pub(crate) fn finish_mib_upload(upload: MibUpload) -> MibReport {
+        upload.assembler.expect("completed MIB upload").finish()
     }
     pub fn upload_mib_with_progress(
         &mut self,

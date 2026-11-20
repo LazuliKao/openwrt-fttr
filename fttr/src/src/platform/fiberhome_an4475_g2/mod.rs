@@ -34,6 +34,8 @@ pub mod optical;
 #[cfg(feature = "platform-fiberhome-an4475-g2")]
 pub mod polling;
 #[cfg(feature = "platform-fiberhome-an4475-g2")]
+mod port_gate;
+#[cfg(feature = "platform-fiberhome-an4475-g2")]
 pub mod profile;
 #[cfg(feature = "platform-fiberhome-an4475-g2")]
 pub mod protocol;

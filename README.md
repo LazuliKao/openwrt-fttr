@@ -59,7 +59,7 @@ make package/luci-app-fttr/compile V=s
 | OpenWrt 配置 | Cargo feature | OpenWrt 默认 | Cargo 默认 | 状态 |
 | --- | --- | --- | --- | --- |
 | `CONFIG_FTTR_PLATFORM_H3C_HM2004_DU` | `platform-h3c-hm2004-du` | ✅ | ✅ | 依赖 H3C FMCS 驱动 |
-| `CONFIG_FTTR_PLATFORM_FIBERHOME_AN4475_G2` | `platform-fiberhome-an4475-g2` | ❌ | ❌ | FSL 运行态及 ubus 接口，依赖 `kmod-fiberhome-fsl`；完整业务、逐 ONU 数据面和管理链路仍需分层实机验证 |
+| `CONFIG_FTTR_PLATFORM_FIBERHOME_AN4475_G2` | `platform-fiberhome-an4475-g2` | ❌ | ❌ | FSL 运行态、IPC 与 ubus 接口，依赖 `kmod-fiberhome-fsl`；分层验证范围见下文 |
 | `CONFIG_FTTR_PLATFORM_TIANYI_TYFZA1` | `platform-tianyi-tyfza1` | ❌ | ❌ | 编译期 stub；板级身份及驱动尚未调查 |
 | — | `all-platforms` | — | ❌ | Cargo 聚合 feature |
 
@@ -88,8 +88,17 @@ make package/luci-app-fttr/compile V=s
 ```sh
 cargo test --locked --workspace --features fttr-api/codegen
 cargo test --locked --lib --no-default-features --features platform-h3c-hm2004-du,all-devices,acs,mqtt,npu
+cargo test --locked --lib --no-default-features --features platform-fiberhome-an4475-g2,all-devices,acs,mqtt
 cargo check --locked --all-targets --no-default-features --features all-platforms,all-devices,acs,mqtt,npu,diagnostics
 ```
+
+### AN4475-G2 遥测与业务门控
+
+- 自动 MIB 使用分段预算，保留上传序号和在途事务；活体 GET 与上传回复分别匹配。只有采集完整、注册代次仍有效且前后 MIB Data Sync 相同的清单才发布；8 位同步计数仍有回绕限制。
+- 有界遥测提前刷新清单，保留有效期检查；自动采集不再每轮关闭业务口。独立监控线程在活体超龄或取消时关闭 VPORT，关闭失败继续重试并保留归属。用户态锁等待及 `ip`/`uci` 命令有超时，内核 ioctl 和系统调度不作硬实时保证。
+- 显式 MIB/FEC/属性诊断会先关闭目标业务口，完成后须重新取得活体响应才开放。长诊断应安排在允许目标业务中断的窗口。
+- `fttr1..fttr16` 接管前会检查服务别名、父接口、802.1ad 协议及 VID。旧版无 `fttrd:fiberhome-vport` 别名的接口需停服、确认归属后迁移；接口形状一致本身不是归属证据。
+- 2026-11-20 的实机窗口验证了 HL202-DU-C、TY-FS803G、K155-11 的管理端点双向通信、自动清单刷新，以及 HL202 MQTT 命令/配置回读和整机重启恢复。提前刷新版三目标各 360 次 ping 无丢包；其后的审查修复版再次整机重启，三目标各 180 次 ping 无丢包，逐秒 carrier 未见断开、清单持续更新。HL202 VPORT 仍有少量 RX dropped 增量，原因未定位。真实无线客户端、吞吐和真实 CWMP RPC 需单独验收，不能由上述结果推定。
 
 ### Windows Rust 交叉编译
 

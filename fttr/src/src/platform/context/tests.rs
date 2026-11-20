@@ -105,6 +105,12 @@ struct MemoryTransport {
     pending: Option<BaselineFrame>,
 }
 impl OmciTransport for MemoryTransport {
+    fn set_deadline(&mut self, deadline: Option<std::time::Instant>) {
+        self.events
+            .lock()
+            .unwrap()
+            .push(format!("deadline:{deadline:?}"));
+    }
     fn send(&mut self, frame: &BaselineFrame) -> io::Result<()> {
         self.events.lock().unwrap().push("send".into());
         self.pending = Some(frame.clone());
@@ -181,6 +187,32 @@ fn recording_platform() -> (PlatformContext, Events) {
         events: Some(events.clone()),
     }));
     (PlatformContext::from_backend(backend).unwrap(), events)
+}
+
+#[test]
+fn session_deadlines_reach_backend_and_nested_timeout_restores_outer_deadline() {
+    use crate::pon_engine::omci::OmciSession;
+    use std::time::{Duration, Instant};
+
+    let (platform, events) = recording_platform();
+    let mut session = OmciSession::new(platform.transport(72).unwrap());
+    let outer = Instant::now() + Duration::from_secs(10);
+    session.finish_before(outer);
+    session
+        .with_timeout(Duration::from_millis(50), |session| {
+            // An inner operation must not relax its caller's shorter deadline.
+            session.with_timeout(Duration::from_secs(20), |_| {
+                Err::<(), _>(io::Error::other("failed"))
+            })
+        })
+        .unwrap_err();
+    let events = events.lock().unwrap();
+    assert_eq!(events.len(), 6);
+    assert_eq!(events[1], format!("deadline:{:?}", Some(outer)));
+    assert_ne!(events[1], events[2]);
+    assert_eq!(events[2], events[3]);
+    assert_eq!(events[2], events[4]);
+    assert_eq!(events[1], events[5]);
 }
 
 #[test]

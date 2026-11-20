@@ -75,8 +75,8 @@ impl InventorySample {
         })
     }
 
-    pub fn refresh_due(&self) -> bool {
-        self.at.elapsed() >= Duration::from_secs(60)
+    pub fn refresh_due(&self, interval: Duration) -> bool {
+        self.at.elapsed() >= interval
     }
 }
 
@@ -135,5 +135,14 @@ mod tests {
         let sample = InventorySample::from_report(&MibAssembler::new(0).finish(), started).unwrap();
         // When status reads it, then old configuration is withheld.
         assert!(sample.current().is_none());
+    }
+
+    #[test]
+    fn segmented_refresh_has_headroom_before_inventory_expiry() {
+        let sampled = Instant::now() - Duration::from_secs(35);
+        let sample = InventorySample::from_report(&MibAssembler::new(0).finish(), sampled).unwrap();
+        assert!(sample.refresh_due(Duration::from_secs(30)));
+        assert!(!sample.refresh_due(Duration::from_secs(60)));
+        assert!(sample.current().is_some());
     }
 }

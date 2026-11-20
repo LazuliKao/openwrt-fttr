@@ -128,26 +128,153 @@ fn with_session<T>(f: impl FnOnce(&mut FslOltSession<Device>) -> io::Result<T>) 
 
 pub(crate) struct FslOmciTransport {
     onu_id: u8,
+    deadline: Option<Instant>,
+    request: Option<BaselineFrame>,
 }
 
 impl FslOmciTransport {
     pub(crate) fn new(onu_id: u8) -> Self {
-        Self { onu_id }
+        Self {
+            onu_id,
+            deadline: None,
+            request: None,
+        }
+    }
+}
+
+fn lock_before<T>(
+    mutex: &Mutex<T>,
+    deadline: Option<Instant>,
+) -> io::Result<std::sync::MutexGuard<'_, T>> {
+    let Some(deadline) = deadline else {
+        return mutex
+            .lock()
+            .map_err(|_| io::Error::other("FSL mutex poisoned"));
+    };
+    loop {
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "FSL mutex deadline exceeded",
+            ));
+        }
+        match mutex.try_lock() {
+            Ok(guard) => return Ok(guard),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(io::Error::other("FSL mutex poisoned"))
+            }
+            Err(std::sync::TryLockError::WouldBlock) => thread::sleep(Duration::from_millis(1)),
+        }
     }
 }
 
 impl OmciTransport for FslOmciTransport {
+    fn set_deadline(&mut self, deadline: Option<Instant>) {
+        self.deadline = deadline;
+    }
+
     fn send(&mut self, frame: &BaselineFrame) -> io::Result<()> {
         let bytes = frame.to_bytes();
-        with_session(|session| session.send_omci(self.onu_id, &bytes, &mut |_| Ok(())))
+        if self.request.as_ref().is_none_or(|previous| {
+            previous.transaction_id != frame.transaction_id
+                || previous.message_type != frame.message_type
+        }) {
+            // Discard old replies if the finite TCI space has wrapped. A paused
+            // request is not sent again until its ordinary retry timeout.
+            let mut queues = lock_before(&runtime_state().omci_rx, self.deadline)?;
+            if let Some(queue) = queues.get_mut(&self.onu_id) {
+                queue.retain(|reply| !reply.answers(frame));
+            }
+        }
+        let mut guard = lock_before(&runtime_state().session, self.deadline)?;
+        let session = guard.as_mut().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "FSL runtime session is not initialized",
+            )
+        })?;
+        session.send_omci(self.onu_id, &bytes, &mut |_| {
+            if self
+                .deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
+            {
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "FSL send deadline exceeded",
+                ))
+            } else {
+                Ok(())
+            }
+        })?;
+        self.request = Some(*frame);
+        Ok(())
     }
 
     fn receive(&mut self) -> io::Result<Option<BaselineFrame>> {
-        let mut queues = runtime_state()
-            .omci_rx
-            .lock()
-            .map_err(|_| io::Error::other("FSL OMCI RX queue lock poisoned"))?;
-        Ok(queues.get_mut(&self.onu_id).and_then(VecDeque::pop_front))
+        let mut queues = lock_before(&runtime_state().omci_rx, self.deadline)?;
+        Ok(queues
+            .get_mut(&self.onu_id)
+            .and_then(|queue| take_omci_response(queue, self.request.as_ref())))
+    }
+}
+
+// A paused upload can still have a reply in flight while a fresh liveness GET
+// runs in another session. Only remove this transport's matching response.
+fn take_omci_response(
+    queue: &mut VecDeque<BaselineFrame>,
+    request: Option<&BaselineFrame>,
+) -> Option<BaselineFrame> {
+    let request = request?;
+    let index = queue.iter().position(|frame| frame.answers(request))?;
+    queue.remove(index)
+}
+
+fn queue_omci_response(queue: &mut VecDeque<BaselineFrame>, frame: BaselineFrame) {
+    // Unsolicited and abandoned replies must not grow the per-ONU queue forever.
+    if queue.len() >= 512 {
+        queue.pop_front();
+    }
+    queue.push_back(frame);
+}
+
+#[cfg(test)]
+mod omci_response_tests {
+    use super::*;
+
+    #[test]
+    fn liveness_get_preserves_late_upload_reply() {
+        let upload = BaselineFrame::new(1, 0x4d, 2, 0, [0; 32]);
+        let get = BaselineFrame::new(2, 0x49, 257, 0, [0; 32]);
+        let upload_reply = BaselineFrame::new(1, 0x2d, 2, 0, [0; 32]);
+        let get_reply = BaselineFrame::new(2, 0x29, 257, 0, [0; 32]);
+        let mut queue = VecDeque::from([upload_reply, get_reply]);
+        assert_eq!(
+            take_omci_response(&mut queue, Some(&get))
+                .unwrap()
+                .transaction_id,
+            2
+        );
+        assert_eq!(queue.len(), 1);
+        assert_eq!(
+            take_omci_response(&mut queue, Some(&upload))
+                .unwrap()
+                .transaction_id,
+            1
+        );
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn unmatched_frames_are_bounded_and_not_given_to_another_request() {
+        let frame = BaselineFrame::new(3, 0x29, 257, 0, [0; 32]);
+        let mut queue = VecDeque::new();
+        for _ in 0..600 {
+            queue_omci_response(&mut queue, frame);
+        }
+        assert_eq!(queue.len(), 512);
+        let request = BaselineFrame::new(4, 0x49, 257, 0, [0; 32]);
+        assert!(take_omci_response(&mut queue, Some(&request)).is_none());
+        assert_eq!(queue.len(), 512);
     }
 }
 
@@ -190,6 +317,15 @@ fn commit_business(
 #[cfg(test)]
 mod commit_tests {
     use super::*;
+
+    #[test]
+    fn contended_runtime_lock_respects_deadline() {
+        let lock = Mutex::new(());
+        let _held = lock.lock().unwrap();
+        let error =
+            lock_before(&lock, Some(Instant::now() + Duration::from_millis(10))).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
 
     #[test]
     fn failed_business_commit_keeps_partial_configuration_armed_for_cleanup() {
@@ -715,6 +851,78 @@ fn ipc_handler(
             };
             let _ = serde_json::to_writer(&mut stream, &response);
             let _ = stream.write_all(b"\n");
+        } else if let Some(request) = line.strip_prefix("HL202 ") {
+            #[cfg(feature = "device-hl202")]
+            crate::controller::hl202::start(
+                stream,
+                request.to_string(),
+                pon_engine.clone(),
+                services.clone(),
+            );
+            #[cfg(not(feature = "device-hl202"))]
+            {
+                let _ = request;
+                let _ = stream.write_all(b"{\"schema_version\":1,\"error\":{\"code\":\"adapter_disabled\",\"message\":\"HL202 adapter not compiled\"}}");
+            }
+        } else if let Some(request) = line.strip_prefix("PROVISIONING ") {
+            let _ = stream.write_all(crate::provisioning::control(request).as_bytes());
+        } else if let Some(request) = line.strip_prefix("FEC_PM ") {
+            let result = serde_json::from_str::<crate::controller::fec::Command>(request)
+                .map_err(std::io::Error::other)
+                .and_then(|command| crate::controller::fec::control(command, &services));
+            let response =
+                result.unwrap_or_else(|error| serde_json::json!({"error": error.to_string()}));
+            let _ = serde_json::to_writer(&mut stream, &response);
+            let _ = stream.write_all(b"\n");
+        } else if let Some(request) = line.strip_prefix("OMCI_ATTRIBUTE ") {
+            let result =
+                serde_json::from_str::<crate::controller::attribute_probe::Command>(request)
+                    .map_err(std::io::Error::other)
+                    .and_then(|command| {
+                        crate::controller::attribute_probe::control(command, &services)
+                    });
+            let response =
+                result.unwrap_or_else(|error| serde_json::json!({"error": error.to_string()}));
+            let _ = serde_json::to_writer(&mut stream, &response);
+            let _ = stream.write_all(b"\n");
+        } else if let Some(request) = line.strip_prefix("MIB ") {
+            let result = serde_json::from_str::<crate::controller::inventory::MibCommand>(request)
+                .map_err(std::io::Error::other)
+                .and_then(|command| {
+                    let progress = command
+                        .progress_id
+                        .as_deref()
+                        .map(crate::controller::inventory::MibProgressReporter::new)
+                        .transpose()?;
+                    crate::controller::inventory::control(
+                        optics.platform,
+                        command.onu_id,
+                        command.tables,
+                        progress,
+                        &services,
+                    )
+                });
+            match result {
+                Ok(report) => {
+                    let _ = serde_json::to_writer(&mut stream, &report);
+                }
+                Err(error) => {
+                    let _ = serde_json::to_writer(
+                        &mut stream,
+                        &serde_json::json!({"schema_version": 1, "error": {"code": format!("{:?}", error.kind()), "message": error.to_string()}}),
+                    );
+                }
+            }
+            let _ = stream.write_all(b"\n");
+        } else if let Some(_request) = line.strip_prefix("ACS ") {
+            #[cfg(feature = "acs")]
+            let response = crate::acs::control(_request);
+            #[cfg(not(feature = "acs"))]
+            let response =
+                "{\"error\":\"ACS adapter not compiled (enable Cargo feature acs)\"}".to_string();
+            let _ = stream.write_all(response.as_bytes());
+        } else if line == "CAPABILITIES" {
+            let _ = writeln!(stream, "{}", crate::capabilities::json());
         } else if line == "STATUS" {
             let reply = serde_json::from_value(crate::provisioning::snapshot())
                 .map_err(|_| 9)
@@ -777,6 +985,51 @@ fn ipc_handler(
                 &serde_json::json!({"status": "error", "error": "unsupported IPC command"}),
             );
             let _ = stream.write_all(b"\n");
+        }
+    }
+}
+
+#[cfg(test)]
+mod ipc_tests {
+    use super::*;
+    use std::io::Read;
+
+    #[test]
+    fn shared_ipc_routes_are_available_on_fiberhome() {
+        let platform = PlatformContext::test_context();
+        let devices = Arc::new(Mutex::new(Vec::new()));
+        let engine = Arc::new(Mutex::new(PonEngine::new(platform.resources())));
+        let services = Arc::new(Mutex::new(BTreeMap::new()));
+        let (requests, _receiver) = mpsc::sync_channel(2);
+        let handler = ipc_handler(
+            devices,
+            engine,
+            services,
+            OpticalClient {
+                platform,
+                requests,
+                hardware_ready: Arc::new(AtomicBool::new(false)),
+                stopping: Arc::new(AtomicBool::new(false)),
+            },
+        );
+        for request in [
+            "CAPABILITIES",
+            "ACS invalid",
+            "PROVISIONING invalid",
+            "FEC_PM invalid",
+            "OMCI_ATTRIBUTE invalid",
+            "MIB invalid",
+        ] {
+            let (mut reader, writer) = UnixStream::pair().unwrap();
+            handler(writer, request);
+            let mut response = String::new();
+            reader.read_to_string(&mut response).unwrap();
+            let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+            assert_ne!(
+                value.get("error").and_then(|v| v.as_str()),
+                Some("unsupported IPC command"),
+                "{request}"
+            );
         }
     }
 }
@@ -925,7 +1178,7 @@ async fn run_async(platform: PlatformContext) {
                     for frame in &report.omci_frames {
                         if let Ok(parsed) = BaselineFrame::from_bytes(&frame.payload) {
                             if let Ok(mut queues) = runtime_state().omci_rx.lock() {
-                                queues.entry(frame.source).or_default().push_back(parsed);
+                                queue_omci_response(queues.entry(frame.source).or_default(), parsed);
                             }
                         }
                     }

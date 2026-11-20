@@ -57,6 +57,19 @@ fn unavailable_with_protocol_reason_when_omci_get_is_unsupported() {
 }
 
 #[test]
+fn measurement_respects_expired_outer_deadline() {
+    let mut session = OmciSession::new(GetTransport {
+        request: None,
+        result: 0,
+        octets: [0, 0],
+    });
+    session.finish_before(Instant::now() - Duration::from_millis(1));
+    let (value, evidence) = read(&mut session, (263, 0x8001, 0x0040), true);
+    assert_eq!(value, None);
+    assert!(evidence.reason.unwrap().contains("deadline"));
+}
+
+#[test]
 fn signed_optical_power_when_ani_g_get_contains_negative_measurement() {
     let block = AttributeCodec::decode(
         MeRegistry::get(263).unwrap(),
