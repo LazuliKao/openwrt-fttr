@@ -44,6 +44,8 @@ mod test_support;
 #[cfg(feature = "platform-fiberhome-an4475-g2")]
 mod transport;
 #[cfg(feature = "platform-fiberhome-an4475-g2")]
+mod ubus;
+#[cfg(feature = "platform-fiberhome-an4475-g2")]
 pub mod upstream;
 
 #[cfg(feature = "platform-fiberhome-an4475-g2")]

@@ -147,7 +147,7 @@ fn profile_plan_matches_observed_page_and_payload_ranges() {
     let bytes = fixture(0x27);
     let table = CalibrationTable::parse(&bytes).unwrap();
     let writes = ux3326s_writes(table.payload()).unwrap();
-    assert_eq!(writes.len(), 545);
+    assert_eq!(writes.len(), 802);
     assert_eq!(
         &writes[..4],
         &[
@@ -223,6 +223,34 @@ fn profile_plan_matches_observed_page_and_payload_ranges() {
         RegisterWrite {
             register: 0x7f,
             value: 0x84
+        }
+    );
+    assert_eq!(
+        writes[545],
+        RegisterWrite {
+            register: 0x80,
+            value: table.payload()[0x300]
+        }
+    );
+    assert_eq!(
+        writes[673],
+        RegisterWrite {
+            register: 0x7f,
+            value: 0x85
+        }
+    );
+    assert_eq!(
+        writes[674],
+        RegisterWrite {
+            register: 0x80,
+            value: table.payload()[0x380]
+        }
+    );
+    assert_eq!(
+        writes[801],
+        RegisterWrite {
+            register: 0xff,
+            value: table.payload()[0x3ff]
         }
     );
     assert_eq!(STOCK_DELAY_ITERATIONS, 133_600);
@@ -304,8 +332,8 @@ fn profile_completes_with_checked_single_byte_writes() {
     let chip = identify_ux3326s(&mut bus).unwrap();
     let mut pacer = Pacer::default();
     program_ux3326s(&mut bus, chip, &table, &mut pacer, || Ok(())).unwrap();
-    assert_eq!(script.borrow().calls, 3 + 545);
-    assert_eq!(pacer.calls, 545);
+    assert_eq!(script.borrow().calls, 3 + 802);
+    assert_eq!(pacer.calls, 802);
     assert!(!pacer.wrong_iterations);
     assert!(!bus.needs_reconciliation());
 }
@@ -339,6 +367,54 @@ fn initializer_probes_then_applies_selected_branch() {
     let mut pacer = Pacer::default();
     let chip = initialize_ux3326s(&mut bus, &table, &mut pacer, || Ok(())).unwrap();
     assert_eq!(chip.discriminator(), UX3326S_CHIP_ID);
-    assert_eq!(script.borrow().calls, 3 + 545);
-    assert_eq!(pacer.calls, 545);
+    assert_eq!(script.borrow().calls, 3 + 802);
+    assert_eq!(pacer.calls, 802);
+}
+
+#[test]
+fn independent_expected_sequence_matches_stock_ux3326s_schedule() {
+    let bytes = fixture(0x27);
+    let table = CalibrationTable::parse(&bytes).unwrap();
+    let payload = table.payload();
+
+    let mut expected = Vec::new();
+    for (reg, val) in [(0x7b, 0x66), (0x7c, 0x99), (0x7d, 0x55), (0x7e, 0xaa)] {
+        expected.push(RegisterWrite {
+            register: reg,
+            value: val,
+        });
+    }
+    for i in 0..0x4c_usize {
+        expected.push(RegisterWrite {
+            register: i as u8,
+            value: payload[i],
+        });
+    }
+    expected.push(RegisterWrite {
+        register: 0x7f,
+        value: 0x80,
+    });
+    for i in 0..0x4c_usize {
+        expected.push(RegisterWrite {
+            register: (0x80 + i) as u8,
+            value: payload[0x100 + i],
+        });
+    }
+    for (page_idx, page) in (0x81_u8..=0x85).enumerate() {
+        expected.push(RegisterWrite {
+            register: 0x7f,
+            value: page,
+        });
+        let base = 0x180 + page_idx * 0x80;
+        for i in 0..0x80_usize {
+            expected.push(RegisterWrite {
+                register: (0x80 + i) as u8,
+                value: payload[base + i],
+            });
+        }
+    }
+
+    assert_eq!(expected.len(), 802);
+    let actual = ux3326s_writes(payload).unwrap();
+    assert_eq!(actual, expected);
 }

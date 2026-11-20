@@ -46,6 +46,38 @@ const BOSA_CAL_OFFSET: u64 = 0x1a_5000;
 const NNI_INTERFACE: &str = "fttr0";
 const SERIAL_NUMBER_ONU_MSG_ID: u8 = 1;
 
+/// Bounded owner-only readback, including the counter banks read by stock
+/// `fsldrv_gpon_getponstat`. Do not acknowledge status, clear counters, or read
+/// the PLOAM/OMCI FIFO here. Counter values are raw snapshots, not interval sums.
+fn log_receive_path_snapshot(session: &mut FslOltSession<Device>) -> io::Result<()> {
+    use crate::platform::diagnostics::RegisterSpace;
+    for (name, address, words) in [
+        ("pon_reset", 0x12, 1),
+        ("ram_status", 0x31, 1),
+        ("serdes_status", 0x110f, 1),
+        ("opt_config", 0x102, 1),
+        ("sd_config", 0x208, 1),
+        ("gpon_mask", 0x210, 1),
+        ("gpon_int", 0x2f0, 1),
+        ("ploam_mask", 0x44a, 1),
+        ("ploam_int", 0x49e, 1),
+        ("ploam_valid", 0x41b, 1),
+        ("sn_request", 0x606, 2),
+        ("dba_start", 0x501, 1),
+        ("dba_work", 0x500, 1),
+        ("nni_spi", 0x913, 1),
+        ("opt_int", 0x150, 1),
+        ("us_gtc_counters", 0x732, 14),
+        ("ds_gem_counters", 0x74c, 14),
+    ] {
+        let values = session
+            .fsl_mut()
+            .read(RegisterSpace::Register, address, 0, words)?;
+        eprintln!("[*] FSL RX snapshot {name}@{address:#x}={values:x?}");
+    }
+    Ok(())
+}
+
 struct FslRuntimeState {
     session: Mutex<Option<FslOltSession<Device>>>,
     omci_rx: Mutex<BTreeMap<u8, VecDeque<BaselineFrame>>>,
@@ -327,9 +359,48 @@ fn format_serial(sn: &[u8; 8]) -> String {
     )
 }
 
+pub(crate) fn status_snapshot(
+    optics: &OpticalClient,
+    pon_engine: &Mutex<PonEngine>,
+    provisioning: Option<fttr_api::SyncStatusReply>,
+) -> fttr_api::StatusReply {
+    let ready = optics.hardware_ready.load(Ordering::Acquire);
+    let tx_enabled = with_session(|session| session.fsl_mut().is_tx_enabled()).ok();
+    let _ = pon_engine;
+    fttr_api::StatusReply {
+        ubus: None,
+        jobs: None,
+        onu_pinning: None,
+        fpga_status: if ready { "ready" } else { "initializing" }.into(),
+        pon_mac: None,
+        provisioning,
+        optical_transceiver: fttr_api::OpticalTransceiverStatus {
+            calibration_sha256: None,
+            calibration_applied: ready,
+            model: "UX3326S1".into(),
+            wavelength_tx_nm: 1490,
+            wavelength_rx_nm: 1310,
+            phy_rate_downlink_gbps: 2.5,
+            phy_rate_uplink_gbps: 1.25,
+            tx_power_dbm: None,
+            laser_bias_current_ma: None,
+            temperature_celsius: None,
+            vcc_voltage: None,
+            cdr_locked: None,
+            tx_enabled,
+            measurements: Default::default(),
+        },
+        switch_ports: Vec::new(),
+        sub_gateways: Vec::new(),
+        telemetry_gateways: Vec::new(),
+        npu: None,
+        ipc: None,
+    }
+}
+
 fn ipc_handler(
     devices: Arc<Mutex<Vec<SubDevice>>>,
-    _pon_engine: Arc<Mutex<PonEngine>>,
+    pon_engine: Arc<Mutex<PonEngine>>,
     services: service::States,
     optics: OpticalClient,
 ) -> impl Fn(UnixStream, &str) + Send + Sync + 'static {
@@ -342,37 +413,7 @@ fn ipc_handler(
             let _ = serde_json::to_writer(&mut stream, &response);
             let _ = stream.write_all(b"\n");
         } else if line == "STATUS" {
-            let ready = optics.hardware_ready.load(Ordering::Acquire);
-            let tx_enabled = with_session(|session| session.fsl_mut().is_tx_enabled()).ok();
-            let reply = fttr_api::StatusReply {
-                ubus: None,
-                jobs: None,
-                onu_pinning: None,
-                fpga_status: if ready { "ready" } else { "initializing" }.into(),
-                pon_mac: None,
-                provisioning: None,
-                optical_transceiver: fttr_api::OpticalTransceiverStatus {
-                    calibration_sha256: None,
-                    calibration_applied: ready,
-                    model: "UX3326S1".into(),
-                    wavelength_tx_nm: 1490,
-                    wavelength_rx_nm: 1310,
-                    phy_rate_downlink_gbps: 2.5,
-                    phy_rate_uplink_gbps: 1.25,
-                    tx_power_dbm: None,
-                    laser_bias_current_ma: None,
-                    temperature_celsius: None,
-                    vcc_voltage: None,
-                    cdr_locked: None,
-                    tx_enabled,
-                    measurements: Default::default(),
-                },
-                switch_ports: Vec::new(),
-                sub_gateways: Vec::new(),
-                telemetry_gateways: Vec::new(),
-                npu: None,
-                ipc: None,
-            };
+            let reply = status_snapshot(&optics, &pon_engine, None);
             let _ = serde_json::to_writer(&mut stream, &reply);
             let _ = stream.write_all(b"\n");
         } else if line == "DEVICES" {
@@ -469,6 +510,19 @@ async fn run_async(platform: PlatformContext) {
         println!("[+] IPC socket server listening on {}", ipc::SOCKET_PATH);
     }
 
+    let _ubus_thread = super::ubus::start(
+        OpticalClient {
+            platform,
+            requests: optical_requests.clone(),
+            hardware_ready: hardware_ready.clone(),
+            stopping: stopping.clone(),
+        },
+        devices.clone(),
+        pon_engine.clone(),
+        service_states.clone(),
+        stopping.clone(),
+    );
+
     let pon_engine_loop = pon_engine.clone();
     let devices_loop = devices.clone();
     let states_loop = service_states.clone();
@@ -489,6 +543,10 @@ async fn run_async(platform: PlatformContext) {
             ready_loop.store(ready, Ordering::Release);
             let mut services = service::Services::new(platform, states_loop);
             let mut optics = OpticalActor { state };
+            let mut observation_start = Instant::now();
+            let mut observation_first = true;
+            let mut observation_counts = (0usize, 0usize, 0usize, 0usize);
+            let mut receive_snapshots_remaining = 3u8;
 
             while !stopping_loop.load(Ordering::Acquire) {
                 {
@@ -512,6 +570,30 @@ async fn run_async(platform: PlatformContext) {
                         thread::sleep(delay);
                         Ok(())
                     })?;
+                    observation_counts.0 += report.interrupts.len();
+                    observation_counts.1 += report.ploams.len();
+                    observation_counts.2 += report.flagged_ploams;
+                    observation_counts.3 += report.omci_frames.len();
+                    if observation_start.elapsed() >= Duration::from_secs(30) {
+                        if receive_snapshots_remaining > 0 {
+                            receive_snapshots_remaining -= 1;
+                            if let Err(error) = log_receive_path_snapshot(session) {
+                                eprintln!("[-] FSL RX snapshot failed: {error}");
+                            }
+                        }
+                        if observation_first || observation_counts != (0, 0, 0, 0) {
+                            eprintln!(
+                                "[*] FSL poll 30s: interrupts={} ploam={} flagged={} omci={}",
+                                observation_counts.0,
+                                observation_counts.1,
+                                observation_counts.2,
+                                observation_counts.3
+                            );
+                        }
+                        observation_first = false;
+                        observation_start = Instant::now();
+                        observation_counts = (0, 0, 0, 0);
+                    }
 
                     for frame in &report.omci_frames {
                         if let Ok(parsed) = BaselineFrame::from_bytes(&frame.payload) {
@@ -524,6 +606,14 @@ async fn run_async(platform: PlatformContext) {
                     let mut newly_active = Vec::new();
                     for record in &report.ploams {
                         if record.message_id() == SERIAL_NUMBER_ONU_MSG_ID {
+                            let Some(rate) = OnuUpstreamRate::from_metadata(record.rate_metadata())
+                            else {
+                                eprintln!(
+                                    "[-] Ignoring SN with unsupported upstream rate metadata {}",
+                                    record.rate_metadata()
+                                );
+                                continue;
+                            };
                             match record.onu_id() {
                                 None => {
                                     if let Some(parsed) = super::olt::parse_upstream_ploam(record) {
@@ -531,13 +621,15 @@ async fn run_async(platform: PlatformContext) {
                                         sn.copy_from_slice(&parsed.payload[..8]);
                                         if let Err(err) = session.process_o3_sn_discovery(
                                             sn,
-                                            OnuUpstreamRate::Rate2p5G,
+                                            rate,
                                             &mut |delay| {
                                                 thread::sleep(delay);
                                                 Ok(())
                                             },
                                         ) {
                                             eprintln!("[-] O3 SN discovery failed: {err}");
+                                        } else {
+                                            eprintln!("[+] O3 SN accepted, upstream rate {rate:?}");
                                         }
                                     }
                                 }
@@ -546,10 +638,12 @@ async fn run_async(platform: PlatformContext) {
                                         .onu(onu_id)
                                         .is_some_and(|onu| onu.state == FslOnuState::Ranging) =>
                                 {
+                                    let mut serial_number = [0u8; 8];
+                                    serial_number.copy_from_slice(&record.frame[2..10]);
                                     match session.process_o4_o5_activation(
                                         onu_id,
+                                        &serial_number,
                                         record.ranging_time_raw(),
-                                        0,
                                         &mut |delay| {
                                             thread::sleep(delay);
                                             Ok(())

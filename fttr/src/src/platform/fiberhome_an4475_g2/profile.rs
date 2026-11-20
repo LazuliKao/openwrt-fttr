@@ -10,7 +10,7 @@ pub const UX3326S_CHIP_ID: u8 = 0x27;
 pub const UX3326S_DEVICE_ADDRESS: u8 = 0x63;
 pub const UX3326S_SIGNATURE_REGISTER: u8 = 0xc4;
 pub const UX3326S_PAGE_REGISTER: u8 = 0x7f;
-pub const UX3326S_PROFILE_BYTES: usize = 0x300;
+pub const UX3326S_PROFILE_BYTES: usize = 0x400;
 /// The stock helper performs this many busy-loop iterations after every write.
 /// It is an iteration count, not a portable time duration.
 pub const STOCK_DELAY_ITERATIONS: u32 = 0x320 * 0xa7;
@@ -141,7 +141,7 @@ pub fn ux3326s_writes(payload: &[u8]) -> io::Result<Vec<RegisterWrite>> {
     if payload.len() != super::calibration::PAYLOAD_BYTES {
         return Err(invalid("UX3326S calibration payload has the wrong length"));
     }
-    let mut writes = Vec::with_capacity(545);
+    let mut writes = Vec::with_capacity(802);
 
     for (offset, value) in (0x7b_u8..=0x7e).zip([0x66, 0x99, 0x55, 0xaa]) {
         writes.push(RegisterWrite {
@@ -175,8 +175,14 @@ pub fn ux3326s_writes(payload: &[u8]) -> io::Result<Vec<RegisterWrite>> {
         register: UX3326S_PAGE_REGISTER,
         value: 0x84,
     });
+    append_chunk(&mut writes, payload, 0x300, 0x080, 0x080)?;
+    writes.push(RegisterWrite {
+        register: UX3326S_PAGE_REGISTER,
+        value: 0x85,
+    });
+    append_chunk(&mut writes, payload, 0x380, 0x080, 0x080)?;
 
-    debug_assert_eq!(writes.len(), 545);
+    debug_assert_eq!(writes.len(), 802);
     Ok(writes)
 }
 

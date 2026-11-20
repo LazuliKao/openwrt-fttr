@@ -44,6 +44,15 @@ pub enum OnuUpstreamRate {
 }
 
 impl OnuUpstreamRate {
+    /// Decode the rate field used by the stock serial-number dispatcher.
+    pub fn from_metadata(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::Rate1p25G),
+            1 => Some(Self::Rate2p5G),
+            _ => None,
+        }
+    }
+
     const fn stock_onu_type(self) -> u8 {
         match self {
             Self::Rate1p25G => 1,
@@ -52,7 +61,7 @@ impl OnuUpstreamRate {
     }
 }
 
-/// High-level ONU activation state tracked by `FslOltSession`.
+/// Local activation progress; `Active` does not independently confirm ONU O5.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OnuState {
     Ranging,
@@ -75,6 +84,8 @@ pub struct ManagedOnu {
 pub struct OltPollReport {
     pub interrupts: Vec<GponInterrupt>,
     pub ploams: Vec<PloamRecord>,
+    /// Records skipped for the same metadata flag as the stock dispatcher.
+    pub flagged_ploams: usize,
     pub omci_frames: Vec<OmciFrame>,
 }
 
@@ -148,6 +159,8 @@ pub struct FslOltSession<B: Bus> {
     base_b_all_set_thd: u16,
     dba_granularity_8x: u32,
     onus: BTreeMap<u8, ManagedOnu>,
+    /// Per-session PON sequence; this alone does not implement the stock ACK queue.
+    next_port_id_sequence: u16,
 }
 
 impl<B: Bus> FslOltSession<B> {
@@ -160,6 +173,7 @@ impl<B: Bus> FslOltSession<B> {
             base_b_all_set_thd: 0,
             dba_granularity_8x: 64,
             onus: BTreeMap::new(),
+            next_port_id_sequence: 0,
         }
     }
 
@@ -277,6 +291,7 @@ impl<B: Bus> FslOltSession<B> {
         let mut report = OltPollReport {
             interrupts,
             ploams: Vec::new(),
+            flagged_ploams: 0,
             omci_frames: Vec::new(),
         };
 
@@ -292,6 +307,8 @@ impl<B: Bus> FslOltSession<B> {
                 let is_last = record.last;
                 if !record.stock_error_flag() {
                     report.ploams.push(record);
+                } else {
+                    report.flagged_ploams += 1;
                 }
                 if is_last {
                     break;
@@ -381,23 +398,32 @@ impl<B: Bus> FslOltSession<B> {
     pub fn process_o4_o5_activation(
         &mut self,
         onu_id: u8,
+        serial_number: &[u8; 8],
         raw_ranging_time: u32,
-        port_id_sequence: u16,
         checkpoint: &mut impl FnMut(Duration) -> io::Result<()>,
     ) -> io::Result<ManagedOnu> {
         self.require_initialized()?;
         let existing = *self.onus.get(&onu_id).ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotFound, "unknown ONU-ID in OLT session")
         })?;
+        if &existing.serial_number != serial_number {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "ranged serial number does not match assigned ONU-ID",
+            ));
+        }
         if existing.state == OnuState::Active {
             return Ok(existing);
         }
 
         let eqd = eqd_from_ranging(raw_ranging_time, existing.rate == OnuUpstreamRate::Rate2p5G);
         let rt_frame = ranging_time_ploam(onu_id, eqd);
-        self.mgmt
-            .send_ploam(&rt_frame, self.config.tx_poll, checkpoint)
-            .map_err(map_send_err)?;
+        // The stock ranging-time message requests three transmissions.
+        for _ in 0..3 {
+            self.mgmt
+                .send_ploam(&rt_frame, self.config.tx_poll, checkpoint)
+                .map_err(map_send_err)?;
+        }
         checkpoint(self.config.o4_ranging_delay)?;
 
         set_onu_active_bit(
@@ -426,11 +452,17 @@ impl<B: Bus> FslOltSession<B> {
             u16::from(onu_id),
             true,
         )?;
-        let port_frame =
-            configure_port_id_ploam(onu_id, u16::from(onu_id), true, port_id_sequence)?;
-        self.mgmt
-            .send_ploam(&port_frame, self.config.tx_poll, checkpoint)
-            .map_err(map_send_err)?;
+        // Stock reserves its 16-bit per-PON sequence before attempting the send,
+        // so even an ambiguous send failure must not reuse it.
+        let sequence = self.next_port_id_sequence;
+        self.next_port_id_sequence = sequence.wrapping_add(1);
+        let port_frame = configure_port_id_ploam(onu_id, u16::from(onu_id), true, sequence)?;
+        // All three stock Configure_Port_ID copies carry the same sequence.
+        for _ in 0..3 {
+            self.mgmt
+                .send_ploam(&port_frame, self.config.tx_poll, checkpoint)
+                .map_err(map_send_err)?;
+        }
         recalculate_b_all_bandwidth(
             &mut self.mgmt.fsl,
             self.base_b_all_set_thd,

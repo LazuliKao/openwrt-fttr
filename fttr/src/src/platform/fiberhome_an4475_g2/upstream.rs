@@ -40,6 +40,11 @@ impl PloamRecord {
         self.words[0] & (1 << 4) != 0
     }
 
+    /// Upstream rate metadata extracted by `fsldrv_gpon_ploamu_receive`.
+    pub fn rate_metadata(&self) -> u8 {
+        (self.words[0] & 3) as u8
+    }
+
     /// Raw ranging time extracted by `fsldrv_gpon_ploamu_receive`:
     /// `((words[0] >> 5) & 0x1f_ffff) + 0x30`.
     pub fn ranging_time_raw(&self) -> u32 {

@@ -1,4 +1,22 @@
 use super::*;
+
+#[test]
+fn stock_upstream_rate_metadata_is_decoded_and_unknown_values_rejected() {
+    for (metadata, expected) in [
+        (0, Some(OnuUpstreamRate::Rate1p25G)),
+        (1, Some(OnuUpstreamRate::Rate2p5G)),
+        (2, None),
+        (3, None),
+    ] {
+        let mut words = [0u32; 13];
+        words[0] = (0x123 << 5) | (1 << 4) | metadata;
+        let record = PloamRecord::decode(words, true);
+        assert_eq!(
+            OnuUpstreamRate::from_metadata(record.rate_metadata()),
+            expected
+        );
+    }
+}
 use crate::platform::fiberhome_an4475_g2::{
     activation::{
         BMP_CFG_RG_REQ, BMP_PLS_REQ, BMP_STA, PORTID_CFG_TAB, RSM_ALM, RSM_CFG_TCONT_CLR,
@@ -310,16 +328,53 @@ fn full_offline_olt_lifecycle_init_discover_activate_omci_fec_and_deactivate() {
     assert_eq!(poll2.ploams.len(), 1);
     assert_eq!(poll2.ploams[0].onu_id(), Some(0));
 
+    let other_sn = *b"TEST\x00\x00\x00\x02";
+    assert_eq!(
+        session
+            .process_o4_o5_activation(
+                0,
+                &other_sn,
+                poll2.ploams[0].ranging_time_raw(),
+                &mut no_sleep
+            )
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::InvalidData
+    );
+    assert_eq!(session.bus().ploam_tx_frames.len(), 3);
+    assert_eq!(session.onu(0).unwrap().state, OnuState::Ranging);
+    // A rejected identity must not consume a sequence; exercise wrap at the
+    // successful send and inspect the encoded frame rather than only a counter.
+    assert_eq!(session.next_port_id_sequence, 0);
+    session.next_port_id_sequence = u16::MAX;
     let activated = session
-        .process_o4_o5_activation(0, poll2.ploams[0].ranging_time_raw(), 0x0001, &mut no_sleep)
+        .process_o4_o5_activation(
+            0,
+            &test_sn,
+            poll2.ploams[0].ranging_time_raw(),
+            &mut no_sleep,
+        )
         .expect("O4/O5 activation");
     assert_eq!(activated.state, OnuState::Active);
     assert_eq!(
         activated.eqd,
         eqd_from_ranging(poll2.ploams[0].ranging_time_raw(), true)
     );
-    // Ranging_Time + Configure_Port_ID added to TX log (3 + 2 = 5).
-    assert_eq!(session.bus().ploam_tx_frames.len(), 5);
+    // Each stock O4 message is sent three times, with identical copies.
+    let frames = &session.bus().ploam_tx_frames;
+    assert_eq!(frames.len(), 9);
+    assert_eq!(frames[3], frames[4]);
+    assert_eq!(frames[4], frames[5]);
+    assert_eq!(frames[6], frames[7]);
+    assert_eq!(frames[7], frames[8]);
+    assert_ne!(frames[3], frames[6]);
+    assert_eq!(
+        frames[6],
+        super::super::downstream::pack_ploam(
+            &configure_port_id_ploam(0, 0, true, u16::MAX).unwrap()
+        )
+    );
+    assert_eq!(session.next_port_id_sequence, 0);
     assert_eq!(session.active_onus().count(), 1);
 
     // Active GDBA threshold recalculated cleanly below baseline 38880.
@@ -377,6 +432,6 @@ fn full_offline_olt_lifecycle_init_discover_activate_omci_fec_and_deactivate() {
         read_b_all_set_thd(&mut session.mgmt.fsl).expect("restored thd"),
         38880
     );
-    // 3 Deactivate_ONU-ID PLOAMs added -> 8 total.
-    assert_eq!(session.bus().ploam_tx_frames.len(), 8);
+    // 3 Deactivate_ONU-ID PLOAMs added -> 12 total.
+    assert_eq!(session.bus().ploam_tx_frames.len(), 12);
 }

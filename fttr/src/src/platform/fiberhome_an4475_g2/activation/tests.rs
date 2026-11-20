@@ -66,6 +66,7 @@ fn ploam_record_extracts_ranging_and_identity_fields() {
     assert_eq!(rec.ranging_time_raw(), 0x123 + 0x30);
     assert_eq!(rec.onu_id(), Some(5));
     assert_eq!(rec.message_id(), 1);
+    assert_eq!(rec.rate_metadata(), 0);
 
     words[4] = 0xff;
     let unassigned = PloamRecord::decode(words, false);
@@ -75,7 +76,9 @@ fn ploam_record_extracts_ranging_and_identity_fields() {
 #[test]
 fn eqd_and_downstream_ploam_frames_match_stock_layout() {
     assert_eq!(eqd_from_ranging(0x100, true), 0x80 + 0x18);
-    assert_eq!(eqd_from_ranging(0x100, false), 0);
+    assert_eq!(eqd_from_ranging(0x100, false), 0x100);
+    assert_eq!(eqd_from_ranging(0x20_002f, false), 0x20_002f);
+    assert_eq!(eqd_from_ranging(0x20_002f, true), 0x10_002f);
 
     let ranging = ranging_time_ploam(7, 0x1234_5678);
     assert_eq!(

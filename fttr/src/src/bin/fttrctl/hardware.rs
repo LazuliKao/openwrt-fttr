@@ -13,6 +13,8 @@ const USAGE: &str = "Usage: fttrctl hardware DEVICE COMMAND [ARGS]
   reg-write ADDRESS WORD...
   mem-read ADDRESS ROW WORDS
   mem-write ADDRESS ROW WORD...
+  bosa-read ADDRESS
+  bosa-write ADDRESS VALUE
   tx on|off
   fec on|off
 Offline exclusive session; fails while fttrd owns the hardware.
@@ -28,6 +30,8 @@ enum Command {
     Fec(bool),
     Read(RegisterSpace, u32, u32, usize),
     Write(RegisterSpace, u32, u32, Vec<u32>),
+    BosaRead(u32),
+    BosaWrite(u32, u32),
 }
 fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
@@ -65,6 +69,8 @@ fn parse(args: &[String]) -> io::Result<Command> {
             args[1].clone(),
             u64::from(number(&args[2])?),
         )),
+        ("bosa-read", 2) => Ok(Command::BosaRead(number(&args[1])?)),
+        ("bosa-write", 3) => Ok(Command::BosaWrite(number(&args[1])?, number(&args[2])?)),
         ("tx" | "fec", 2) => {
             let enabled = match args[1].as_str() {
                 "on" => true,
@@ -175,6 +181,13 @@ pub(super) fn handle(args: &[String]) -> io::Result<()> {
         Command::Write(space, address, row, words) => {
             session.write(space, address, row, &words)?;
             serde_json::json!({"address": address, "row": row, "written_words": words.len()})
+        }
+        Command::BosaRead(address) => {
+            serde_json::json!({"address": address, "value": hardware.read_bosa_reg(address)?})
+        }
+        Command::BosaWrite(address, value) => {
+            hardware.write_bosa_reg(address, value)?;
+            serde_json::json!({"address": address, "value": value})
         }
         Command::Tx(enabled) => {
             session.set_optical_tx_enable(enabled)?;

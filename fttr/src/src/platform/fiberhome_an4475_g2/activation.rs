@@ -68,12 +68,12 @@ const BMP_PLS_RG_REQ: u32 = 1 << 0;
 const RSM_ALM_TCONT_CLR_FAIL: u32 = 1 << 22;
 
 /// Computes the EqD value used by `fslstack_gpon_add_onu_o4_o5_process`:
-/// `(raw >> 1) + 0x18` when in ranging state (`7`), or `0` otherwise.
-pub fn eqd_from_ranging(raw_ranging_time: u32, is_ranging_state: bool) -> u32 {
-    if is_ranging_state {
+/// Type 7 (2.5G) uses `(raw >> 1) + 0x18`; type 1 (1.25G) uses raw.
+pub fn eqd_from_ranging(raw_ranging_time: u32, is_2p5g: bool) -> u32 {
+    if is_2p5g {
         (raw_ranging_time >> 1).saturating_add(0x18)
     } else {
-        0
+        raw_ranging_time
     }
 }
 
