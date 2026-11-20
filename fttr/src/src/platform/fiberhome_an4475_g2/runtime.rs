@@ -1,8 +1,10 @@
 //! AN4475-G2 FSL hardware owner, runtime scheduler, and OMCI/PLOAM bridge.
 use super::{
-    activation::configure_gem_port,
+    activation::{
+        assign_alloc_id_ploam, configure_gem_port, PLOAM_MSG_ACK, PLOAM_MSG_BER_INTERVAL,
+    },
     diagnostics::FslDiagnostics,
-    gdba::{alloc_to_tcont, configure_alloc, GdbaAllocConfig},
+    gdba::{alloc_to_tcont, GdbaAllocConfig},
     olt::{FslOltSession, OltSessionConfig, OnuState as FslOnuState, OnuUpstreamRate},
     transport::Device,
     ONU_COUNT,
@@ -154,33 +156,41 @@ impl FslManagementLease {
 impl ManagementLease for FslManagementLease {
     fn set_business_grant_floor(&mut self, bytes: u16) -> io::Result<()> {
         let onu_id = self.onu_id;
-        let data_id = 0x100 + u16::from(onu_id);
+        let res = super::RESOURCES.onu(onu_id)?;
         let enable = bytes > 0;
         with_session(|session| {
             let onu = session
                 .onu(onu_id)
                 .copied()
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "ONU not active in FSL"))?;
-            configure_gem_port(session.fsl_mut(), onu.onu_index, 0, data_id, enable)?;
+            configure_gem_port(session.fsl_mut(), onu.onu_index, 0, res.gem_id, enable)?;
+            let max_onus = session.config().init.max_onu_id.min(128) as u8;
+            let tcont = alloc_to_tcont(res.alloc_id, 0, max_onus, 0)?;
+            let bw = if enable { u32::from(bytes) } else { 0 };
+            let alloc = GdbaAllocConfig {
+                tcont,
+                onu_index: onu.onu_index,
+                enable,
+                fixed_bw: bw,
+                assured_bw: 0,
+                max_bw: bw,
+                alloc_type: 0,
+                priority: 0,
+                weight: 0x80,
+                ds_period: 7,
+                ds_flag: enable,
+                ds_bw_flag: false,
+                ds_tail_flag: false,
+            };
+            session.configure_tcont_alloc(&alloc)?;
             if enable {
-                let tcont = alloc_to_tcont(data_id, 0, 128, 0)?;
-                let bw = u32::from(bytes);
-                let alloc = GdbaAllocConfig {
-                    tcont,
-                    onu_index: onu.onu_index,
-                    enable: true,
-                    fixed_bw: bw,
-                    assured_bw: 0,
-                    max_bw: bw,
-                    alloc_type: 0,
-                    priority: 0,
-                    weight: 0x80,
-                    ds_period: 7,
-                    ds_flag: true,
-                    ds_bw_flag: false,
-                    ds_tail_flag: false,
-                };
-                configure_alloc(session.fsl_mut(), &alloc)?;
+                let frame = assign_alloc_id_ploam(onu_id, res.alloc_id, true, 0)?;
+                for _ in 0..session.config().ploam_repeat {
+                    session.send_ploam(&frame, &mut |delay| {
+                        thread::sleep(delay);
+                        Ok(())
+                    })?;
+                }
             }
             Ok(())
         })
@@ -198,14 +208,7 @@ impl ManagementLease for FslManagementLease {
 impl Drop for FslManagementLease {
     fn drop(&mut self) {
         if !self.disarmed {
-            let onu_id = self.onu_id;
-            let data_id = 0x100 + u16::from(onu_id);
-            let _ = with_session(|session| {
-                if let Some(onu) = session.onu(onu_id).copied() {
-                    configure_gem_port(session.fsl_mut(), onu.onu_index, 0, data_id, false)?;
-                }
-                Ok(())
-            });
+            let _ = revoke_business(self.onu_id);
         }
     }
 }
@@ -223,14 +226,33 @@ pub(crate) fn send_ploam(frame: &PloamFrame) -> io::Result<()> {
     })
 }
 
+/// Revokes only the ONU's business data GEM port and data T-CONT without
+/// deactivating the ONU's O5 registration or OMCC management channel.
 pub(crate) fn revoke_business(id: u8) -> io::Result<()> {
-    let data_gem = 0x100 + u16::from(id);
+    let res = super::RESOURCES.onu(id)?;
     with_session(|session| {
-        if session.onu(id).is_some() {
-            session.deactivate_onu(id, &[], &[data_gem], &mut |delay| {
-                thread::sleep(delay);
-                Ok(())
-            })?;
+        let Some(onu) = session.onu(id).copied() else {
+            return Ok(());
+        };
+        configure_gem_port(session.fsl_mut(), onu.onu_index, 0, res.gem_id, false)?;
+        let max_onus = session.config().init.max_onu_id.min(128) as u8;
+        if let Ok(tcont) = alloc_to_tcont(res.alloc_id, 0, max_onus, 0) {
+            let disable_alloc = GdbaAllocConfig {
+                tcont,
+                onu_index: onu.onu_index,
+                enable: false,
+                fixed_bw: 0,
+                assured_bw: 0,
+                max_bw: 0,
+                alloc_type: 0,
+                priority: 0,
+                weight: 0,
+                ds_period: 0,
+                ds_flag: false,
+                ds_bw_flag: false,
+                ds_tail_flag: false,
+            };
+            let _ = session.configure_tcont_alloc(&disable_alloc);
         }
         Ok(())
     })
@@ -278,7 +300,20 @@ impl OpticalBackend for RuntimeOptics<'_> {
             if let Ok(mut engine) = self.engine.lock() {
                 engine.mark_offline(id);
             }
-            let _ = revoke_business(id);
+            let _ = with_session(|session| {
+                if session.onu(id).is_some() {
+                    let res = super::RESOURCES.onu(id)?;
+                    let max_onus = session.config().init.max_onu_id.min(128) as u8;
+                    let extra_tconts = alloc_to_tcont(res.alloc_id, 0, max_onus, 0)
+                        .map(|t| vec![t])
+                        .unwrap_or_default();
+                    session.deactivate_onu(id, &extra_tconts, &[res.gem_id], &mut |delay| {
+                        thread::sleep(delay);
+                        Ok(())
+                    })?;
+                }
+                Ok(())
+            });
         }
         Ok(())
     }
@@ -544,6 +579,7 @@ async fn run_async(platform: PlatformContext) {
             let mut services = service::Services::new(platform, states_loop);
             let mut optics = OpticalActor { state };
             let mut observation_start = Instant::now();
+            let mut last_timeout_check = Instant::now();
             let mut observation_first = true;
             let mut observation_counts = (0usize, 0usize, 0usize, 0usize);
             let mut receive_snapshots_remaining = 3u8;
@@ -560,11 +596,15 @@ async fn run_async(platform: PlatformContext) {
                         let _ = request.reply.send(response);
                     }
                 }
+                if stopping_loop.load(Ordering::Acquire) {
+                    break;
+                }
                 if !ready_loop.load(Ordering::Acquire) || optics.state != OpticalState::Enabled {
                     thread::sleep(Duration::from_millis(20));
                     continue;
                 }
 
+                let run_timeouts = last_timeout_check.elapsed() >= Duration::from_secs(1);
                 let poll_result = with_session(|session| {
                     let report = session.poll_once(16, 16, &mut |delay| {
                         thread::sleep(delay);
@@ -619,7 +659,7 @@ async fn run_async(platform: PlatformContext) {
                                     if let Some(parsed) = super::olt::parse_upstream_ploam(record) {
                                         let mut sn = [0u8; 8];
                                         sn.copy_from_slice(&parsed.payload[..8]);
-                                        if let Err(err) = session.process_o3_sn_discovery(
+                                        match session.process_o3_sn_discovery(
                                             sn,
                                             rate,
                                             &mut |delay| {
@@ -627,9 +667,13 @@ async fn run_async(platform: PlatformContext) {
                                                 Ok(())
                                             },
                                         ) {
-                                            eprintln!("[-] O3 SN discovery failed: {err}");
-                                        } else {
-                                            eprintln!("[+] O3 SN accepted, upstream rate {rate:?}");
+                                            Ok(onu) => eprintln!(
+                                                "[+] O3 SN accepted -> ONU {} ranging (rate={rate:?})",
+                                                onu.onu_id
+                                            ),
+                                            Err(err) => {
+                                                eprintln!("[-] O3 SN discovery failed: {err}")
+                                            }
                                         }
                                     }
                                 }
@@ -649,14 +693,72 @@ async fn run_async(platform: PlatformContext) {
                                             Ok(())
                                         },
                                     ) {
-                                        Ok(active) => newly_active.push(active),
+                                        Ok(pending) => eprintln!(
+                                            "[+] O4 ranging + Configure_Port_ID sent for ONU {} (eqd={}, state={:?})",
+                                            pending.onu_id, pending.eqd, pending.state
+                                        ),
                                         Err(err) => eprintln!(
-                                            "[-] O4/O5 activation failed for ONU {onu_id}: {err}"
+                                            "[-] O4 activation failed for ONU {onu_id}: {err}"
                                         ),
                                     }
                                 }
                                 Some(_) => {}
                             }
+                        } else if record.message_id() == PLOAM_MSG_ACK {
+                            match session.process_ploam_ack(record, &mut |delay| {
+                                thread::sleep(delay);
+                                Ok(())
+                            }) {
+                                Ok(Some(active)) => {
+                                    eprintln!(
+                                        "[+] O5 Configure_Port_ID ACK confirmed for ONU {} (rate={:?}, eqd={})",
+                                        active.onu_id, active.rate, active.eqd
+                                    );
+                                    newly_active.push(active);
+                                }
+                                Ok(None) if record.frame[2] != PLOAM_MSG_BER_INTERVAL => {
+                                    eprintln!(
+                                        "[*] Ignoring unmatched PLOAM ACK onu_id={:?} acked_msg={:#x} enable={} seq={}",
+                                        record.onu_id(),
+                                        record.frame[2],
+                                        record.frame[5],
+                                        u16::from_be_bytes([record.frame[8], record.frame[9]])
+                                    );
+                                }
+                                Ok(None) => {}
+                                Err(err) => {
+                                    eprintln!("[-] PLOAM ACK processing failed: {err}");
+                                }
+                            }
+                        } else {
+                            eprintln!(
+                                "[*] FSL upstream PLOAM msg_id={:#x} onu_id={:?}",
+                                record.message_id(),
+                                record.onu_id()
+                            );
+                        }
+                    }
+
+                    if run_timeouts {
+                        last_timeout_check = Instant::now();
+                        match session.check_timeouts(&mut |delay| {
+                            thread::sleep(delay);
+                            Ok(())
+                        }) {
+                            Ok(timeouts)
+                                if timeouts.expired_acks > 0
+                                    || !timeouts.timed_out_ranging.is_empty()
+                                    || !timeouts.timed_out_port_id_ack.is_empty() =>
+                            {
+                                eprintln!(
+                                    "[*] FSL timeout sweep: expired_acks={} ranging_timeout={:?} port_id_ack_timeout={:?}",
+                                    timeouts.expired_acks,
+                                    timeouts.timed_out_ranging,
+                                    timeouts.timed_out_port_id_ack
+                                );
+                            }
+                            Ok(_) => {}
+                            Err(err) => eprintln!("[-] FSL timeout sweep failed: {err}"),
                         }
                     }
                     Ok(newly_active)
@@ -673,6 +775,14 @@ async fn run_async(platform: PlatformContext) {
                             if let Ok(mut engine) = pon_engine_loop.lock() {
                                 engine.register_onu(vendor, sn_tail);
                                 let _ = engine.activate_onu(onu.onu_id);
+                                if let Some(entry) = engine
+                                    .active_onus
+                                    .iter_mut()
+                                    .find(|entry| entry.onu_id == onu.onu_id)
+                                {
+                                    entry.eq_delay = Some(onu.eqd);
+                                    entry.state = crate::pon_engine::ploam::OnuState::O5Operation;
+                                }
                             }
                             if let Ok(mut list) = devices_loop.lock() {
                                 if !list.iter().any(|d| d.id == sn) {
@@ -683,8 +793,8 @@ async fn run_async(platform: PlatformContext) {
                                     });
                                 }
                             }
-                            let _ = vendor;
-                            services.start(onu.onu_id, sn);
+                            let vendor_str = String::from_utf8_lossy(&vendor).into_owned();
+                            services.start(onu.onu_id, vendor_str);
                         }
                     }
                     Err(err) => {
@@ -693,6 +803,30 @@ async fn run_async(platform: PlatformContext) {
                     }
                 }
                 thread::sleep(Duration::from_millis(5));
+            }
+
+            // Drain any final Shutdown/Status request queued right as `stopping` flipped.
+            {
+                let mut backend = RuntimeOptics {
+                    ready: ready_loop.load(Ordering::Acquire),
+                    services: &mut services,
+                    engine: &pon_engine_loop,
+                };
+                let mut handled_shutdown = false;
+                for request in optical_receiver.try_iter() {
+                    handled_shutdown |= matches!(request.command, OpticalCommand::Shutdown);
+                    let response = optics.dispatch(&request, &mut backend, &stopping_loop);
+                    let _ = request.reply.send(response);
+                }
+                if !handled_shutdown {
+                    if let Ok(request) = optical_receiver.recv_timeout(Duration::from_millis(50)) {
+                        let response = optics.dispatch(&request, &mut backend, &stopping_loop);
+                        let _ = request.reply.send(response);
+                    }
+                }
+            }
+            if let Ok(mut guard) = runtime_state().session.lock() {
+                *guard = None;
             }
         })
         .ok();

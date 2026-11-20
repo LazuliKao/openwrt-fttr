@@ -7,20 +7,21 @@
 
 use super::{
     activation::{
-        self, assign_onu_id, configure_gem_port, configure_port_id_ploam, eqd_from_ranging,
-        range_request, ranging_time_ploam, remove_onu, set_onu_active_bit,
+        self, assign_onu_id, ber_interval_ploam, configure_gem_port, configure_port_id_ploam,
+        eqd_from_ranging, range_request, ranging_time_ploam, remove_onu, set_onu_active_bit,
         set_onu_upstream_rate_2p5g, ALM_PROC_ONU_ACTIVE_CFG, BMP_CFG_ONU_ACTIVE,
-        PLOAM_DEFAULT_REPEAT,
+        DEFAULT_BER_INTERVAL, PLOAM_DEFAULT_REPEAT, PLOAM_MSG_ACK, PLOAM_MSG_CONFIGURE_PORT_ID,
     },
     downstream::SendError,
     gdba::{
-        configure_alloc, read_b_all_set_thd, read_eight_times_dba_granularity,
-        recalculate_b_all_bandwidth, GdbaAllocConfig, GdbaGapConfig,
+        configure_alloc, configure_ds_active_pending_slot, read_b_all_set_thd,
+        read_eight_times_dba_granularity, recalculate_b_all_bandwidth, set_na_num, GdbaAllocConfig,
+        GdbaGapConfig,
     },
     initialization::{
         self,
         defaults::{
-            apply_gpon_defaults, configure_nni_vport, DEFAULT_NNI_ETH_TPID,
+            apply_gpon_defaults, configure_nni_vport, configure_rssi_ad_ctrl, DEFAULT_NNI_ETH_TPID,
             DEFAULT_NNI_GEMPORT_OFFSET,
         },
         InitConfig,
@@ -34,10 +35,15 @@ use super::{
     upstream::{OmciFrame, PloamRecord, ReceiveError},
 };
 use crate::pon_engine::ploam::PloamFrame;
-use std::{collections::BTreeMap, io, num::NonZeroU16, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    io,
+    num::NonZeroU16,
+    time::{Duration, Instant},
+};
 
 /// Upstream burst rate mode recovered from `fslstack_gpon_ploamu_serial_number_process`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum OnuUpstreamRate {
     Rate1p25G,
     Rate2p5G,
@@ -61,11 +67,31 @@ impl OnuUpstreamRate {
     }
 }
 
-/// Local activation progress; `Active` does not independently confirm ONU O5.
+/// Local activation progress matching stock states `3` (Ranging),
+/// `7` (AwaitingPortIdAck), and `8` (Active after Configure_Port_ID ACK).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OnuState {
     Ranging,
+    AwaitingPortIdAck,
     Active,
+}
+
+/// Pending `Configure_Port_ID` (`0x0e`) ACK tracker matching stock
+/// `g_fslstack_ploamd_ack_list_head`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PendingPortIdAck {
+    pub onu_id: u8,
+    pub gem_port_id: u16,
+    pub sequence: u16,
+    pub created_at: Instant,
+}
+
+/// Summary returned by periodic timeout sweeps (`check_timeouts`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TimeoutReport {
+    pub expired_acks: usize,
+    pub timed_out_ranging: Vec<u8>,
+    pub timed_out_port_id_ack: Vec<u8>,
 }
 
 /// Software mirror of an active or ranging ONU managed on the FSL PON MAC.
@@ -101,6 +127,10 @@ pub struct OltSessionConfig {
     pub ploam_repeat: u8,
     pub o3_range_delay: Duration,
     pub o4_ranging_delay: Duration,
+    /// Stock `fslstack_gpon_ploamd_ack_list_timeout_check` expiry (5s).
+    pub ack_timeout: Duration,
+    /// Stock `fslstack_gpon_range_ack_state_timeout_check` expiry for O3/O4 (5s).
+    pub state_timeout: Duration,
     pub gap_config: GdbaGapConfig,
 }
 
@@ -123,6 +153,8 @@ impl Default for OltSessionConfig {
             ploam_repeat: PLOAM_DEFAULT_REPEAT,
             o3_range_delay: Duration::from_millis(50),
             o4_ranging_delay: Duration::from_millis(10),
+            ack_timeout: Duration::from_secs(5),
+            state_timeout: Duration::from_secs(5),
             gap_config: GdbaGapConfig::default(),
         }
     }
@@ -150,7 +182,7 @@ fn map_recv_err(err: ReceiveError) -> io::Error {
     err.source
 }
 
-/// Stateful offline GPON OLT controller driving the FSL SPI primitives over a generic `Bus`.
+/// Stateful GPON OLT controller driving the FSL SPI primitives over a generic `Bus`.
 pub struct FslOltSession<B: Bus> {
     mgmt: Management<B>,
     config: OltSessionConfig,
@@ -158,8 +190,15 @@ pub struct FslOltSession<B: Bus> {
     onu_id_offset: u8,
     base_b_all_set_thd: u16,
     dba_granularity_8x: u32,
+    gdba_pending_initialized: bool,
+    active_na_tconts: BTreeSet<u8>,
     onus: BTreeMap<u8, ManagedOnu>,
-    /// Per-session PON sequence; this alone does not implement the stock ACK queue.
+    state_entered_at: BTreeMap<u8, Instant>,
+    pending_port_id_acks: Vec<PendingPortIdAck>,
+    blacklist: BTreeSet<([u8; 8], OnuUpstreamRate)>,
+    whitelist: BTreeSet<([u8; 8], OnuUpstreamRate)>,
+    auto_whitelist: bool,
+    /// Per-session PON sequence matching stock `g_fslstack_ploam_seq`.
     next_port_id_sequence: u16,
 }
 
@@ -172,9 +211,48 @@ impl<B: Bus> FslOltSession<B> {
             onu_id_offset: 0,
             base_b_all_set_thd: 0,
             dba_granularity_8x: 64,
+            gdba_pending_initialized: false,
+            active_na_tconts: BTreeSet::new(),
             onus: BTreeMap::new(),
+            state_entered_at: BTreeMap::new(),
+            pending_port_id_acks: Vec::new(),
+            blacklist: BTreeSet::new(),
+            whitelist: BTreeSet::new(),
+            auto_whitelist: true,
             next_port_id_sequence: 0,
         }
+    }
+
+    pub fn pending_port_id_acks(&self) -> &[PendingPortIdAck] {
+        &self.pending_port_id_acks
+    }
+
+    pub fn add_to_blacklist(&mut self, serial_number: [u8; 8], rate: OnuUpstreamRate) {
+        self.blacklist.insert((serial_number, rate));
+    }
+
+    pub fn remove_from_blacklist(&mut self, serial_number: [u8; 8], rate: OnuUpstreamRate) -> bool {
+        self.blacklist.remove(&(serial_number, rate))
+    }
+
+    pub fn is_blacklisted(&self, serial_number: [u8; 8], rate: OnuUpstreamRate) -> bool {
+        self.blacklist.contains(&(serial_number, rate))
+    }
+
+    pub fn add_to_whitelist(&mut self, serial_number: [u8; 8], rate: OnuUpstreamRate) {
+        self.whitelist.insert((serial_number, rate));
+    }
+
+    pub fn remove_from_whitelist(&mut self, serial_number: [u8; 8], rate: OnuUpstreamRate) -> bool {
+        self.whitelist.remove(&(serial_number, rate))
+    }
+
+    pub fn is_whitelisted(&self, serial_number: [u8; 8], rate: OnuUpstreamRate) -> bool {
+        self.whitelist.contains(&(serial_number, rate))
+    }
+
+    pub fn set_auto_whitelist(&mut self, enabled: bool) {
+        self.auto_whitelist = enabled;
     }
 
     pub fn bus(&self) -> &B {
@@ -198,6 +276,32 @@ impl<B: Bus> FslOltSession<B> {
         self.mgmt
             .send_ploam(frame, self.config.tx_poll, checkpoint)
             .map_err(map_send_err)
+    }
+
+    /// Programs a T-CONT in `GDBA_DS_PARA_TAB`, `GDBA_PARA_H/L_TAB`, the
+    /// `GDBA_DS_ACTIVE_TAB`/`GDBA_DS_PENDING_TAB` scheduling ring, and
+    /// `GDBA_NA_NUM_CFG` (`fsldrv_gpon_gdba_alloc_info_conf`).
+    pub fn configure_tcont_alloc(&mut self, cfg: &GdbaAllocConfig) -> io::Result<()> {
+        self.require_initialized()?;
+        configure_alloc(&mut self.mgmt.fsl, cfg)?;
+        match configure_ds_active_pending_slot(
+            &mut self.mgmt.fsl,
+            self.config.init.gdba_scene,
+            cfg.onu_index,
+            cfg.tcont,
+            cfg.enable,
+            &mut self.gdba_pending_initialized,
+        ) {
+            Ok(()) => {}
+            Err(err) if !cfg.enable && err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        }
+        if cfg.enable && cfg.alloc_type == 1 {
+            self.active_na_tconts.insert(cfg.tcont);
+        } else {
+            self.active_na_tconts.remove(&cfg.tcont);
+        }
+        set_na_num(&mut self.mgmt.fsl, self.active_na_tconts.len() as u16)
     }
 
     pub fn config(&self) -> &OltSessionConfig {
@@ -255,6 +359,7 @@ impl<B: Bus> FslOltSession<B> {
     }
 
     /// Executes full hardware reset release, static GPON/GDBA/BMP/NNI/GEM defaults,
+    /// board RSSI/GPIO optical enable (`fhdrv_olt_pon_rssi_ad_ctrl(0xff, 0xff, 1)`),
     /// baseline GDBA threshold capture, and default interrupt mask setup.
     pub fn initialize(
         &mut self,
@@ -262,6 +367,7 @@ impl<B: Bus> FslOltSession<B> {
     ) -> io::Result<()> {
         initialization::release_reset(&mut self.mgmt.fsl, &self.config.init, checkpoint)?;
         self.onu_id_offset = apply_gpon_defaults(&mut self.mgmt.fsl, self.config.init.max_onu_id)?;
+        configure_rssi_ad_ctrl(&mut self.mgmt.fsl, None, None, Some(true))?;
         configure_nni_vport(
             &mut self.mgmt.fsl,
             self.config.nni_gem_port_offset,
@@ -335,16 +441,32 @@ impl<B: Bus> FslOltSession<B> {
         Ok(report)
     }
 
-    /// Handles `Serial_Number_ONU` (O3): configures upstream rate, sends
-    /// `Assign_ONU-ID`, waits `o3_range_delay`, and triggers `range_request`
-    /// (`fslstack_gpon_add_onu_o3_process`).
+    /// Handles `Serial_Number_ONU` (O3): enforces blacklist/whitelist policy,
+    /// configures upstream rate, sends `Assign_ONU-ID`, waits `o3_range_delay`,
+    /// and triggers `range_request` (`fslstack_gpon_add_onu_o3_process`).
     pub fn process_o3_sn_discovery(
         &mut self,
         serial_number: [u8; 8],
         rate: OnuUpstreamRate,
         checkpoint: &mut impl FnMut(Duration) -> io::Result<()>,
     ) -> io::Result<ManagedOnu> {
+        self.process_o3_sn_discovery_at(serial_number, rate, Instant::now(), checkpoint)
+    }
+
+    pub fn process_o3_sn_discovery_at(
+        &mut self,
+        serial_number: [u8; 8],
+        rate: OnuUpstreamRate,
+        now: Instant,
+        checkpoint: &mut impl FnMut(Duration) -> io::Result<()>,
+    ) -> io::Result<ManagedOnu> {
         self.require_initialized()?;
+        if self.blacklist.contains(&(serial_number, rate)) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "ONU serial number and rate are blacklisted",
+            ));
+        }
         if self
             .onus
             .values()
@@ -354,6 +476,16 @@ impl<B: Bus> FslOltSession<B> {
                 io::ErrorKind::AlreadyExists,
                 "duplicate ONU serial number",
             ));
+        }
+        if !self.whitelist.contains(&(serial_number, rate)) {
+            if self.auto_whitelist {
+                self.whitelist.insert((serial_number, rate));
+            } else {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "ONU serial number and rate are not whitelisted",
+                ));
+            }
         }
 
         let (onu_index, onu_id) = self.allocate_onu_slot()?;
@@ -388,18 +520,42 @@ impl<B: Bus> FslOltSession<B> {
             state: OnuState::Ranging,
         };
         self.onus.insert(onu_id, entry);
+        self.state_entered_at.insert(onu_id, now);
         Ok(entry)
     }
 
-    /// Handles ranged `Serial_Number_ONU` (O4->O5): sends `Ranging_Time`, activates
-    /// alarm monitor and OMCC T-CONT/GEM, enables `BMP_CFG_ONU_ACTIVE`, sends
-    /// `Configure_Port_ID`, and recalculates dynamic GDBA `B_ALL_SET_THD`
-    /// (`fslstack_gpon_add_onu_o4_o5_process` + `fslstack_gpon_configure_omci_bw_and_port`).
+    /// Handles ranged `Serial_Number_ONU` (O4): sends `Ranging_Time`, activates
+    /// alarm monitor and OMCC T-CONT, enables `BMP_CFG_ONU_ACTIVE`, sends
+    /// `Configure_Port_ID`, enqueues the pending ACK entry, and recalculates
+    /// dynamic GDBA `B_ALL_SET_THD` (`fslstack_gpon_add_onu_o4_o5_process` +
+    /// `fslstack_gpon_configure_omci_bw_and_port`).
+    ///
+    /// Matching stock behavior, this transitions the ONU to
+    /// `OnuState::AwaitingPortIdAck` (state 7) and defers `PORTID_CFG_TAB` OMCC
+    /// GEM port programming and `OnuState::Active` (state 8) until a matching
+    /// upstream `Configure_Port_ID` ACK is processed by `process_ploam_ack`.
     pub fn process_o4_o5_activation(
         &mut self,
         onu_id: u8,
         serial_number: &[u8; 8],
         raw_ranging_time: u32,
+        checkpoint: &mut impl FnMut(Duration) -> io::Result<()>,
+    ) -> io::Result<ManagedOnu> {
+        self.process_o4_o5_activation_at(
+            onu_id,
+            serial_number,
+            raw_ranging_time,
+            Instant::now(),
+            checkpoint,
+        )
+    }
+
+    pub fn process_o4_o5_activation_at(
+        &mut self,
+        onu_id: u8,
+        serial_number: &[u8; 8],
+        raw_ranging_time: u32,
+        now: Instant,
         checkpoint: &mut impl FnMut(Duration) -> io::Result<()>,
     ) -> io::Result<ManagedOnu> {
         self.require_initialized()?;
@@ -412,7 +568,28 @@ impl<B: Bus> FslOltSession<B> {
                 "ranged serial number does not match assigned ONU-ID",
             ));
         }
-        if existing.state == OnuState::Active {
+        if self
+            .blacklist
+            .contains(&(existing.serial_number, existing.rate))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "ONU serial number and rate are blacklisted",
+            ));
+        }
+        if !self
+            .whitelist
+            .contains(&(existing.serial_number, existing.rate))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "ONU serial number and rate are not whitelisted",
+            ));
+        }
+        if matches!(
+            existing.state,
+            OnuState::AwaitingPortIdAck | OnuState::Active
+        ) {
             return Ok(existing);
         }
 
@@ -438,31 +615,31 @@ impl<B: Bus> FslOltSession<B> {
             self.dba_granularity_8x,
             existing.rate.stock_onu_type(),
         )?;
-        configure_alloc(&mut self.mgmt.fsl, &omcc_cfg)?;
+        self.configure_tcont_alloc(&omcc_cfg)?;
         set_onu_active_bit(
             &mut self.mgmt.fsl,
             BMP_CFG_ONU_ACTIVE,
             existing.onu_index,
             true,
         )?;
-        configure_gem_port(
-            &mut self.mgmt.fsl,
-            existing.onu_index,
-            0,
-            u16::from(onu_id),
-            true,
-        )?;
         // Stock reserves its 16-bit per-PON sequence before attempting the send,
         // so even an ambiguous send failure must not reuse it.
         let sequence = self.next_port_id_sequence;
         self.next_port_id_sequence = sequence.wrapping_add(1);
-        let port_frame = configure_port_id_ploam(onu_id, u16::from(onu_id), true, sequence)?;
+        let gem_port_id = u16::from(onu_id);
+        let port_frame = configure_port_id_ploam(onu_id, gem_port_id, true, sequence)?;
         // All three stock Configure_Port_ID copies carry the same sequence.
         for _ in 0..3 {
             self.mgmt
                 .send_ploam(&port_frame, self.config.tx_poll, checkpoint)
                 .map_err(map_send_err)?;
         }
+        self.pending_port_id_acks.push(PendingPortIdAck {
+            onu_id,
+            gem_port_id,
+            sequence,
+            created_at: now,
+        });
         recalculate_b_all_bandwidth(
             &mut self.mgmt.fsl,
             self.base_b_all_set_thd,
@@ -471,11 +648,136 @@ impl<B: Bus> FslOltSession<B> {
 
         let updated = ManagedOnu {
             eqd,
+            state: OnuState::AwaitingPortIdAck,
+            ..existing
+        };
+        self.onus.insert(onu_id, updated);
+        self.state_entered_at.insert(onu_id, now);
+        Ok(updated)
+    }
+
+    /// Processes an upstream PLOAM `Acknowledge` (`0x09`) frame
+    /// (`fslstack_gpon_ploam_ack_process` ->
+    /// `fslstack_gpon_configure_port_id_ack_process`).
+    ///
+    /// When the acknowledged downstream message is `Configure_Port_ID` (`0x0e`)
+    /// with `activate != 0`, matches a pending `(onu_id, sequence)` entry, and
+    /// the ONU is in `OnuState::AwaitingPortIdAck`, this programs the OMCC GEM
+    /// port in `PORTID_CFG_TAB`, transitions the ONU to `OnuState::Active`, and
+    /// transmits `BER_Interval` (`28_800_000`, 3x).
+    pub fn process_ploam_ack(
+        &mut self,
+        record: &PloamRecord,
+        checkpoint: &mut impl FnMut(Duration) -> io::Result<()>,
+    ) -> io::Result<Option<ManagedOnu>> {
+        self.process_ploam_ack_at(record, Instant::now(), checkpoint)
+    }
+
+    pub fn process_ploam_ack_at(
+        &mut self,
+        record: &PloamRecord,
+        now: Instant,
+        checkpoint: &mut impl FnMut(Duration) -> io::Result<()>,
+    ) -> io::Result<Option<ManagedOnu>> {
+        self.require_initialized()?;
+        if record.message_id() != PLOAM_MSG_ACK {
+            return Ok(None);
+        }
+        let Some(onu_id) = record.onu_id() else {
+            return Ok(None);
+        };
+        let acked_msg_id = record.frame[2];
+        if acked_msg_id != PLOAM_MSG_CONFIGURE_PORT_ID {
+            return Ok(None);
+        }
+        let enable = record.frame[5] != 0;
+        let sequence = u16::from_be_bytes([record.frame[8], record.frame[9]]);
+        let Some(existing) = self.onus.get(&onu_id).copied() else {
+            return Ok(None);
+        };
+        if !enable || existing.state != OnuState::AwaitingPortIdAck {
+            return Ok(None);
+        }
+        let Some(ack_pos) = self
+            .pending_port_id_acks
+            .iter()
+            .position(|entry| entry.onu_id == onu_id && entry.sequence == sequence)
+        else {
+            return Ok(None);
+        };
+
+        let ack_entry = self.pending_port_id_acks.remove(ack_pos);
+        configure_gem_port(
+            &mut self.mgmt.fsl,
+            existing.onu_index,
+            0,
+            ack_entry.gem_port_id,
+            true,
+        )?;
+        let ber_frame = ber_interval_ploam(onu_id, DEFAULT_BER_INTERVAL);
+        for _ in 0..self.config.ploam_repeat {
+            self.mgmt
+                .send_ploam(&ber_frame, self.config.tx_poll, checkpoint)
+                .map_err(map_send_err)?;
+        }
+
+        let updated = ManagedOnu {
             state: OnuState::Active,
             ..existing
         };
         self.onus.insert(onu_id, updated);
-        Ok(updated)
+        self.state_entered_at.insert(onu_id, now);
+        Ok(Some(updated))
+    }
+
+    /// Runs the stock periodic ACK-list expiry
+    /// (`fslstack_gpon_ploamd_ack_list_timeout_check`) and independent O3/O4
+    /// state timeout sweep (`fslstack_gpon_range_ack_state_timeout_check`),
+    /// reregistering timed-out ONUs so they can cleanly re-enter discovery.
+    pub fn check_timeouts(
+        &mut self,
+        checkpoint: &mut impl FnMut(Duration) -> io::Result<()>,
+    ) -> io::Result<TimeoutReport> {
+        self.check_timeouts_at(Instant::now(), checkpoint)
+    }
+
+    pub fn check_timeouts_at(
+        &mut self,
+        now: Instant,
+        checkpoint: &mut impl FnMut(Duration) -> io::Result<()>,
+    ) -> io::Result<TimeoutReport> {
+        self.require_initialized()?;
+        let mut report = TimeoutReport::default();
+
+        let ack_timeout = self.config.ack_timeout;
+        let before = self.pending_port_id_acks.len();
+        self.pending_port_id_acks
+            .retain(|entry| now.saturating_duration_since(entry.created_at) < ack_timeout);
+        report.expired_acks = before - self.pending_port_id_acks.len();
+
+        let state_timeout = self.config.state_timeout;
+        let expired_onus: Vec<(u8, OnuState)> = self
+            .onus
+            .iter()
+            .filter_map(|(&onu_id, onu)| {
+                if !matches!(onu.state, OnuState::Ranging | OnuState::AwaitingPortIdAck) {
+                    return None;
+                }
+                let entered_at = self.state_entered_at.get(&onu_id).copied()?;
+                (now.saturating_duration_since(entered_at) >= state_timeout)
+                    .then_some((onu_id, onu.state))
+            })
+            .collect();
+
+        for (onu_id, state) in expired_onus {
+            self.deactivate_onu(onu_id, &[], &[], checkpoint)?;
+            match state {
+                OnuState::Ranging => report.timed_out_ranging.push(onu_id),
+                OnuState::AwaitingPortIdAck => report.timed_out_port_id_ack.push(onu_id),
+                OnuState::Active => {}
+            }
+        }
+        Ok(report)
     }
 
     /// Toggles an ONU's upstream FEC bitmap bit (`BMP_CFG_ONU_FEC_1G`) and
@@ -547,6 +849,25 @@ impl<B: Bus> FslOltSession<B> {
         gems.push(u16::from(onu_id));
         gems.extend_from_slice(extra_gems);
 
+        for &tcont in &tconts {
+            let disable_cfg = GdbaAllocConfig {
+                tcont,
+                onu_index: onu.onu_index,
+                enable: false,
+                fixed_bw: 0,
+                assured_bw: 0,
+                max_bw: 0,
+                alloc_type: 0,
+                priority: 0,
+                weight: 0,
+                ds_period: 0,
+                ds_flag: false,
+                ds_bw_flag: false,
+                ds_tail_flag: false,
+            };
+            self.configure_tcont_alloc(&disable_cfg)?;
+        }
+
         remove_onu(
             &mut self.mgmt,
             onu_id,
@@ -565,6 +886,9 @@ impl<B: Bus> FslOltSession<B> {
             &self.config.gap_config,
         )?;
         self.onus.remove(&onu_id);
+        self.state_entered_at.remove(&onu_id);
+        self.pending_port_id_acks
+            .retain(|entry| entry.onu_id != onu_id);
         Ok(())
     }
 }

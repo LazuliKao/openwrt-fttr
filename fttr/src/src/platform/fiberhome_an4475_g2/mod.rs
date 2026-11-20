@@ -83,7 +83,8 @@ const fn allocations() -> [super::resources::OnuResources; ONU_COUNT] {
     while index < entries.len() {
         entries[index] = super::resources::OnuResources {
             onu_id: index as u8,
-            alloc_id: 0x100 + index as u16,
+            // FSL hardware maps data Alloc-IDs in 0x400..(0x500 - max_onus) for alloc_offset_mode=0.
+            alloc_id: 0x400 + index as u16,
             gem_id: 0x100 + index as u16,
             interface: None,
         };

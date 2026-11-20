@@ -23,12 +23,12 @@ use crate::platform::fiberhome_an4475_g2::{
     },
     downstream::{OMCI_CONTROL, OMCI_MEMORY, PLOAM_DATA as TX_PLOAM_DATA, PLOAM_INFO},
     gdba::{
-        read_b_all_set_thd, GDBA_DS_PARA_TAB, GDBA_DS_TAB_REQ_CFG, GDBA_PARA_H_TAB,
-        GDBA_PARA_L_TAB, GDBA_TAB_REQ_CFG,
+        read_b_all_set_thd, GDBA_DS_ACTIVE_TAB, GDBA_DS_PARA_TAB, GDBA_DS_PENDING_TAB,
+        GDBA_DS_TAB_REQ_CFG, GDBA_PARA_H_TAB, GDBA_PARA_L_TAB, GDBA_TAB_REQ_CFG,
     },
     initialization::{
-        defaults::GDBA_SLOT_REQ_CFG, GPON_RAM_INIT_MASK, RAM_INIT_STATUS, SERDES_LOCK_MASK,
-        SERDES_STATUS,
+        defaults::{DEBUG_PIN_SEL, GDBA_SLOT_REQ_CFG},
+        GPON_RAM_INIT_MASK, RAM_INIT_STATUS, SERDES_LOCK_MASK, SERDES_STATUS,
     },
     interrupts::{
         read_mask, GPON_INT, GPON_INT_MASK, NNI_INT, NNI_INT_MASK, PLOAM_LOAMI_SUFI_INT,
@@ -50,6 +50,7 @@ struct SimBus {
     mems: BTreeMap<(u32, u32), Vec<u32>>,
     ploam_tx_frames: Vec<[u32; 12]>,
     omci_tx_writes: Vec<(u32, Vec<u32>)>,
+    portid_tab_writes: Vec<(u32, Vec<u32>)>,
     rx_ploams: VecDeque<[u32; 13]>,
 }
 
@@ -69,6 +70,7 @@ impl SimBus {
             mems: BTreeMap::new(),
             ploam_tx_frames: Vec::new(),
             omci_tx_writes: Vec::new(),
+            portid_tab_writes: Vec::new(),
             rx_ploams: VecDeque::new(),
         }
     }
@@ -202,6 +204,8 @@ impl Bus for SimBus {
                 words.reverse();
                 if addr == OMCI_MEMORY {
                     self.omci_tx_writes.push((row, words.clone()));
+                } else if addr == PORTID_CFG_TAB {
+                    self.portid_tab_writes.push((row, words.clone()));
                 }
                 self.mems.insert((addr, row), words);
             }
@@ -263,6 +267,21 @@ fn ploam_conversion_roundtrips_with_pon_engine_frame() {
     assert_eq!(parsed.payload, frame.payload);
 }
 
+fn build_configure_port_id_ack(
+    onu_id: u8,
+    gem_port_id: u16,
+    enable: bool,
+    sequence: u16,
+) -> [u8; 13] {
+    let down = configure_port_id_ploam(onu_id, gem_port_id, enable, sequence).unwrap();
+    let mut frame = [0u8; 13];
+    frame[0] = onu_id;
+    frame[1] = PLOAM_MSG_ACK;
+    frame[2] = PLOAM_MSG_CONFIGURE_PORT_ID;
+    frame[3..12].copy_from_slice(&down[..9]);
+    frame
+}
+
 #[test]
 fn full_offline_olt_lifecycle_init_discover_activate_omci_fec_and_deactivate() {
     let mut cfg = OltSessionConfig::default();
@@ -273,6 +292,11 @@ fn full_offline_olt_lifecycle_init_discover_activate_omci_fec_and_deactivate() {
     assert!(session.is_initialized());
     assert_eq!(session.base_b_all_set_thd(), 38880);
     assert_eq!(session.dba_granularity_8x(), 64);
+    assert_eq!(
+        session.bus().get_reg_slice(DEBUG_PIN_SEL, 1),
+        vec![0x8c],
+        "stock rssi_ad_ctrl(0xff, 0xff, 1) must program DEBUG_PIN_SEL=0x8c"
+    );
 
     let masks = read_mask(&mut session.mgmt.fsl).expect("read_mask");
     assert!(masks.ploam_rx && masks.omci_rx && masks.losi && masks.tiwi);
@@ -314,7 +338,7 @@ fn full_offline_olt_lifecycle_init_discover_activate_omci_fec_and_deactivate() {
     // Assign_ONU-ID repeated 3 times.
     assert_eq!(session.bus().ploam_tx_frames.len(), 3);
 
-    // Synthesize ranged SN PLOAMu (O4 -> O5) and activate ONU 0.
+    // Synthesize ranged SN PLOAMu (O4) and transition ONU 0 to AwaitingPortIdAck.
     let raw_rt = 0x400u32 << 5;
     let mut ranged_frame = [0u8; 13];
     ranged_frame[0] = onu.onu_id;
@@ -347,17 +371,18 @@ fn full_offline_olt_lifecycle_init_discover_activate_omci_fec_and_deactivate() {
     // successful send and inspect the encoded frame rather than only a counter.
     assert_eq!(session.next_port_id_sequence, 0);
     session.next_port_id_sequence = u16::MAX;
-    let activated = session
+    let portid_writes_before_o4 = session.bus().portid_tab_writes.len();
+    let pending = session
         .process_o4_o5_activation(
             0,
             &test_sn,
             poll2.ploams[0].ranging_time_raw(),
             &mut no_sleep,
         )
-        .expect("O4/O5 activation");
-    assert_eq!(activated.state, OnuState::Active);
+        .expect("O4 activation");
+    assert_eq!(pending.state, OnuState::AwaitingPortIdAck);
     assert_eq!(
-        activated.eqd,
+        pending.eqd,
         eqd_from_ranging(poll2.ploams[0].ranging_time_raw(), true)
     );
     // Each stock O4 message is sent three times, with identical copies.
@@ -375,7 +400,23 @@ fn full_offline_olt_lifecycle_init_discover_activate_omci_fec_and_deactivate() {
         )
     );
     assert_eq!(session.next_port_id_sequence, 0);
-    assert_eq!(session.active_onus().count(), 1);
+    assert_eq!(session.active_onus().count(), 0);
+    assert_eq!(session.pending_port_id_acks().len(), 1);
+    assert_eq!(session.pending_port_id_acks()[0].sequence, u16::MAX);
+
+    // Before Configure_Port_ID ACK, PORTID_CFG_TAB must not be updated and send_omci must fail.
+    assert_eq!(
+        session.bus().portid_tab_writes.len(),
+        portid_writes_before_o4,
+        "OMCC GEM port must not be programmed before Configure_Port_ID ACK"
+    );
+    assert_eq!(
+        session
+            .send_omci(0, &[0; 8], &mut no_sleep)
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::NotConnected
+    );
 
     // Active GDBA threshold recalculated cleanly below baseline 38880.
     let thd_no_fec = read_b_all_set_thd(&mut session.mgmt.fsl).expect("read thd");
@@ -388,11 +429,69 @@ fn full_offline_olt_lifecycle_init_discover_activate_omci_fec_and_deactivate() {
         session.bus().mems.contains_key(&(GDBA_DS_PARA_TAB, 0))
             && session.bus().mems.contains_key(&(GDBA_PARA_H_TAB, 0))
             && session.bus().mems.contains_key(&(GDBA_PARA_L_TAB, 0))
+            && session.bus().mems.get(&(GDBA_DS_ACTIVE_TAB, 0)) == Some(&vec![0x100, 0])
+            && session.bus().mems.get(&(GDBA_DS_PENDING_TAB, 0)) == Some(&vec![0x100, 0]),
+        "OMCC T-CONT must be programmed into both GDBA Active and Pending tables"
     );
-    assert!(
-        session.bus().mems.contains_key(&(PORTID_CFG_TAB, 0)),
-        "OMCC GEM port entry must be programmed"
+
+    // Wrong sequence or disable ACK must be ignored without promoting to Active.
+    let wrong_seq_ack = PloamRecord::decode(
+        encode_rx_ploam_words(&build_configure_port_id_ack(0, 0, true, 0x1234), 0),
+        true,
     );
+    assert_eq!(
+        session
+            .process_ploam_ack(&wrong_seq_ack, &mut no_sleep)
+            .unwrap(),
+        None
+    );
+    let disable_ack = PloamRecord::decode(
+        encode_rx_ploam_words(&build_configure_port_id_ack(0, 0, false, u16::MAX), 0),
+        true,
+    );
+    assert_eq!(
+        session
+            .process_ploam_ack(&disable_ack, &mut no_sleep)
+            .unwrap(),
+        None
+    );
+    assert_eq!(session.onu(0).unwrap().state, OnuState::AwaitingPortIdAck);
+    assert_eq!(session.pending_port_id_acks().len(), 1);
+
+    // Matching Configure_Port_ID ACK transitions ONU to Active, programs PORTID_CFG_TAB,
+    // and transmits BER_Interval (28_800_000) 3 times.
+    let matching_ack_frame = build_configure_port_id_ack(0, 0, true, u16::MAX);
+    session
+        .bus_mut()
+        .push_rx_ploam(encode_rx_ploam_words(&matching_ack_frame, 0));
+    let poll_ack = session.poll_once(4, 4, &mut no_sleep).expect("poll ACK");
+    assert_eq!(poll_ack.ploams.len(), 1);
+    let activated = session
+        .process_ploam_ack(&poll_ack.ploams[0], &mut no_sleep)
+        .expect("process ACK")
+        .expect("ONU must transition to Active");
+    assert_eq!(activated.state, OnuState::Active);
+    assert_eq!(session.active_onus().count(), 1);
+    assert!(session.pending_port_id_acks().is_empty());
+    assert_eq!(
+        session.bus().portid_tab_writes.len(),
+        portid_writes_before_o4 + 1,
+        "OMCC GEM port entry must be programmed after Configure_Port_ID ACK"
+    );
+    assert_eq!(session.bus().portid_tab_writes.last().unwrap().0, 0);
+    assert_eq!(session.bus().ploam_tx_frames.len(), 12);
+    assert_eq!(
+        session.bus().ploam_tx_frames[9],
+        super::super::downstream::pack_ploam(&ber_interval_ploam(0, DEFAULT_BER_INTERVAL))
+    );
+    // Duplicate ACK is idempotent and ignored.
+    assert_eq!(
+        session
+            .process_ploam_ack(&poll_ack.ploams[0], &mut no_sleep)
+            .unwrap(),
+        None
+    );
+    assert_eq!(session.bus().ploam_tx_frames.len(), 12);
 
     // Enabling US FEC shrinks B_ALL_SET_THD by ~239/255.
     let thd_with_fec = session
@@ -432,6 +531,114 @@ fn full_offline_olt_lifecycle_init_discover_activate_omci_fec_and_deactivate() {
         read_b_all_set_thd(&mut session.mgmt.fsl).expect("restored thd"),
         38880
     );
-    // 3 Deactivate_ONU-ID PLOAMs added -> 12 total.
-    assert_eq!(session.bus().ploam_tx_frames.len(), 12);
+    // 3 Deactivate_ONU-ID PLOAMs added -> 15 total.
+    assert_eq!(session.bus().ploam_tx_frames.len(), 15);
+}
+
+#[test]
+fn ranging_and_port_id_ack_timeouts_reregister_and_expire_ack_entries() {
+    let mut cfg = OltSessionConfig::default();
+    cfg.init.max_onu_id = 16;
+    let mut session = FslOltSession::new(SimBus::new(), cfg);
+    session.initialize(&mut no_sleep).expect("initialize");
+
+    let t0 = Instant::now();
+    let sn_a = *b"TEST\x00\x00\x00\x11";
+    let sn_b = *b"TEST\x00\x00\x00\x22";
+
+    // ONU A enters Ranging at t0 and times out at t0 + 5s.
+    let onu_a = session
+        .process_o3_sn_discovery_at(sn_a, OnuUpstreamRate::Rate1p25G, t0, &mut no_sleep)
+        .expect("O3 A");
+    let before_timeout = session
+        .check_timeouts_at(t0 + Duration::from_secs(4), &mut no_sleep)
+        .expect("sweep 4s");
+    assert_eq!(before_timeout, TimeoutReport::default());
+    assert!(session.onu(onu_a.onu_id).is_some());
+
+    let after_o3_timeout = session
+        .check_timeouts_at(t0 + Duration::from_secs(5), &mut no_sleep)
+        .expect("sweep 5s");
+    assert_eq!(after_o3_timeout.timed_out_ranging, vec![onu_a.onu_id]);
+    assert!(after_o3_timeout.timed_out_port_id_ack.is_empty());
+    assert!(session.onu(onu_a.onu_id).is_none());
+
+    // ONU B enters O3 at t1, O4 at t1 + 1s (AwaitingPortIdAck), and times out at t1 + 6s.
+    let t1 = t0 + Duration::from_secs(10);
+    let onu_b = session
+        .process_o3_sn_discovery_at(sn_b, OnuUpstreamRate::Rate2p5G, t1, &mut no_sleep)
+        .expect("O3 B");
+    session
+        .process_o4_o5_activation_at(
+            onu_b.onu_id,
+            &sn_b,
+            0x200,
+            t1 + Duration::from_secs(1),
+            &mut no_sleep,
+        )
+        .expect("O4 B");
+    assert_eq!(session.pending_port_id_acks().len(), 1);
+    assert_eq!(
+        session.onu(onu_b.onu_id).unwrap().state,
+        OnuState::AwaitingPortIdAck
+    );
+
+    let after_o4_timeout = session
+        .check_timeouts_at(t1 + Duration::from_secs(6), &mut no_sleep)
+        .expect("sweep O4 timeout");
+    assert_eq!(after_o4_timeout.expired_acks, 1);
+    assert_eq!(after_o4_timeout.timed_out_port_id_ack, vec![onu_b.onu_id]);
+    assert!(session.pending_port_id_acks().is_empty());
+    assert!(session.onu(onu_b.onu_id).is_none());
+    assert_eq!(session.bus().get_reg_slice(BMP_CFG_ONU_ACTIVE, 4)[0] & 1, 0);
+    assert_eq!(
+        read_b_all_set_thd(&mut session.mgmt.fsl).expect("restored thd"),
+        38880
+    );
+
+    // Timed-out ONU can cleanly re-discover after reregister cleanup.
+    let rediscovered = session
+        .process_o3_sn_discovery_at(
+            sn_b,
+            OnuUpstreamRate::Rate2p5G,
+            t1 + Duration::from_secs(7),
+            &mut no_sleep,
+        )
+        .expect("rediscover B");
+    assert_eq!(rediscovered.state, OnuState::Ranging);
+}
+
+#[test]
+fn blacklist_and_strict_whitelist_gate_discovery() {
+    let mut cfg = OltSessionConfig::default();
+    cfg.init.max_onu_id = 16;
+    let mut session = FslOltSession::new(SimBus::new(), cfg);
+    session.initialize(&mut no_sleep).expect("initialize");
+
+    let sn = *b"TEST\x00\x00\x00\x33";
+    // Blacklist is keyed on (SN, rate), matching stock fslstack_black_list_find_entry.
+    session.add_to_blacklist(sn, OnuUpstreamRate::Rate1p25G);
+    assert_eq!(
+        session
+            .process_o3_sn_discovery(sn, OnuUpstreamRate::Rate1p25G, &mut no_sleep)
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::PermissionDenied
+    );
+    assert!(session.bus().ploam_tx_frames.is_empty());
+
+    // Strict whitelist mode rejects non-whitelisted (SN, rate) until explicitly added.
+    session.set_auto_whitelist(false);
+    assert_eq!(
+        session
+            .process_o3_sn_discovery(sn, OnuUpstreamRate::Rate2p5G, &mut no_sleep)
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::PermissionDenied
+    );
+    session.add_to_whitelist(sn, OnuUpstreamRate::Rate2p5G);
+    let onu = session
+        .process_o3_sn_discovery(sn, OnuUpstreamRate::Rate2p5G, &mut no_sleep)
+        .expect("whitelisted 2.5G ONU allowed");
+    assert_eq!(onu.state, OnuState::Ranging);
 }

@@ -1,7 +1,7 @@
 //! Static GPON MAC, GDBA, BMP, NNI, ToD, and default GEM configuration
 //! sequences extracted from `fslstack_gpon_reg_config`.
 
-use super::{rmw_fields, set_field, write_reg_u32, write_reg_words, PD_PLL_SDS_CFG};
+use super::{rmw_fields, set_field, write_reg_u32, write_reg_words, ETH_TYPE_CFG, PD_PLL_SDS_CFG};
 use crate::platform::{
     diagnostics::RegisterSpace,
     fiberhome_an4475_g2::{
@@ -176,7 +176,7 @@ pub fn apply_gdba_defaults<B: Bus>(fsl: &mut Fsl<B>) -> io::Result<()> {
     rmw_fields(fsl, GDBA_BASIC_CFG, 1, &[(6, 6, 7)])?;
     rmw_fields(fsl, GDBA_DS_CNT_CFG, 1, &[(0, 1, 1), (7, 15, 20)])?;
     rmw_fields(fsl, GDBA_L_H_THR_CFG, 4, &[(0, 15, 20)])?;
-    rmw_fields(fsl, GDBA_CW_CFG, 2, &[(32, 16, 6), (2, 16, 6)])?;
+    rmw_fields(fsl, GDBA_CW_CFG, 2, &[(32, 16, 6), (2, 16, 6), (0, 1, 1)])?;
     rmw_fields(fsl, GDBA_DBA_START_CFG, 1, &[(0, 1, 1)])?;
     rmw_fields(fsl, GDBA_WORK_CFG, 1, &[(1, 3, 0), (0, 1, 1)])?;
     rmw_fields(
@@ -265,6 +265,39 @@ pub fn configure_nni_vport<B: Bus>(
 ) -> io::Result<()> {
     set_nni_gem_port_offset(fsl, gem_port_offset)?;
     set_nni_eth_tpid(fsl, eth_tpid)
+}
+
+/// Configures the FSL debug/GPIO pins used for board-level optical/RSSI control
+/// (`fsldrv_gpon_rssiadctrl` -> `fsldrv_gpon_common_gpio_set`).
+///
+/// Stock `subont_manager` invokes `fhdrv_olt_pon_rssi_ad_ctrl(0xff, 0xff, 1)`
+/// before enabling optical TX, which masks `ETH_TYPE_CFG@0x2` to bit 0 and
+/// updates `DEBUG_PIN_SEL@0x3` with `GPIO_TS=0`, `GPIO_SEL=4`, and
+/// `GPIO_LED[3:2]=1` (`0x8c` from the default `0x0a`).
+pub fn configure_rssi_ad_ctrl<B: Bus>(
+    fsl: &mut Fsl<B>,
+    rssi_thxor: Option<bool>,
+    rssi_gain: Option<bool>,
+    rssi_ad_en: Option<bool>,
+) -> io::Result<()> {
+    let eth_type = fsl.read_register(ETH_TYPE_CFG)?;
+    write_reg_u32(fsl, ETH_TYPE_CFG, eth_type & 1)?;
+
+    let mut debug_pin = [fsl.read_register(DEBUG_PIN_SEL)?];
+    set_field(&mut debug_pin, 15, 5, 0); // GPIO_TS = 0
+    set_field(&mut debug_pin, 0, 3, 4); // GPIO_SEL = 4
+    let mut gpio_led = (debug_pin[0] >> 5) & 0x3ff;
+    if let Some(thxor) = rssi_thxor {
+        gpio_led = (gpio_led & 0x33f) | (u32::from(thxor) << 6);
+    }
+    if let Some(gain) = rssi_gain {
+        gpio_led = (gpio_led & 0x3cf) | (u32::from(gain) << 4);
+    }
+    if let Some(ad_en) = rssi_ad_en {
+        gpio_led = (gpio_led & 0x3f3) | (u32::from(ad_en) << 2);
+    }
+    set_field(&mut debug_pin, 5, 10, gpio_led);
+    write_reg_u32(fsl, DEBUG_PIN_SEL, debug_pin[0])
 }
 
 /// Runs the full `fslstack_gpon_reg_config` sequence and returns `ONUID_OFFSET_CFG`.

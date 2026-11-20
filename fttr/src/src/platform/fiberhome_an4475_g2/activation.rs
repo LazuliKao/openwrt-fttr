@@ -58,7 +58,11 @@ pub const SWITCH_CFG_GEMPORT_BITMAP: u32 = 0xb01;
 pub const PLOAM_MSG_ASSIGN_ONU_ID: u8 = 0x03;
 pub const PLOAM_MSG_RANGING_TIME: u8 = 0x04;
 pub const PLOAM_MSG_DEACTIVATE_ONU_ID: u8 = 0x05;
+pub const PLOAM_MSG_ACK: u8 = 0x09;
+pub const PLOAM_MSG_ASSIGN_ALLOC_ID: u8 = 0x0a;
 pub const PLOAM_MSG_CONFIGURE_PORT_ID: u8 = 0x0e;
+pub const PLOAM_MSG_BER_INTERVAL: u8 = 0x12;
+pub const DEFAULT_BER_INTERVAL: u32 = 28_800_000;
 pub const PLOAM_DEFAULT_REPEAT: u8 = 3;
 pub const MAX_PLOAM_FILTER_SLOTS: u8 = 4;
 pub const MAX_ONU_INDEX: u16 = 127;
@@ -127,6 +131,41 @@ pub fn configure_port_id_ploam(
     frame[4] = ((gem_port_id & 0xf) << 4) as u8;
     frame[5..7].copy_from_slice(&sequence.to_be_bytes());
     Ok(frame)
+}
+
+/// Builds a 12-byte downstream GPON `Assign_Alloc-ID` (`0x0a`) PLOAM frame
+/// matching `fslstack_gpon_assign_alloc_id` (`alloc_type = 1` for GEM payload,
+/// `0xff` to deallocate).
+pub fn assign_alloc_id_ploam(
+    onu_id: u8,
+    alloc_id: u16,
+    enable: bool,
+    sequence: u16,
+) -> io::Result<[u8; 12]> {
+    if u32::from(alloc_id) > MAX_ROW {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Alloc-ID exceeds 12-bit GPON range",
+        ));
+    }
+    let mut frame = [0u8; 12];
+    frame[0] = onu_id;
+    frame[1] = PLOAM_MSG_ASSIGN_ALLOC_ID;
+    frame[2] = (alloc_id >> 4) as u8;
+    frame[3] = ((alloc_id & 0xf) << 4) as u8;
+    frame[4] = if enable { 1 } else { 0xff };
+    frame[5..7].copy_from_slice(&sequence.to_be_bytes());
+    Ok(frame)
+}
+
+/// Builds a 12-byte downstream GPON `BER_Interval` (`0x12`) PLOAM frame
+/// matching `fslstack_gpon_send_ber_interval_msg`.
+pub fn ber_interval_ploam(onu_id: u8, interval: u32) -> [u8; 12] {
+    let mut frame = [0u8; 12];
+    frame[0] = onu_id;
+    frame[1] = PLOAM_MSG_BER_INTERVAL;
+    frame[2..6].copy_from_slice(&interval.to_be_bytes());
+    frame
 }
 
 /// Converts a protocol ONU-ID to the 7-bit internal hardware `onu_index`
