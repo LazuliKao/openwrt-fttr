@@ -173,6 +173,46 @@ impl FslManagementLease {
     }
 }
 
+fn commit_business(
+    modified: &mut bool,
+    disarmed: &mut bool,
+    configure: impl FnOnce() -> io::Result<()>,
+) -> io::Result<()> {
+    if !*modified {
+        // A failed configure can still have partially changed hardware.
+        *modified = true;
+        configure()?;
+    }
+    *disarmed = true;
+    Ok(())
+}
+
+#[cfg(test)]
+mod commit_tests {
+    use super::*;
+
+    #[test]
+    fn failed_business_commit_keeps_partial_configuration_armed_for_cleanup() {
+        let (mut modified, mut disarmed) = (false, false);
+        let error = commit_business(&mut modified, &mut disarmed, || {
+            Err(io::Error::other("injected write failure"))
+        });
+        assert!(error.is_err());
+        assert!(modified);
+        assert!(!disarmed);
+    }
+
+    #[test]
+    fn already_configured_business_commits_without_reconfiguration() {
+        let (mut modified, mut disarmed) = (true, false);
+        commit_business(&mut modified, &mut disarmed, || {
+            panic!("unexpected reconfiguration")
+        })
+        .unwrap();
+        assert!(disarmed);
+    }
+}
+
 fn configure_business_datapath(onu_id: u8, floor_bytes: Option<u16>) -> io::Result<()> {
     let res = super::RESOURCES.onu(onu_id)?;
     with_session(|session| {
@@ -222,18 +262,10 @@ impl ManagementLease for FslManagementLease {
         Ok(())
     }
 
-    fn disarm(&mut self) {
-        if !self.business_modified {
-            if let Err(err) = configure_business_datapath(self.onu_id, None) {
-                eprintln!(
-                    "[-] FSL business datapath activation failed for ONU {}: {err}",
-                    self.onu_id
-                );
-            } else {
-                self.business_modified = true;
-            }
-        }
-        self.disarmed = true;
+    fn disarm(&mut self) -> io::Result<()> {
+        commit_business(&mut self.business_modified, &mut self.disarmed, || {
+            configure_business_datapath(self.onu_id, None)
+        })
     }
 }
 
@@ -629,46 +661,7 @@ fn data_path(
     let gem_ports: Option<Vec<u16>> = inventory
         .as_ref()
         .and_then(|v| v.gem_ports.iter().map(|p| p.port_id).collect());
-    let forwarding_verified = if let Some(ref inv) = inventory {
-        let gem_matched = olt_channel_gem.is_some_and(|expected| {
-            gem_ports
-                .as_ref()
-                .is_some_and(|ports| ports.contains(&expected))
-        });
-        let rx_traffic = rx_bytes.unwrap_or(0) > 0;
-        let (verified, fwd_ev) = if !gem_matched {
-            (
-                false,
-                fttr_api::MeasurementEvidence::unavailable(
-                    format!("FSL VPORT {interface}"),
-                    "forwarding_proof",
-                    "gem_port_mismatch_with_olt_vport",
-                ),
-            )
-        } else if rx_traffic {
-            (
-                true,
-                fttr_api::MeasurementEvidence::observed(
-                    format!("{interface}/statistics"),
-                    "forwarding_proof",
-                    format!(
-                        "vport_gem_rx_observed: rx_bytes={}, tx_bytes={}, gem_port=0x{:04x}",
-                        rx_bytes.unwrap_or(0),
-                        tx_bytes.unwrap_or(0),
-                        olt_channel_gem.unwrap_or(0)
-                    ),
-                ),
-            )
-        } else {
-            (
-                false,
-                fttr_api::MeasurementEvidence::unavailable(
-                    format!("{interface}/statistics"),
-                    "forwarding_proof",
-                    "waiting_for_first_rx_frame_from_vport",
-                ),
-            )
-        };
+    if let Some(ref inv) = inventory {
         for field in ["gem_ports", "onu_inventory"] {
             let mut ev = fttr_api::MeasurementEvidence::observed(
                 "fresh ONU OMCI MIB upload; not OLT forwarding proof",
@@ -683,19 +676,15 @@ fn data_path(
             ev.age_seconds = Some(inv.age_seconds);
             measurements.insert(field.into(), ev);
         }
-        measurements.insert("forwarding_proof".into(), fwd_ev);
-        Some(verified)
-    } else {
-        measurements.insert(
-            "forwarding_proof".into(),
-            fttr_api::MeasurementEvidence::unavailable(
-                "verified data-path inventory",
-                "forwarding_proof",
-                "verified_inventory_unavailable",
-            ),
-        );
-        Some(false)
-    };
+    }
+    measurements.insert(
+        "forwarding_proof".into(),
+        fttr_api::MeasurementEvidence::unavailable(
+            format!("FSL VPORT {interface}"),
+            "forwarding_proof",
+            "current_bidirectional_forwarding_not_verified",
+        ),
+    );
     fttr_api::DataPathStatus {
         interface,
         gem_ports,
@@ -706,7 +695,7 @@ fn data_path(
         current_tx_kbps,
         current_rx_kbps,
         olt_channel_gem,
-        forwarding_verified,
+        forwarding_verified: None,
         offload: Default::default(),
         measurements,
     }
@@ -1116,6 +1105,13 @@ async fn run_async(platform: PlatformContext) {
                             Err(err) => eprintln!("[-] FSL timeout sweep failed: {err}"),
                         }
                     }
+                    // A later event in the same batch may have retired an earlier ACK.
+                    newly_active.retain(|candidate| {
+                        session.onu(candidate.onu_id).is_some_and(|current| {
+                            current.state == FslOnuState::Active
+                                && current.serial_number == candidate.serial_number
+                        })
+                    });
                     Ok((deactivated, newly_active))
                 });
 

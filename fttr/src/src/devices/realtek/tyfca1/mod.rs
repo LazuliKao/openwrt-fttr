@@ -190,7 +190,7 @@ pub(super) fn configure(
         println!("REALTEK_TYFCA1_UNI_PORT_READY id={id} port={uni_port_num} endpoint={endpoint:04x} bp={bp_inst:04x}");
     }
 
-    lease.disarm();
+    lease.disarm()?;
     println!("REALTEK_TYFCA1_PROVISION_OK id={id} port={port:04x} business=1300 management=60");
     Ok(())
 }

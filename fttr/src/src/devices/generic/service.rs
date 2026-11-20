@@ -274,7 +274,7 @@ fn configure_with_options(
         "GENERIC_BRIDGE_SERVICE_READBACK_OK gem={port:04x} endpoints={:?}; data evidence still required",
         inventory.endpoints
     );
-    lease.disarm();
+    lease.disarm()?;
     println!("GENERIC_LEASE_PERSISTED id={id}");
     Ok(())
 }

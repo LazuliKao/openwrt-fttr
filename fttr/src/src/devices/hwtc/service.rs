@@ -60,7 +60,7 @@ pub(super) fn configure_profile(
     verify(&mut session, 256, 0, 0x8000, b"HWTC")?;
     println!("HWTC_SERVICE_READBACK_OK gem={port:04x}; data evidence still required");
     crate::controller::management::bootstrap(&mut session, id, 0x601);
-    lease.disarm();
+    lease.disarm()?;
     println!("HWTC_LEASE_PERSISTED id={id}");
     Ok(())
 }

@@ -16,6 +16,7 @@ use std::{
 /// Enough room for 1500B payload + 4B inner 802.1Q tag + 4B outer 802.1ad VPORT tag.
 pub const NNI_MTU: u16 = 1508;
 const DEFAULT_BRIDGE: &str = "br-lan";
+const PORT_ALIAS: &str = "fttrd:fiberhome-vport";
 
 pub fn gem_to_vid(gem_id: u16, offset: u16) -> io::Result<u16> {
     let vid = gem_id.checked_sub(offset).ok_or_else(|| {
@@ -74,6 +75,47 @@ fn run_ip_link(args: &[&str]) -> io::Result<()> {
     }
 }
 
+fn matching_vlan_details(details: &str, vlan: &str, nni: &str, vid: u16) -> bool {
+    let tokens: Vec<_> = details.split_whitespace().collect();
+    let has_protocol = tokens.windows(2).any(|w| w == ["protocol", "802.1ad"]);
+    let has_vid = tokens
+        .windows(2)
+        .any(|w| w[0] == "id" && w[1].parse::<u16>() == Ok(vid));
+    let parent = vlan
+        .lines()
+        .any(|line| line.trim() == format!("Device: {nni}"));
+    has_protocol && has_vid && parent
+}
+
+fn verify_existing_port(iface: &str, nni: &str, vid: u16) -> io::Result<()> {
+    let output = Command::new("ip")
+        .args(["-d", "link", "show", "dev", iface])
+        .output()?;
+    let vlan = fs::read_to_string(format!("/proc/net/vlan/{iface}"))?;
+    let alias = fs::read_to_string(format!("/sys/class/net/{iface}/ifalias"))?;
+    if alias.trim() == PORT_ALIAS
+        && output.status.success()
+        && matching_vlan_details(&String::from_utf8_lossy(&output.stdout), &vlan, nni, vid)
+    {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("{iface} conflicts with expected {nni} 802.1ad VLAN {vid}"),
+        ))
+    }
+}
+
+fn attach_bridge(iface: &str, bridge: &str) -> io::Result<()> {
+    if !Path::new(&format!("/sys/class/net/{bridge}/bridge")).is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("bridge {bridge} is unavailable"),
+        ));
+    }
+    run_ip_link(&["set", iface, "master", bridge])
+}
+
 pub fn prepare_nni_and_ports(nni: &str, gem_offset: u16, stopping: &AtomicBool) -> io::Result<()> {
     let mtu = NNI_MTU.to_string();
     run_ip_link(&["set", nni, "mtu", &mtu, "up"])?;
@@ -95,7 +137,6 @@ pub fn prepare_nni_and_ports(nni: &str, gem_offset: u16, stopping: &AtomicBool) 
     }
 
     let bridge = configured_bridge();
-    let bridge_exists = Path::new(&format!("/sys/class/net/{bridge}")).exists();
     for entry in RESOURCES.allocations {
         let Some(iface) = entry.interface else {
             continue;
@@ -103,17 +144,16 @@ pub fn prepare_nni_and_ports(nni: &str, gem_offset: u16, stopping: &AtomicBool) 
         let vid = gem_to_vid(entry.gem_id, gem_offset)?;
         let vid_str = vid.to_string();
         if Path::new(&format!("/sys/class/net/{iface}")).exists() {
-            let _ = run_ip_link(&["set", iface, "down"]);
-            let _ = run_ip_link(&["del", iface]);
+            verify_existing_port(iface, nni, vid)?;
+        } else {
+            run_ip_link(&[
+                "add", "link", nni, "name", iface, "type", "vlan", "protocol", "802.1ad", "id",
+                &vid_str,
+            ])?;
+            run_ip_link(&["set", iface, "alias", PORT_ALIAS])?;
         }
-        run_ip_link(&[
-            "add", "link", nni, "name", iface, "type", "vlan", "protocol", "802.1ad", "id",
-            &vid_str,
-        ])?;
         run_ip_link(&["set", iface, "mtu", "1500", "down"])?;
-        if bridge_exists {
-            let _ = run_ip_link(&["set", iface, "master", &bridge]);
-        }
+        attach_bridge(iface, &bridge)?;
     }
     Ok(())
 }
@@ -131,11 +171,18 @@ pub fn set_port_up(onu_id: u8, up: bool) -> io::Result<()> {
             format!("VPORT interface {iface} does not exist"),
         ));
     }
+    let entry = RESOURCES.onu(onu_id)?;
+    verify_existing_port(
+        iface,
+        "fttr0",
+        gem_to_vid(
+            entry.gem_id,
+            super::initialization::defaults::DEFAULT_NNI_GEMPORT_OFFSET,
+        )?,
+    )?;
     if up {
         let bridge = configured_bridge();
-        if Path::new(&format!("/sys/class/net/{bridge}")).exists() {
-            let _ = run_ip_link(&["set", iface, "master", &bridge]);
-        }
+        attach_bridge(iface, &bridge)?;
         run_ip_link(&["set", iface, "up"])
     } else {
         run_ip_link(&["set", iface, "down"])
@@ -143,10 +190,8 @@ pub fn set_port_up(onu_id: u8, up: bool) -> io::Result<()> {
 }
 
 pub fn bring_all_ports_down() {
-    for &iface in RESOURCES.downstream_interfaces {
-        if Path::new(&format!("/sys/class/net/{iface}")).exists() {
-            let _ = run_ip_link(&["set", iface, "down"]);
-        }
+    for entry in RESOURCES.allocations {
+        let _ = set_port_up(entry.onu_id, false);
     }
 }
 
@@ -172,5 +217,29 @@ mod tests {
         assert!(!valid_interface_name("../br-lan"));
         assert!(!valid_interface_name("br lan"));
         assert!(!valid_interface_name("0123456789abcdef"));
+    }
+
+    #[test]
+    fn existing_port_requires_matching_parent_protocol_and_vid() {
+        let details = "vlan protocol 802.1ad id 2 <REORDER_HDR>";
+        assert!(matching_vlan_details(
+            details,
+            "Device: fttr0\n",
+            "fttr0",
+            2
+        ));
+        assert!(!matching_vlan_details(
+            details,
+            "Device: eth0\n",
+            "fttr0",
+            2
+        ));
+        assert!(!matching_vlan_details(
+            "vlan protocol 802.1Q id 2",
+            "Device: fttr0",
+            "fttr0",
+            2
+        ));
+        assert!(!matching_vlan_details(details, "Device: fttr0", "fttr0", 3));
     }
 }

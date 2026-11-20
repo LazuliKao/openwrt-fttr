@@ -19,7 +19,7 @@ pub struct PlatformContext {
 pub trait ManagementLease {
     fn set_business_grant_floor(&mut self, bytes: u16) -> io::Result<()>;
     fn set_management_grant_floor(&mut self, bytes: u16) -> io::Result<()>;
-    fn disarm(&mut self);
+    fn disarm(&mut self) -> io::Result<()>;
 }
 
 /// Opaque reversible platform state. Dropping it restores the previous mapping.

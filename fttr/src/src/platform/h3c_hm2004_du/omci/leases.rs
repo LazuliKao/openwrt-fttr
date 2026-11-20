@@ -219,8 +219,9 @@ impl crate::platform::context::ManagementLease for StockOmccLease {
     fn set_management_grant_floor(&mut self, bytes: u16) -> io::Result<()> {
         StockOmccLease::set_management_grant_floor(self, bytes)
     }
-    fn disarm(&mut self) {
-        StockOmccLease::disarm(self)
+    fn disarm(&mut self) -> io::Result<()> {
+        StockOmccLease::disarm(self);
+        Ok(())
     }
 }
 #[cfg(test)]

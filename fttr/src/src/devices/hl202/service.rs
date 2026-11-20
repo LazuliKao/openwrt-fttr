@@ -331,7 +331,7 @@ pub fn configure(
             println!("OMCC_HEARTBEAT_OK channel={channel:04x}; data plane still requires packet evidence");
         }
     }
-    lease.disarm();
+    lease.disarm()?;
     println!("HL202_LEASE_PERSISTED id={id}");
     Ok(())
 }

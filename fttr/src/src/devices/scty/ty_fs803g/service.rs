@@ -263,7 +263,7 @@ pub fn configure(
     );
 
     // Keep Alloc-ID and FPGA channel permanently armed for business
-    lease.disarm();
+    lease.disarm()?;
     println!("SCTY_TY_FS803G_LEASE_PERSISTED id={id} port={port:04x}");
     Ok(())
 }

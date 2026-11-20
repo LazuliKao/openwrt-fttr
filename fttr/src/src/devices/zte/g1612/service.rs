@@ -165,7 +165,7 @@ pub fn configure(
 
     verify(&mut session, 256, 0, 0x8000, &vendor_bytes)?;
     println!("ZTE_G1612_BRIDGE_SERVICE_READBACK_OK gem={port:04x} veip={G1612_VEIP_ENDPOINT:04x}");
-    lease.disarm();
+    lease.disarm()?;
     println!("ZTE_G1612_LEASE_PERSISTED id={id}");
     Ok(())
 }

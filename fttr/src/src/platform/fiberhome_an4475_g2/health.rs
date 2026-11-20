@@ -75,6 +75,9 @@ pub(super) fn watch(
             return Err(io::Error::other("OMCI management configuration changed"));
         }
         if let Ok(request) = requests.try_recv() {
+            // The synchronous diagnostic may exceed the evidence deadline.
+            // Keep the port closed until a subsequent liveness GET succeeds.
+            drop(port_lease.take());
             match request {
                 inventory::WorkerRequest::Fec(request) => {
                     let result = fec::run(platform, &request, Some(cancellation.clone()));
@@ -143,11 +146,9 @@ pub(super) fn watch(
         }
         if port_lease.is_some() && next_telemetry.is_some_and(|deadline| Instant::now() >= deadline)
         {
-            let responsive = collector.refresh();
+            drop(port_lease.take());
+            collector.refresh();
             let completed = Instant::now();
-            if responsive {
-                last_response = completed;
-            }
             next_get = completed;
             next_telemetry = Some(completed + Duration::from_secs(60));
         }

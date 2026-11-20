@@ -133,8 +133,9 @@ impl ManagementLease for Lease {
             .push(format!("management:{bytes}"));
         Ok(())
     }
-    fn disarm(&mut self) {
+    fn disarm(&mut self) -> io::Result<()> {
         self.committed = true;
+        Ok(())
     }
 }
 impl Drop for Lease {
@@ -276,7 +277,7 @@ fn non_h3c_backend_drives_transport_resources_leases_and_runtime_without_enum_di
     drop(channel);
     drop(lease);
     let mut committed = platform.management_lease(72).unwrap();
-    committed.disarm();
+    committed.disarm().unwrap();
     drop(committed);
     crate::platform::runtime::run_selected(platform).unwrap();
     platform.backend().health_diagnostic(platform).unwrap();

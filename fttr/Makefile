@@ -18,7 +18,7 @@ define Package/openwrt-fttr
   CATEGORY:=Network
   SUBMENU:=PON
   TITLE:=OpenWrt FTTR controller and device management tools
-  DEPENDS:=$(RUST_ARCH_DEPENDS) +FTTR_PLATFORM_H3C_HM2004_DU:kmod-h3c-fmcs +FTTR_PLATFORM_FIBERHOME_AN4475_G2:kmod-fiberhome-fsl +FTTR_NPU&&FTTR_PLATFORM_H3C_HM2004_DU:airoha-en7581-npu-firmware +uci +ubus +firewall4 +dnsmasq
+  DEPENDS:=$(RUST_ARCH_DEPENDS) +FTTR_PLATFORM_H3C_HM2004_DU:kmod-h3c-fmcs +FTTR_PLATFORM_FIBERHOME_AN4475_G2:kmod-fiberhome-fsl +FTTR_PLATFORM_FIBERHOME_AN4475_G2:kmod-8021q +FTTR_PLATFORM_FIBERHOME_AN4475_G2:ip-full +FTTR_NPU&&FTTR_PLATFORM_H3C_HM2004_DU:airoha-en7581-npu-firmware +uci +ubus +firewall4 +dnsmasq
 endef
 
 define Package/openwrt-fttr/description
