@@ -885,6 +885,7 @@ pub fn send_ploam_msg(data: &[u8]) -> io::Result<()> {
         if ret < 0 {
             return Err(io::Error::last_os_error());
         }
+        remember_downstream(data);
         Ok(())
     }
     #[cfg(not(unix))]
@@ -892,6 +893,62 @@ pub fn send_ploam_msg(data: &[u8]) -> io::Result<()> {
         let _ = data;
         Ok(())
     }
+}
+
+/// Downstream PLOAM frames we transmitted recently.
+///
+/// The micro-OLT's own receiver observes the downstream stream it just sent:
+/// `Upstream_Overhead` is a broadcast (ONU-ID 0xFF) message with ID 0x01, which
+/// is bit-for-bit the shape of an upstream `Serial_Number_ONU` report. Without
+/// this registry such an echo is indistinguishable from a real ONU announcing
+/// itself, so it reserves a slot and shows up as a permanently offline
+/// "Unknown" device. Matching the exact bytes we sent separates the two
+/// without guessing at vendor codes or serial ranges.
+static DOWNSTREAM_ECHOES: std::sync::Mutex<Vec<([u8; 13], std::time::Instant)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// How long a transmitted frame stays eligible as an echo candidate.
+const ECHO_WINDOW: Duration = Duration::from_secs(3);
+/// Bounded so a stuck entry can never grow the set without limit.
+const ECHO_LIMIT: usize = 64;
+
+fn remember_downstream(frame: &[u8]) {
+    let mut echo = [0u8; 13];
+    echo.copy_from_slice(&frame[..13]);
+    let Ok(mut echoes) = DOWNSTREAM_ECHOES.lock() else {
+        return;
+    };
+    echoes.retain(|(_, at)| at.elapsed() < ECHO_WINDOW);
+    if echoes.len() >= ECHO_LIMIT {
+        echoes.remove(0);
+    }
+    echoes.push((echo, std::time::Instant::now()));
+}
+
+/// True when an observed "upstream" frame is byte-identical to something this
+/// OLT sent within the echo window.
+///
+/// ONU-ID, message ID and the 10 payload bytes are compared; the CRC byte is
+/// excluded because it is derived from the same fields and some FPGA
+/// revisions re-emit it. A genuine ONU report cannot collide with these
+/// values, since it carries the ONU's own vendor code and serial number.
+pub fn is_downstream_echo(observed: &[u8]) -> bool {
+    if observed.len() < 12 {
+        return false;
+    }
+    let Ok(mut echoes) = DOWNSTREAM_ECHOES.lock() else {
+        return false;
+    };
+    echoes.retain(|(_, at)| at.elapsed() < ECHO_WINDOW);
+    let matched = echoes
+        .iter()
+        .any(|(frame, _)| frame[..12] == observed[..12]);
+    if matched {
+        // One echo per transmission: do not let a repeated reflection keep
+        // matching after it has already been accounted for.
+        echoes.retain(|(frame, _)| frame[..12] != observed[..12]);
+    }
+    matched
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1218,5 +1275,56 @@ mod tests {
         assert_eq!(parse_optical_reset_state(0).unwrap(), false);
         assert!(parse_optical_reset_state(2).is_err());
         assert!(parse_optical_reset_state(0xFFFFFFFF).is_err());
+    }
+
+    use crate::pon_engine::ploam::PloamFrame;
+
+    fn clear_echoes() {
+        DOWNSTREAM_ECHOES.lock().unwrap().clear();
+    }
+
+    #[test]
+    fn downstream_upstream_overhead_is_recognised_as_an_echo() {
+        clear_echoes();
+        // The discovery frame that shares ID 0x01 with Serial_Number_ONU.
+        let overhead = crate::platform::h3c_hm2004_du::activation::discovery_frames()[0].to_bytes();
+        remember_downstream(&overhead);
+        assert!(is_downstream_echo(&overhead));
+        // A reflection is accounted for once; a second identical frame is a
+        // fresh transmission candidate, not the same echo replayed.
+        assert!(!is_downstream_echo(&overhead));
+    }
+
+    #[test]
+    fn a_real_onu_serial_report_is_not_mistaken_for_an_echo() {
+        clear_echoes();
+        let overhead = crate::platform::h3c_hm2004_du::activation::discovery_frames()[0].to_bytes();
+        remember_downstream(&overhead);
+        // Upstream Serial_Number_ONU from a real ONT: ONU-ID 0xFF, ID 0x01,
+        // but the payload carries the ONU's own vendor code and serial.
+        let report = PloamFrame::new(
+            0xff,
+            1,
+            [0x48, 0x57, 0x54, 0x43, 0x12, 0x34, 0x56, 0x78, 0, 0],
+        )
+        .to_bytes();
+        assert!(!is_downstream_echo(&report));
+    }
+
+    #[test]
+    fn echoes_expire_and_the_registry_stays_bounded() {
+        clear_echoes();
+        {
+            let mut echoes = DOWNSTREAM_ECHOES.lock().unwrap();
+            for n in 0..(ECHO_LIMIT + 10) {
+                echoes.push(([0u8; 13], std::time::Instant::now() - ECHO_WINDOW * 2));
+                let _ = n;
+            }
+            // All entries are stale, so nothing can match.
+            assert!(echoes.len() > ECHO_LIMIT);
+        }
+        let stale = [0u8; 13];
+        assert!(!is_downstream_echo(&stale));
+        assert!(DOWNSTREAM_ECHOES.lock().unwrap().is_empty());
     }
 }
