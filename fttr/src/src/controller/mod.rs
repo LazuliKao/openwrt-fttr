@@ -18,3 +18,4 @@ pub mod profile;
 pub(crate) mod service;
 pub(crate) mod telemetry;
 pub(crate) mod topology;
+pub(crate) mod ubus_mib;

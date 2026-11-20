@@ -117,3 +117,29 @@ fn poll_and_clear_pending_respects_masks_and_stock_order() {
     );
     assert!(bus.0.borrow().steps.is_empty());
 }
+
+#[test]
+fn alarm_bitmap_reads_four_words_and_checks_onu_index() {
+    let expected: [u32; 4] = [1 << 3, 1 << 0, 0, 1 << 31];
+    let rx: Vec<u8> = expected.iter().flat_map(|w| w.to_be_bytes()).collect();
+    let step = crate::platform::fiberhome_an4475_g2::test_support::message(
+        [
+            ((GPON_LOSI_ALM >> 8) as u8) << 3 | 2,
+            GPON_LOSI_ALM as u8,
+            3 << 4,
+            0,
+            0,
+        ],
+        &[0],
+        rx,
+    );
+    let (mut fsl, bus) = mock_fsl(vec![step]);
+    let words = read_alarm_bitmap(&mut fsl, GPON_LOSI_ALM).expect("read_alarm_bitmap");
+    assert!(alarm_bitmap_contains(&words, 3));
+    assert!(!alarm_bitmap_contains(&words, 2));
+    assert!(alarm_bitmap_contains(&words, 32));
+    assert!(alarm_bitmap_contains(&words, 127));
+    assert!(!alarm_bitmap_contains(&words, 128));
+    assert!(read_alarm_bitmap(&mut fsl, GPON_INT).is_err());
+    assert!(bus.0.borrow().steps.is_empty());
+}

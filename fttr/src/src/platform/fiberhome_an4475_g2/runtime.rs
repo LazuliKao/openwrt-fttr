@@ -1,7 +1,8 @@
 //! AN4475-G2 FSL hardware owner, runtime scheduler, and OMCI/PLOAM bridge.
 use super::{
     activation::{
-        assign_alloc_id_ploam, configure_gem_port, PLOAM_MSG_ACK, PLOAM_MSG_BER_INTERVAL,
+        assign_alloc_id_ploam, configure_gem_port, set_gem_wmci_aes, PLOAM_MSG_ACK,
+        PLOAM_MSG_ASSIGN_ALLOC_ID, PLOAM_MSG_BER_INTERVAL,
     },
     diagnostics::FslDiagnostics,
     gdba::{alloc_to_tcont, GdbaAllocConfig},
@@ -47,6 +48,23 @@ const BOSA_CAL_SOURCE: &str = "/dev/ubi0_3";
 const BOSA_CAL_OFFSET: u64 = 0x1a_5000;
 const NNI_INTERFACE: &str = "fttr0";
 const SERIAL_NUMBER_ONU_MSG_ID: u8 = 1;
+const PLOAM_MSG_DYING_GASP: u8 = 3;
+
+fn deactivate_session_onu(session: &mut FslOltSession<Device>, id: u8) -> io::Result<bool> {
+    if session.onu(id).is_none() {
+        return Ok(false);
+    }
+    let res = super::RESOURCES.onu(id)?;
+    let max_onus = session.config().init.max_onu_id.min(128) as u8;
+    let extra_tconts = alloc_to_tcont(res.alloc_id, 0, max_onus, 0)
+        .map(|t| vec![t])
+        .unwrap_or_default();
+    session.deactivate_onu(id, &extra_tconts, &[res.gem_id], &mut |delay| {
+        thread::sleep(delay);
+        Ok(())
+    })?;
+    Ok(true)
+}
 
 /// Bounded owner-only readback, including the counter banks read by stock
 /// `fsldrv_gpon_getponstat`. Do not acknowledge status, clear counters, or read
@@ -136,6 +154,7 @@ impl OmciTransport for FslOmciTransport {
 pub(crate) struct FslManagementLease {
     onu_id: u8,
     disarmed: bool,
+    business_modified: bool,
 }
 
 impl FslManagementLease {
@@ -149,51 +168,54 @@ impl FslManagementLease {
         Ok(Self {
             onu_id,
             disarmed: false,
+            business_modified: false,
         })
     }
 }
 
+fn configure_business_datapath(onu_id: u8, floor_bytes: Option<u16>) -> io::Result<()> {
+    let res = super::RESOURCES.onu(onu_id)?;
+    with_session(|session| {
+        let onu = session
+            .onu(onu_id)
+            .copied()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "ONU not active in FSL"))?;
+        configure_gem_port(session.fsl_mut(), onu.onu_index, 0, res.gem_id, true)?;
+        let max_onus = session.config().init.max_onu_id.min(128) as u8;
+        let tcont = alloc_to_tcont(res.alloc_id, 0, max_onus, 0)?;
+        let alloc = GdbaAllocConfig::business_data(
+            tcont,
+            onu.onu_index,
+            session.dba_granularity_8x(),
+            onu.rate == OnuUpstreamRate::Rate2p5G,
+            floor_bytes.map(u32::from),
+        )?;
+        session.configure_tcont_alloc(&alloc)?;
+        let frame = assign_alloc_id_ploam(onu_id, res.alloc_id, true, 0)?;
+        for _ in 0..session.config().ploam_repeat {
+            session.send_ploam(&frame, &mut |delay| {
+                thread::sleep(delay);
+                Ok(())
+            })?;
+        }
+        println!(
+            "[+] FSL business datapath enabled for ONU {onu_id}: gem={:#x} alloc={:#x} tcont={tcont} fixed_bw={} max_bw={} alloc_type={}",
+            res.gem_id, res.alloc_id, alloc.fixed_bw, alloc.max_bw, alloc.alloc_type
+        );
+        Ok(())
+    })
+}
+
 impl ManagementLease for FslManagementLease {
     fn set_business_grant_floor(&mut self, bytes: u16) -> io::Result<()> {
-        let onu_id = self.onu_id;
-        let res = super::RESOURCES.onu(onu_id)?;
-        let enable = bytes > 0;
-        with_session(|session| {
-            let onu = session
-                .onu(onu_id)
-                .copied()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "ONU not active in FSL"))?;
-            configure_gem_port(session.fsl_mut(), onu.onu_index, 0, res.gem_id, enable)?;
-            let max_onus = session.config().init.max_onu_id.min(128) as u8;
-            let tcont = alloc_to_tcont(res.alloc_id, 0, max_onus, 0)?;
-            let bw = if enable { u32::from(bytes) } else { 0 };
-            let alloc = GdbaAllocConfig {
-                tcont,
-                onu_index: onu.onu_index,
-                enable,
-                fixed_bw: bw,
-                assured_bw: 0,
-                max_bw: bw,
-                alloc_type: 0,
-                priority: 0,
-                weight: 0x80,
-                ds_period: 7,
-                ds_flag: enable,
-                ds_bw_flag: false,
-                ds_tail_flag: false,
-            };
-            session.configure_tcont_alloc(&alloc)?;
-            if enable {
-                let frame = assign_alloc_id_ploam(onu_id, res.alloc_id, true, 0)?;
-                for _ in 0..session.config().ploam_repeat {
-                    session.send_ploam(&frame, &mut |delay| {
-                        thread::sleep(delay);
-                        Ok(())
-                    })?;
-                }
-            }
-            Ok(())
-        })
+        // Mark before touching hardware so partial configuration is cleaned up.
+        // A read-only management lease must not revoke persistent business.
+        self.business_modified = true;
+        if bytes == 0 {
+            revoke_business(self.onu_id)
+        } else {
+            configure_business_datapath(self.onu_id, Some(bytes))
+        }
     }
 
     fn set_management_grant_floor(&mut self, _bytes: u16) -> io::Result<()> {
@@ -201,13 +223,23 @@ impl ManagementLease for FslManagementLease {
     }
 
     fn disarm(&mut self) {
+        if !self.business_modified {
+            if let Err(err) = configure_business_datapath(self.onu_id, None) {
+                eprintln!(
+                    "[-] FSL business datapath activation failed for ONU {}: {err}",
+                    self.onu_id
+                );
+            } else {
+                self.business_modified = true;
+            }
+        }
         self.disarmed = true;
     }
 }
 
 impl Drop for FslManagementLease {
     fn drop(&mut self) {
-        if !self.disarmed {
+        if self.business_modified && !self.disarmed {
             let _ = revoke_business(self.onu_id);
         }
     }
@@ -300,21 +332,12 @@ impl OpticalBackend for RuntimeOptics<'_> {
             if let Ok(mut engine) = self.engine.lock() {
                 engine.mark_offline(id);
             }
-            let _ = with_session(|session| {
-                if session.onu(id).is_some() {
-                    let res = super::RESOURCES.onu(id)?;
-                    let max_onus = session.config().init.max_onu_id.min(128) as u8;
-                    let extra_tconts = alloc_to_tcont(res.alloc_id, 0, max_onus, 0)
-                        .map(|t| vec![t])
-                        .unwrap_or_default();
-                    session.deactivate_onu(id, &extra_tconts, &[res.gem_id], &mut |delay| {
-                        thread::sleep(delay);
-                        Ok(())
-                    })?;
-                }
-                Ok(())
-            });
+            let _ = with_session(|session| deactivate_session_onu(session, id).map(|_| ()));
+            if let Ok(mut queues) = runtime_state().omci_rx.lock() {
+                queues.remove(&id);
+            }
         }
+        super::vport::bring_all_ports_down();
         Ok(())
     }
 
@@ -335,35 +358,14 @@ impl OpticalBackend for RuntimeOptics<'_> {
     }
 }
 
-fn ensure_nni_up(stopping: &AtomicBool) -> io::Result<()> {
-    let status = std::process::Command::new("ip")
-        .args(["link", "set", NNI_INTERFACE, "up"])
-        .status()?;
-    if !status.success() {
-        return Err(io::Error::other(format!(
-            "failed to bring {NNI_INTERFACE} up: {status}"
-        )));
-    }
-    let carrier_path = format!("/sys/class/net/{NNI_INTERFACE}/carrier");
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline && !stopping.load(Ordering::Acquire) {
-        if let Ok(val) = fs::read_to_string(&carrier_path) {
-            if val.trim() == "1" {
-                return Ok(());
-            }
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-    Err(io::Error::new(
-        io::ErrorKind::TimedOut,
-        format!("{NNI_INTERFACE} carrier did not come up within 5s"),
-    ))
-}
-
 fn initialize_hardware(stopping: &AtomicBool) -> io::Result<OpticalState> {
-    ensure_nni_up(stopping)?;
+    let config = OltSessionConfig {
+        nni_eth_tpid: super::initialization::defaults::IEEE_8021AD_TPID,
+        ..OltSessionConfig::default()
+    };
+    super::vport::prepare_nni_and_ports(NNI_INTERFACE, config.nni_gem_port_offset, stopping)?;
     let dev = Device::open(Path::new(FSL_DEVICE_PATH))?;
-    let mut session = FslOltSession::new(dev, OltSessionConfig::default());
+    let mut session = FslOltSession::new(dev, config);
     session.initialize(&mut |delay| {
         if stopping.load(Ordering::Acquire) {
             return Err(io::Error::new(io::ErrorKind::Interrupted, "stopping"));
@@ -371,6 +373,13 @@ fn initialize_hardware(stopping: &AtomicBool) -> io::Result<OpticalState> {
         thread::sleep(delay);
         Ok(())
     })?;
+    // Stock `apply_gemport_defaults` pre-maps GEM 256..271 to ONU 0 and enables
+    // WMCI on GEM 270. Clear our managed business GEM slots so each ONU's GEM
+    // is bound strictly to its own `onu_index` only after provisioning succeeds.
+    for entry in super::RESOURCES.allocations {
+        configure_gem_port(session.fsl_mut(), 0, 0, entry.gem_id, false)?;
+        set_gem_wmci_aes(session.fsl_mut(), entry.gem_id, false, false)?;
+    }
     FslDiagnostics.calibrate_bosa(Path::new(BOSA_CAL_SOURCE), BOSA_CAL_OFFSET)?;
     let desired = crate::optical::load_enabled().unwrap_or(false);
     session.fsl_mut().set_tx_enabled(desired)?;
@@ -386,50 +395,320 @@ fn initialize_hardware(stopping: &AtomicBool) -> io::Result<OpticalState> {
     })
 }
 
-fn format_serial(sn: &[u8; 8]) -> String {
-    let vendor = String::from_utf8_lossy(&sn[..4]);
-    format!(
-        "{vendor}{:02X}{:02X}{:02X}{:02X}",
-        sn[4], sn[5], sn[6], sn[7]
-    )
-}
-
 pub(crate) fn status_snapshot(
     optics: &OpticalClient,
     pon_engine: &Mutex<PonEngine>,
-    provisioning: Option<fttr_api::SyncStatusReply>,
-) -> fttr_api::StatusReply {
+    devices: &Mutex<Vec<SubDevice>>,
+    services: &service::States,
+    provisioning: fttr_api::SyncStatusReply,
+) -> Result<fttr_api::StatusReply, i32> {
     let ready = optics.hardware_ready.load(Ordering::Acquire);
     let tx_enabled = with_session(|session| session.fsl_mut().is_tx_enabled()).ok();
-    let _ = pon_engine;
-    fttr_api::StatusReply {
-        ubus: None,
-        jobs: None,
-        onu_pinning: None,
-        fpga_status: if ready { "ready" } else { "initializing" }.into(),
-        pon_mac: None,
-        provisioning,
-        optical_transceiver: fttr_api::OpticalTransceiverStatus {
-            calibration_sha256: None,
-            calibration_applied: ready,
-            model: "UX3326S1".into(),
-            wavelength_tx_nm: 1490,
-            wavelength_rx_nm: 1310,
-            phy_rate_downlink_gbps: 2.5,
-            phy_rate_uplink_gbps: 1.25,
-            tx_power_dbm: None,
-            laser_bias_current_ma: None,
-            temperature_celsius: None,
-            vcc_voltage: None,
-            cdr_locked: None,
-            tx_enabled,
-            measurements: Default::default(),
+    let devices = devices.lock().map_err(|_| 9)?;
+    let engine = pon_engine.lock().map_err(|_| 9)?;
+    Ok(crate::platform::status::snapshot(
+        &engine,
+        services,
+        (&devices, provisioning),
+        crate::platform::status::Hardware {
+            switch_port_count: super::ONU_COUNT as u8,
+            supports_pinning: false,
+            ranging_source: |_| "FSL upstream ranging time / calculated EqD".into(),
+            has_pon_mac_fec: false,
+            data_path,
+            fpga_status: if ready { "ready" } else { "not_ready" }.into(),
+            pon_mac: None,
+            optical_transceiver: fttr_api::OpticalTransceiverStatus {
+                calibration_sha256: None,
+                calibration_applied: ready,
+                model: "UX3326S1".into(),
+                wavelength_tx_nm: 1490,
+                wavelength_rx_nm: 1310,
+                phy_rate_downlink_gbps: 2.5,
+                phy_rate_uplink_gbps: 1.25,
+                tx_power_dbm: None,
+                laser_bias_current_ma: None,
+                temperature_celsius: None,
+                vcc_voltage: None,
+                cdr_locked: None,
+                tx_enabled,
+                measurements: Default::default(),
+            },
+            npu: None,
         },
-        switch_ports: Vec::new(),
-        sub_gateways: Vec::new(),
-        telemetry_gateways: Vec::new(),
-        npu: None,
-        ipc: None,
+    ))
+}
+
+struct PortCounters {
+    at: Instant,
+    tx: Option<u64>,
+    rx: Option<u64>,
+}
+
+fn read_sysfs_counter(path: &Path) -> (Option<u64>, fttr_api::MeasurementEvidence) {
+    let source = path.display().to_string();
+    let unit = if path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.ends_with("packets"))
+    {
+        "packets"
+    } else {
+        "bytes"
+    };
+    match fs::read_to_string(path) {
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(value) => (
+                Some(value),
+                fttr_api::MeasurementEvidence::observed(source, unit, raw.trim()),
+            ),
+            Err(error) => (
+                None,
+                fttr_api::MeasurementEvidence::unavailable(
+                    source,
+                    unit,
+                    format!("invalid_counter: {error}"),
+                ),
+            ),
+        },
+        Err(error) => (
+            None,
+            fttr_api::MeasurementEvidence::unavailable(
+                source,
+                unit,
+                format!("read_failed: {error}"),
+            ),
+        ),
+    }
+}
+
+fn counter_rate_kbps(
+    current: Option<u64>,
+    previous: Option<u64>,
+    elapsed: Duration,
+) -> Option<f64> {
+    if elapsed < Duration::from_secs(1) {
+        return None;
+    }
+    let delta = current?.checked_sub(previous?)?;
+    Some((delta as f64) * 8.0 / elapsed.as_secs_f64() / 1000.0)
+}
+
+fn data_path(
+    id: u8,
+    registration: &str,
+    inventory: Option<fttr_api::OnuOmciInventory>,
+) -> fttr_api::DataPathStatus {
+    static SAMPLES: OnceLock<Mutex<BTreeMap<String, PortCounters>>> = OnceLock::new();
+    let interface = super::RESOURCES
+        .interface(id)
+        .unwrap_or("unmapped")
+        .to_owned();
+    let base = Path::new("/sys/class/net")
+        .join(&interface)
+        .join("statistics");
+    let mut measurements = fttr_api::Measurements::new();
+    measurements.insert(
+        "interface_scope".into(),
+        fttr_api::MeasurementEvidence::observed("FSL 802.1ad VPORT", "scope", "per_onu_vport"),
+    );
+    let (tx_bytes, tx_ev) = read_sysfs_counter(&base.join("tx_bytes"));
+    let (rx_bytes, rx_ev) = read_sysfs_counter(&base.join("rx_bytes"));
+    let (_tx_packets, tx_pkts_ev) = read_sysfs_counter(&base.join("tx_packets"));
+    let (_rx_packets, rx_pkts_ev) = read_sysfs_counter(&base.join("rx_packets"));
+    measurements.insert("tx_bytes".into(), tx_ev);
+    measurements.insert("rx_bytes".into(), rx_ev);
+    measurements.insert("tx_packets".into(), tx_pkts_ev);
+    measurements.insert("rx_packets".into(), rx_pkts_ev);
+
+    let mut current_tx_kbps = None;
+    let mut current_rx_kbps = None;
+    if let Ok(mut samples) = SAMPLES.get_or_init(|| Mutex::new(BTreeMap::new())).lock() {
+        let key = format!("{interface}:{registration}");
+        let previous = samples.get(&key);
+        if let Some(previous) = previous {
+            current_tx_kbps = counter_rate_kbps(tx_bytes, previous.tx, previous.at.elapsed());
+            current_rx_kbps = counter_rate_kbps(rx_bytes, previous.rx, previous.at.elapsed());
+        }
+        if previous.is_none_or(|sample| sample.at.elapsed() >= Duration::from_secs(1)) {
+            samples.insert(
+                key,
+                PortCounters {
+                    at: Instant::now(),
+                    tx: tx_bytes,
+                    rx: rx_bytes,
+                },
+            );
+        }
+    }
+    for (name, value) in [
+        ("current_tx_kbps", current_tx_kbps),
+        ("current_rx_kbps", current_rx_kbps),
+    ] {
+        let evidence = match value {
+            Some(value) => fttr_api::MeasurementEvidence::observed(
+                format!("{}/counter_delta", base.display()),
+                "kbit/s",
+                value.to_string(),
+            ),
+            None => fttr_api::MeasurementEvidence::unavailable(
+                format!("{}/counter_delta", base.display()),
+                "kbit/s",
+                "requires_two_valid_monotonic_samples_at_least_one_second_apart",
+            ),
+        };
+        measurements.insert(name.into(), evidence);
+    }
+
+    measurements.insert(
+        "nni_expected_tpid".into(),
+        fttr_api::MeasurementEvidence::observed(
+            "FSL runtime 802.1ad VPORT constant; not readback",
+            "hex",
+            format!(
+                "0x{:04x}",
+                super::initialization::defaults::IEEE_8021AD_TPID
+            ),
+        ),
+    );
+    measurements.insert(
+        "nni_expected_gem_offset".into(),
+        fttr_api::MeasurementEvidence::observed(
+            "FSL initialization constant; not readback",
+            "gem_port_id",
+            super::initialization::defaults::DEFAULT_NNI_GEMPORT_OFFSET.to_string(),
+        ),
+    );
+    // The session is also used by OMCI and the activation worker. Never wait
+    // for it while status holds the engine/device locks: an unavailable sample
+    // is preferable to blocking or inverting the hardware lock order.
+    use super::initialization::defaults::{
+        NNI_ETH_TPID_CFG, NNI_GEMPORT_OFFSET_CFG, VLAN_TYPE_CFG,
+    };
+    let register_values = runtime_state()
+        .session
+        .try_lock()
+        .ok()
+        .and_then(|mut guard| {
+            guard.as_mut().map(|session| {
+                [NNI_ETH_TPID_CFG, VLAN_TYPE_CFG, NNI_GEMPORT_OFFSET_CFG]
+                    .map(|address| session.fsl_mut().read_register(address).ok())
+            })
+        });
+    for (index, name, address, mask, unit) in [
+        (0, "nni_tpid_readback", NNI_ETH_TPID_CFG, 0xffff, "hex"),
+        (1, "nni_vlan_type_readback", VLAN_TYPE_CFG, 0xffff, "hex"),
+        (
+            2,
+            "nni_gem_offset_readback",
+            NNI_GEMPORT_OFFSET_CFG,
+            0x0fff,
+            "gem_port_id",
+        ),
+    ] {
+        let source = format!("shared FSL register {address:#x}; readback");
+        let evidence = match register_values.and_then(|values| values[index]) {
+            Some(value) if unit == "hex" => fttr_api::MeasurementEvidence::observed(
+                source,
+                unit,
+                format!("0x{:04x}", value & mask),
+            ),
+            Some(value) => {
+                fttr_api::MeasurementEvidence::observed(source, unit, (value & mask).to_string())
+            }
+            None => fttr_api::MeasurementEvidence::unavailable(
+                source,
+                unit,
+                "session_busy_or_register_unavailable",
+            ),
+        };
+        measurements.insert(name.into(), evidence);
+    }
+
+    let olt_channel_gem = super::RESOURCES.onu(id).ok().map(|r| r.gem_id);
+    let gem_ports: Option<Vec<u16>> = inventory
+        .as_ref()
+        .and_then(|v| v.gem_ports.iter().map(|p| p.port_id).collect());
+    let forwarding_verified = if let Some(ref inv) = inventory {
+        let gem_matched = olt_channel_gem.is_some_and(|expected| {
+            gem_ports
+                .as_ref()
+                .is_some_and(|ports| ports.contains(&expected))
+        });
+        let rx_traffic = rx_bytes.unwrap_or(0) > 0;
+        let (verified, fwd_ev) = if !gem_matched {
+            (
+                false,
+                fttr_api::MeasurementEvidence::unavailable(
+                    format!("FSL VPORT {interface}"),
+                    "forwarding_proof",
+                    "gem_port_mismatch_with_olt_vport",
+                ),
+            )
+        } else if rx_traffic {
+            (
+                true,
+                fttr_api::MeasurementEvidence::observed(
+                    format!("{interface}/statistics"),
+                    "forwarding_proof",
+                    format!(
+                        "vport_gem_rx_observed: rx_bytes={}, tx_bytes={}, gem_port=0x{:04x}",
+                        rx_bytes.unwrap_or(0),
+                        tx_bytes.unwrap_or(0),
+                        olt_channel_gem.unwrap_or(0)
+                    ),
+                ),
+            )
+        } else {
+            (
+                false,
+                fttr_api::MeasurementEvidence::unavailable(
+                    format!("{interface}/statistics"),
+                    "forwarding_proof",
+                    "waiting_for_first_rx_frame_from_vport",
+                ),
+            )
+        };
+        for field in ["gem_ports", "onu_inventory"] {
+            let mut ev = fttr_api::MeasurementEvidence::observed(
+                "fresh ONU OMCI MIB upload; not OLT forwarding proof",
+                "ONU configuration",
+                format!(
+                    "{} GEM CTPs; {} VLAN filters; {} VLAN operation tables",
+                    inv.gem_ports.len(),
+                    inv.vlan_filters.len(),
+                    inv.vlan_operations.len()
+                ),
+            );
+            ev.age_seconds = Some(inv.age_seconds);
+            measurements.insert(field.into(), ev);
+        }
+        measurements.insert("forwarding_proof".into(), fwd_ev);
+        Some(verified)
+    } else {
+        measurements.insert(
+            "forwarding_proof".into(),
+            fttr_api::MeasurementEvidence::unavailable(
+                "verified data-path inventory",
+                "forwarding_proof",
+                "verified_inventory_unavailable",
+            ),
+        );
+        Some(false)
+    };
+    fttr_api::DataPathStatus {
+        interface,
+        gem_ports,
+        vlan_id: None,
+        onu_inventory: inventory,
+        tx_bytes,
+        rx_bytes,
+        current_tx_kbps,
+        current_rx_kbps,
+        olt_channel_gem,
+        forwarding_verified,
+        offload: Default::default(),
+        measurements,
     }
 }
 
@@ -448,8 +727,22 @@ fn ipc_handler(
             let _ = serde_json::to_writer(&mut stream, &response);
             let _ = stream.write_all(b"\n");
         } else if line == "STATUS" {
-            let reply = status_snapshot(&optics, &pon_engine, None);
-            let _ = serde_json::to_writer(&mut stream, &reply);
+            let reply = serde_json::from_value(crate::provisioning::snapshot())
+                .map_err(|_| 9)
+                .and_then(|provisioning| {
+                    status_snapshot(&optics, &pon_engine, &devices, &services, provisioning)
+                });
+            match reply {
+                Ok(status) => {
+                    let _ = serde_json::to_writer(&mut stream, &status);
+                }
+                Err(_) => {
+                    let _ = serde_json::to_writer(
+                        &mut stream,
+                        &serde_json::json!({"status":"error","error":"status unavailable"}),
+                    );
+                }
+            }
             let _ = stream.write_all(b"\n");
         } else if line == "DEVICES" {
             let list = devices.lock().map(|d| d.clone()).unwrap_or_default();
@@ -509,7 +802,7 @@ async fn run_async(platform: PlatformContext) {
         eprintln!("[-] Optical ownership failed: {error}");
         std::process::exit(1);
     });
-    let _lifetime = lifetime::Lifetime::start().await.unwrap_or_else(|error| {
+    let lifetime = lifetime::Lifetime::start().await.unwrap_or_else(|error| {
         eprintln!("[-] MQTT startup failed: {error}");
         std::process::exit(1);
     });
@@ -525,6 +818,12 @@ async fn run_async(platform: PlatformContext) {
     let hardware_ready = Arc::new(AtomicBool::new(false));
     let stopping = Arc::new(AtomicBool::new(false));
     let (optical_requests, optical_receiver) = mpsc::sync_channel(2);
+    let shutdown_client = OpticalClient {
+        platform,
+        requests: optical_requests.clone(),
+        hardware_ready: hardware_ready.clone(),
+        stopping: stopping.clone(),
+    };
     let service_states: service::States = Arc::new(Mutex::new(BTreeMap::new()));
 
     if let Ok(listener) = ipc::create_socket_listener() {
@@ -559,7 +858,6 @@ async fn run_async(platform: PlatformContext) {
     );
 
     let pon_engine_loop = pon_engine.clone();
-    let devices_loop = devices.clone();
     let states_loop = service_states.clone();
     let stopping_loop = stopping.clone();
     let ready_loop = hardware_ready.clone();
@@ -643,6 +941,25 @@ async fn run_async(platform: PlatformContext) {
                         }
                     }
 
+                    let mut deactivated = Vec::new();
+                    match session.evaluate_alarm_interrupts(&report.interrupts) {
+                        Ok(offline) => {
+                            for (onu_id, reason) in offline {
+                                eprintln!(
+                                    "[*] FSL offline alarm ({reason}) for ONU {onu_id} -> deactivating"
+                                );
+                                match deactivate_session_onu(session, onu_id) {
+                                    Ok(true) => deactivated.push(onu_id),
+                                    Ok(false) => {}
+                                    Err(err) => eprintln!(
+                                        "[-] FSL deactivate failed for ONU {onu_id} ({reason}): {err}"
+                                    ),
+                                }
+                            }
+                        }
+                        Err(err) => eprintln!("[-] FSL alarm evaluation failed: {err}"),
+                    }
+
                     let mut newly_active = Vec::new();
                     for record in &report.ploams {
                         if record.message_id() == SERIAL_NUMBER_ONU_MSG_ID {
@@ -659,6 +976,23 @@ async fn run_async(platform: PlatformContext) {
                                     if let Some(parsed) = super::olt::parse_upstream_ploam(record) {
                                         let mut sn = [0u8; 8];
                                         sn.copy_from_slice(&parsed.payload[..8]);
+                                        if let Some(existing) = session.find_onu_by_sn(&sn) {
+                                            if existing.state == FslOnuState::Active {
+                                                eprintln!(
+                                                    "[*] O3 SN rediscovery for active ONU {} -> deactivating stale registration",
+                                                    existing.onu_id
+                                                );
+                                                match deactivate_session_onu(session, existing.onu_id)
+                                                {
+                                                    Ok(true) => deactivated.push(existing.onu_id),
+                                                    Ok(false) => {}
+                                                    Err(err) => eprintln!(
+                                                        "[-] Stale ONU {} deactivation failed: {err}",
+                                                        existing.onu_id
+                                                    ),
+                                                }
+                                            }
+                                        }
                                         match session.process_o3_sn_discovery(
                                             sn,
                                             rate,
@@ -704,6 +1038,24 @@ async fn run_async(platform: PlatformContext) {
                                 }
                                 Some(_) => {}
                             }
+                        } else if record.message_id() == PLOAM_MSG_DYING_GASP {
+                            if let Some(onu_id) = record.onu_id() {
+                                if session
+                                    .onu(onu_id)
+                                    .is_some_and(|onu| onu.state == FslOnuState::Active)
+                                {
+                                    eprintln!(
+                                        "[*] ONU {onu_id} sent Dying_Gasp PLOAM -> deactivating"
+                                    );
+                                    match deactivate_session_onu(session, onu_id) {
+                                        Ok(true) => deactivated.push(onu_id),
+                                        Ok(false) => {}
+                                        Err(err) => eprintln!(
+                                            "[-] Dying_Gasp deactivate failed for ONU {onu_id}: {err}"
+                                        ),
+                                    }
+                                }
+                            }
                         } else if record.message_id() == PLOAM_MSG_ACK {
                             match session.process_ploam_ack(record, &mut |delay| {
                                 thread::sleep(delay);
@@ -716,7 +1068,10 @@ async fn run_async(platform: PlatformContext) {
                                     );
                                     newly_active.push(active);
                                 }
-                                Ok(None) if record.frame[2] != PLOAM_MSG_BER_INTERVAL => {
+                                Ok(None)
+                                    if record.frame[2] != PLOAM_MSG_BER_INTERVAL
+                                        && record.frame[2] != PLOAM_MSG_ASSIGN_ALLOC_ID =>
+                                {
                                     eprintln!(
                                         "[*] Ignoring unmatched PLOAM ACK onu_id={:?} acked_msg={:#x} enable={} seq={}",
                                         record.onu_id(),
@@ -761,37 +1116,43 @@ async fn run_async(platform: PlatformContext) {
                             Err(err) => eprintln!("[-] FSL timeout sweep failed: {err}"),
                         }
                     }
-                    Ok(newly_active)
+                    Ok((deactivated, newly_active))
                 });
 
                 match poll_result {
-                    Ok(newly_active) => {
+                    Ok((deactivated, newly_active)) => {
+                        for id in deactivated {
+                            services.stop(id);
+                            if let Ok(mut engine) = pon_engine_loop.lock() {
+                                engine.mark_offline(id);
+                            }
+                            if let Ok(mut queues) = runtime_state().omci_rx.lock() {
+                                queues.remove(&id);
+                            }
+                            let _ = super::vport::set_port_up(id, false);
+                        }
                         for onu in newly_active {
-                            let sn = format_serial(&onu.serial_number);
                             let mut vendor = [0u8; 4];
                             vendor.copy_from_slice(&onu.serial_number[..4]);
                             let mut sn_tail = [0u8; 4];
                             sn_tail.copy_from_slice(&onu.serial_number[4..8]);
-                            if let Ok(mut engine) = pon_engine_loop.lock() {
-                                engine.register_onu(vendor, sn_tail);
-                                let _ = engine.activate_onu(onu.onu_id);
-                                if let Some(entry) = engine
-                                    .active_onus
-                                    .iter_mut()
-                                    .find(|entry| entry.onu_id == onu.onu_id)
-                                {
-                                    entry.eq_delay = Some(onu.eqd);
-                                    entry.state = crate::pon_engine::ploam::OnuState::O5Operation;
+                            let displaced = match pon_engine_loop.lock() {
+                                Ok(mut engine) => match engine.confirm_platform_onu(
+                                    onu.onu_id, vendor, sn_tail, onu.eqd,
+                                ) {
+                                    Ok(displaced) => displaced,
+                                    Err(err) => {
+                                        eprintln!("[-] FSL ONU confirmation failed: {err}");
+                                        continue;
+                                    }
+                                },
+                                Err(_) => {
+                                    eprintln!("[-] PON engine lock poisoned");
+                                    continue;
                                 }
-                            }
-                            if let Ok(mut list) = devices_loop.lock() {
-                                if !list.iter().any(|d| d.id == sn) {
-                                    list.push(SubDevice {
-                                        id: sn.clone(),
-                                        last_seen: 0,
-                                        payload_bytes: 0,
-                                    });
-                                }
+                            };
+                            for id in displaced {
+                                services.stop(id);
                             }
                             let vendor_str = String::from_utf8_lossy(&vendor).into_owned();
                             services.start(onu.onu_id, vendor_str);
@@ -802,6 +1163,7 @@ async fn run_async(platform: PlatformContext) {
                         thread::sleep(Duration::from_millis(50));
                     }
                 }
+                services.refresh_auth();
                 thread::sleep(Duration::from_millis(5));
             }
 
@@ -825,15 +1187,44 @@ async fn run_async(platform: PlatformContext) {
                     }
                 }
             }
+            super::vport::bring_all_ports_down();
             if let Ok(mut guard) = runtime_state().session.lock() {
                 *guard = None;
             }
         })
         .ok();
 
-    let _ = crate::runtime::termination().await;
-    stopping.store(true, Ordering::Release);
-    if let Some(handle) = fsl_thread {
-        let _ = handle.join();
+    tokio::select! {
+        result = lifetime.wait(devices) => {
+            eprintln!("[-] Controller supervision stopped: {result:?}");
+            stopping.store(true, Ordering::Release);
+            if let Some(handle) = fsl_thread {
+                let _ = handle.join();
+            }
+            std::process::exit(1);
+        }
+        result = crate::runtime::termination() => {
+            if let Err(error) = result {
+                eprintln!("[-] Signal handler failed: {error}");
+            }
+            #[cfg(feature = "acs")]
+            crate::acs::shutdown();
+            crate::runtime::request_stop();
+            let optical = crate::runtime::spawn_blocking(move || {
+                shutdown_client.request(OpticalCommand::Shutdown)
+            });
+            let (optical, ()) = tokio::join!(
+                tokio::time::timeout(Duration::from_secs(4), optical),
+                crate::runtime::shutdown(),
+            );
+            match optical {
+                Ok(Ok(Ok(_))) => (),
+                result => eprintln!("[-] Optical shutdown not confirmed: {result:?}"),
+            }
+            stopping.store(true, Ordering::Release);
+            if let Some(handle) = fsl_thread {
+                let _ = handle.join();
+            }
+        }
     }
 }

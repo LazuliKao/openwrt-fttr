@@ -98,6 +98,30 @@ fn omcc_alloc_config_matches_type7_and_non_type7_stock_math() {
 }
 
 #[test]
+fn business_data_alloc_config_scales_best_effort_and_floor_modes() {
+    let be_1g = GdbaAllocConfig::business_data(128, 0, 64, false, None).unwrap();
+    assert_eq!(be_1g.fixed_bw, 0);
+    assert_eq!(be_1g.max_bw, 312_500);
+    assert_eq!(be_1g.alloc_type, 2);
+    assert!(be_1g.ds_flag);
+    assert!(!be_1g.ds_tail_flag);
+
+    let floor_1g = GdbaAllocConfig::business_data(129, 1, 64, false, Some(1300)).unwrap();
+    assert_eq!(floor_1g.fixed_bw, 1300);
+    assert_eq!(floor_1g.max_bw, 312_500);
+    assert_eq!(floor_1g.alloc_type, 0);
+    assert!(floor_1g.ds_flag);
+
+    let be_2p5g = GdbaAllocConfig::business_data(130, 2, 64, true, Some(0)).unwrap();
+    assert_eq!(be_2p5g.fixed_bw, 0);
+    assert_eq!(be_2p5g.max_bw, 312_500);
+    assert_eq!(be_2p5g.alloc_type, 2);
+    assert!(be_2p5g.ds_tail_flag);
+
+    assert!(GdbaAllocConfig::business_data(128, 0, 0, false, None).is_err());
+}
+
+#[test]
 fn configure_alloc_writes_ds_para_h_l_and_request_pulses() {
     let cfg = GdbaAllocConfig {
         tcont: 0x12,

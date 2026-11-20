@@ -27,7 +27,9 @@ use super::{
         InitConfig,
     },
     interrupts::{
-        poll_and_clear_pending, set_all_gpon_int_masks, set_mask, GponInterrupt, SOFT_RDWR_OMCI_STA,
+        alarm_bitmap_contains, poll_and_clear_pending, read_alarm_bitmap, set_all_gpon_int_masks,
+        set_mask, GponInterrupt, GPON_DYING_GASP_ALM, GPON_LOFI_ALM, GPON_LOSI_ALM,
+        SOFT_RDWR_OMCI_STA,
     },
     management::Management,
     polling::PollPolicy,
@@ -194,6 +196,8 @@ pub struct FslOltSession<B: Bus> {
     active_na_tconts: BTreeSet<u8>,
     onus: BTreeMap<u8, ManagedOnu>,
     state_entered_at: BTreeMap<u8, Instant>,
+    losi_counts: BTreeMap<u8, u8>,
+    lofi_counts: BTreeMap<u8, u8>,
     pending_port_id_acks: Vec<PendingPortIdAck>,
     blacklist: BTreeSet<([u8; 8], OnuUpstreamRate)>,
     whitelist: BTreeSet<([u8; 8], OnuUpstreamRate)>,
@@ -215,6 +219,8 @@ impl<B: Bus> FslOltSession<B> {
             active_na_tconts: BTreeSet::new(),
             onus: BTreeMap::new(),
             state_entered_at: BTreeMap::new(),
+            losi_counts: BTreeMap::new(),
+            lofi_counts: BTreeMap::new(),
             pending_port_id_acks: Vec::new(),
             blacklist: BTreeSet::new(),
             whitelist: BTreeSet::new(),
@@ -324,10 +330,78 @@ impl<B: Bus> FslOltSession<B> {
         self.onus.get(&onu_id)
     }
 
+    pub fn find_onu_by_sn(&self, serial_number: &[u8; 8]) -> Option<ManagedOnu> {
+        self.onus
+            .values()
+            .find(|onu| &onu.serial_number == serial_number)
+            .copied()
+    }
+
     pub fn active_onus(&self) -> impl Iterator<Item = &ManagedOnu> {
         self.onus
             .values()
             .filter(|onu| onu.state == OnuState::Active)
+    }
+
+    /// Evaluates stock per-ONU offline alarm interrupts (`DyingGasp`, `Losi`, `Lofi`)
+    /// by reading the corresponding 128-bit alarm bitmap registers
+    /// (`GPON_DYING_GASP_ALM`, `GPON_LOSI_ALM`, `GPON_LOFI_ALM`).
+    ///
+    /// Matches stock thresholds from `fsl_core_fttr_chip.ko`:
+    /// - `Losi`: >5 hits (`fslstack_gpon_losi_direct_handler`)
+    /// - `Lofi`: >2 hits (`fslstack_gpon_lofi_direct_handler`)
+    /// - `DyingGasp`: active ONU bit set (`fslstack_gpon_dying_gasp_direct_handler`)
+    ///
+    /// Returns `(onu_id, reason)` pairs to deactivate; caller performs teardown so
+    /// platform-specific business GEM/T-CONT resources and host services are released.
+    pub fn evaluate_alarm_interrupts(
+        &mut self,
+        interrupts: &[GponInterrupt],
+    ) -> io::Result<Vec<(u8, &'static str)>> {
+        self.require_initialized()?;
+        let mut offline = Vec::new();
+        let active: Vec<(u8, u16)> = self
+            .onus
+            .values()
+            .filter(|onu| onu.state == OnuState::Active)
+            .map(|onu| (onu.onu_id, onu.onu_index))
+            .collect();
+
+        if interrupts.contains(&GponInterrupt::DyingGasp) {
+            let bitmap = read_alarm_bitmap(&mut self.mgmt.fsl, GPON_DYING_GASP_ALM)?;
+            for &(onu_id, onu_index) in &active {
+                if alarm_bitmap_contains(&bitmap, onu_index)
+                    && !offline.iter().any(|&(id, _)| id == onu_id)
+                {
+                    offline.push((onu_id, "dying_gasp"));
+                }
+            }
+        }
+        if interrupts.contains(&GponInterrupt::Losi) {
+            let bitmap = read_alarm_bitmap(&mut self.mgmt.fsl, GPON_LOSI_ALM)?;
+            for &(onu_id, onu_index) in &active {
+                if alarm_bitmap_contains(&bitmap, onu_index) {
+                    let count = self.losi_counts.entry(onu_id).or_insert(0);
+                    *count = count.saturating_add(1);
+                    if *count > 5 && !offline.iter().any(|&(id, _)| id == onu_id) {
+                        offline.push((onu_id, "losi"));
+                    }
+                }
+            }
+        }
+        if interrupts.contains(&GponInterrupt::Lofi) {
+            let bitmap = read_alarm_bitmap(&mut self.mgmt.fsl, GPON_LOFI_ALM)?;
+            for &(onu_id, onu_index) in &active {
+                if alarm_bitmap_contains(&bitmap, onu_index) {
+                    let count = self.lofi_counts.entry(onu_id).or_insert(0);
+                    *count = count.saturating_add(1);
+                    if *count > 2 && !offline.iter().any(|&(id, _)| id == onu_id) {
+                        offline.push((onu_id, "lofi"));
+                    }
+                }
+            }
+        }
+        Ok(offline)
     }
 
     fn require_initialized(&self) -> io::Result<()> {
@@ -727,6 +801,8 @@ impl<B: Bus> FslOltSession<B> {
         };
         self.onus.insert(onu_id, updated);
         self.state_entered_at.insert(onu_id, now);
+        self.losi_counts.remove(&onu_id);
+        self.lofi_counts.remove(&onu_id);
         Ok(Some(updated))
     }
 
@@ -887,6 +963,8 @@ impl<B: Bus> FslOltSession<B> {
         )?;
         self.onus.remove(&onu_id);
         self.state_entered_at.remove(&onu_id);
+        self.losi_counts.remove(&onu_id);
+        self.lofi_counts.remove(&onu_id);
         self.pending_port_id_acks
             .retain(|entry| entry.onu_id != onu_id);
         Ok(())

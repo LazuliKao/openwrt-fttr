@@ -236,6 +236,32 @@ mod tests {
         assert_eq!(engine.active_onus[0].state, OnuState::O4Ranging);
         assert_eq!(engine.active_onus[0].eq_delay, None);
     }
+
+    #[test]
+    fn platform_confirmation_uses_hardware_slot_and_retires_conflicting_identity() {
+        let mut engine = test_engine();
+        engine
+            .confirm_platform_onu(3, *b"TEST", [0, 0, 0, 1], 42)
+            .unwrap();
+        assert_eq!(engine.active_onus[0].onu_id, 3);
+        assert_eq!(engine.active_onus[0].state, OnuState::O5Operation);
+        assert_eq!(engine.active_onus[0].eq_delay, Some(42));
+        let displaced = engine
+            .confirm_platform_onu(7, *b"TEST", [0, 0, 0, 1], 43)
+            .unwrap();
+        assert_eq!(displaced, vec![3]);
+        assert_eq!(engine.active_onus.len(), 1);
+        assert_eq!(engine.active_onus[0].onu_id, 7);
+        let displaced = engine
+            .confirm_platform_onu(7, *b"TEST", [0, 0, 0, 2], 44)
+            .unwrap();
+        assert_eq!(displaced, vec![7]);
+        assert_eq!(engine.active_onus.len(), 1);
+        assert_eq!(engine.active_onus[0].serial_number, [0, 0, 0, 2]);
+        assert!(engine
+            .confirm_platform_onu(254, *b"TEST", [0; 4], 0)
+            .is_err());
+    }
 }
 
 impl PonEngine {
@@ -246,6 +272,45 @@ impl PonEngine {
             onu_pins: Default::default(),
             pin_error: None,
         }
+    }
+
+    /// Adopt an ID already confirmed by the platform, rather than allocating a
+    /// second, potentially different ID in the shared engine.
+    #[cfg(any(feature = "platform-fiberhome-an4475-g2", test))]
+    pub(crate) fn confirm_platform_onu(
+        &mut self,
+        id: u8,
+        vendor: [u8; 4],
+        sn: [u8; 4],
+        eqd: u32,
+    ) -> Result<Vec<u8>, String> {
+        if !self.resources.onu_ids.contains(&id) {
+            return Err(format!("platform ONU-ID {id} is unavailable"));
+        }
+        let displaced = self
+            .active_onus
+            .iter()
+            .filter(|onu| {
+                (onu.onu_id == id && (onu.vendor_id != vendor || onu.serial_number != sn))
+                    || (onu.onu_id != id && onu.vendor_id == vendor && onu.serial_number == sn)
+            })
+            .map(|onu| onu.onu_id)
+            .collect();
+        self.active_onus.retain(|onu| {
+            !((onu.onu_id == id && (onu.vendor_id != vendor || onu.serial_number != sn))
+                || (onu.onu_id != id && onu.vendor_id == vendor && onu.serial_number == sn))
+        });
+        if !self.active_onus.iter().any(|onu| onu.onu_id == id) {
+            self.active_onus.push(GponOnu::new(id, vendor, sn));
+        }
+        let onu = self
+            .active_onus
+            .iter_mut()
+            .find(|onu| onu.onu_id == id)
+            .unwrap();
+        onu.eq_delay = Some(eqd);
+        onu.state = OnuState::O5Operation;
+        Ok(displaced)
     }
 
     /// Processes an ONU discovered on the PON link (from upstream PLOAM or auto-ranging)

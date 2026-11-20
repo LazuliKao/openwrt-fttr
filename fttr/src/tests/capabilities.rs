@@ -44,7 +44,13 @@ fn capabilities_offline_queries_agree_without_controller_initialization() {
         assert_eq!(cli["pages"][page], true);
     }
     for page in ["hardware", "calibration"] {
-        assert_eq!(cli["pages"][page], cfg!(feature = "platform-h3c-hm2004-du"));
+        assert_eq!(
+            cli["pages"][page],
+            cfg!(any(
+                feature = "platform-h3c-hm2004-du",
+                feature = "platform-fiberhome-an4475-g2"
+            ))
+        );
     }
     let adapters = cli["adapters"]["omci"]
         .as_array()

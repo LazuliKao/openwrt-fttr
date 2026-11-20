@@ -69,6 +69,7 @@ pub const NNI_GEMPORT_OFFSET_CFG: u32 = 0x9e6;
 
 pub const DEFAULT_NNI_ETH_TPID: u16 = 0x8200;
 pub const STANDARD_8021Q_TPID: u16 = 0x8100;
+pub const IEEE_8021AD_TPID: u16 = 0x88a8;
 pub const DEFAULT_NNI_GEMPORT_OFFSET: u16 = 255;
 
 pub const TOD_UART_BAUD_RATE_CFG: u32 = 0x1203;

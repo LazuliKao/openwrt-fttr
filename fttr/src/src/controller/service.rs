@@ -169,6 +169,13 @@ impl Services {
                 state.identity_at = Some(std::time::Instant::now());
             }
             let mut reported_unsupported = false;
+            struct CancelOnDrop(Arc<AtomicBool>);
+            impl Drop for CancelOnDrop {
+                fn drop(&mut self) {
+                    self.0.store(true, Ordering::Release);
+                }
+            }
+            let unsupported_telemetry = CancelOnDrop(Arc::new(AtomicBool::new(false)));
             let Some(adapter) = wait_for_adapter(&token, || {
                 let serial = super::service::onu_serial(id);
                 crate::devices::select_with_serial(&vendor, &identity, serial.as_deref())
@@ -178,9 +185,11 @@ impl Services {
                 }
                 if !reported_unsupported {
                     println!("[!] ONU {id} generation={generation} vendor={vendor}: identity collected; business profile unsupported; waiting for adapter policy change");
+                    super::telemetry::start(platform, id, unsupported_telemetry.0.clone());
                     reported_unsupported = true;
                 }
             }) else { return; };
+            drop(unsupported_telemetry);
             let set = |phase: BusinessPhase, error: Option<String>| {
                 if token.load(Ordering::Acquire) { return; }
                 if let Some(state) = states.lock().unwrap().get_mut(&id).filter(|state| state.generation == generation) {

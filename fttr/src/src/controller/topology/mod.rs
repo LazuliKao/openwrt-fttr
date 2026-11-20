@@ -297,18 +297,29 @@ fn project(
         }
         let pin = binding(sn.as_deref(), status.onu_pinning.as_ref());
         let interface = onu.data_path.interface.clone();
+        let shared_interface = onu
+            .data_path
+            .measurements
+            .get("interface_scope")
+            .is_some_and(|scope| scope.raw.as_deref() == Some("shared_nni"));
         // Prefer the direct read; preserve unknown on read error rather than false.
-        let carrier = read_carrier(&interface).or_else(|| {
-            local
-                .interfaces
-                .iter()
-                .find(|i| i.name == interface)
-                .and_then(|i| i.carrier)
-        });
+        let carrier = (!shared_interface)
+            .then(|| {
+                read_carrier(&interface).or_else(|| {
+                    local
+                        .interfaces
+                        .iter()
+                        .find(|i| i.name == interface)
+                        .and_then(|i| i.carrier)
+                })
+            })
+            .flatten();
         let operational = onu.state == RegistrationState::O5Operation;
         if unique && operational {
             learned_onus.insert(u16::from(onu.onu_id), sn.clone().unwrap());
-            onu_interfaces.insert(u16::from(onu.onu_id), interface.clone());
+            if !shared_interface {
+                onu_interfaces.insert(u16::from(onu.onu_id), interface.clone());
+            }
             node_by_sn.insert(sn.clone().unwrap(), id.clone());
         }
         let ext = if unique && operational && onu.identity_current {
@@ -464,6 +475,14 @@ fn project(
     }
     let mut occupied = BTreeMap::<String, Vec<String>>::new();
     for link in &links {
+        if link
+            .data_path
+            .as_ref()
+            .and_then(|path| path.measurements.get("interface_scope"))
+            .is_some_and(|scope| scope.raw.as_deref() == Some("shared_nni"))
+        {
+            continue;
+        }
         if let Some(interface) = &link.data_interface {
             occupied
                 .entry(interface.clone())

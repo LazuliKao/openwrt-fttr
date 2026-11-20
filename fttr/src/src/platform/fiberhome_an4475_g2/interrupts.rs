@@ -15,6 +15,12 @@ use std::io;
 
 /// `GPON_INT_MASK` (reg ID `0xde` / 222, 7-bit, base address `0x210`).
 pub const GPON_INT_MASK: u32 = 0x210;
+/// `GPON_DYING_GASP_ALM` (reg ID `0xd2` / 210, 128-bit / 4 words, base address `0x265`).
+pub const GPON_DYING_GASP_ALM: u32 = 0x265;
+/// `GPON_LOSI_ALM` (reg ID `0xd3` / 211, 128-bit / 4 words, base address `0x269`).
+pub const GPON_LOSI_ALM: u32 = 0x269;
+/// `GPON_LOFI_ALM` (reg ID `0xd4` / 212, 128-bit / 4 words, base address `0x26d`).
+pub const GPON_LOFI_ALM: u32 = 0x26d;
 /// `GPON_INT` (reg ID `0xdf` / 223, 7-bit W1C status, base address `0x2f0`).
 pub const GPON_INT: u32 = 0x2f0;
 /// `PLOAM_RD_VLD_CFG` (reg ID `0x137` / 311, 1-bit, base address `0x41b`).
@@ -270,6 +276,31 @@ pub fn poll_and_clear_pending<B: Bus>(fsl: &mut Fsl<B>) -> io::Result<Vec<GponIn
         clear_interrupt(fsl, kind)?;
     }
     Ok(pending)
+}
+
+/// Reads (and read-clears) one 128-bit per-ONU alarm bitmap register
+/// (`GPON_DYING_GASP_ALM`, `GPON_LOSI_ALM`, or `GPON_LOFI_ALM`).
+pub fn read_alarm_bitmap<B: Bus>(fsl: &mut Fsl<B>, reg_addr: u32) -> io::Result<[u32; 4]> {
+    if !matches!(
+        reg_addr,
+        GPON_DYING_GASP_ALM | GPON_LOSI_ALM | GPON_LOFI_ALM
+    ) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "unsupported per-ONU alarm bitmap register",
+        ));
+    }
+    let words = fsl.read(RegisterSpace::Register, reg_addr, 0, 4)?;
+    Ok(words.try_into().unwrap())
+}
+
+/// Returns whether `onu_index` (`0..128`) is set in a 128-bit alarm bitmap.
+pub fn alarm_bitmap_contains(words: &[u32; 4], onu_index: u16) -> bool {
+    if onu_index >= 128 {
+        return false;
+    }
+    let word = words[usize::from(onu_index >> 5)];
+    (word >> (onu_index & 0x1f)) & 1 != 0
 }
 
 #[cfg(test)]

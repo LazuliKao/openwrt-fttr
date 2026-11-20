@@ -1,5 +1,5 @@
 //! FiberHome AN4475-G2 implementation of the shared platform operation boundary.
-use super::{diagnostics::FslDiagnostics, runtime, An4475G2, RESOURCES};
+use super::{diagnostics::FslDiagnostics, health, runtime, An4475G2, RESOURCES};
 use crate::{
     platform::{
         adapter::{PlatformAdapter, PlatformDescriptor},
@@ -56,6 +56,18 @@ impl PlatformBackend for An4475G2 {
 
     fn revoke_business(&self, id: u8) -> io::Result<()> {
         runtime::revoke_business(id)
+    }
+
+    fn watch(
+        &self,
+        platform: PlatformContext,
+        id: u8,
+        cancellation: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        _vendor: [u8; 4],
+        requests: &std::sync::mpsc::Receiver<crate::controller::inventory::WorkerRequest>,
+        wake: std::sync::Arc<crate::platform::openwrt::wake::Wake>,
+    ) -> io::Result<()> {
+        health::watch(platform, id, cancellation, requests, wake)
     }
 
     fn run(&self, platform: PlatformContext) -> Result<(), SelectionError> {

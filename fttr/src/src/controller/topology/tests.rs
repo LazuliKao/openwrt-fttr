@@ -150,6 +150,33 @@ fn onu(sn: &str, id: u8) -> SubGatewayStatus {
 }
 
 #[test]
+fn shared_nni_is_not_an_onu_port_or_a_port_conflict() {
+    let mut a = onu("TEST00000001", 0);
+    let mut b = onu("TEST00000002", 1);
+    for onu in [&mut a, &mut b] {
+        onu.data_path.interface = "fttr0".into();
+        onu.data_path.measurements.insert(
+            "interface_scope".into(),
+            MeasurementEvidence::observed("FSL platform", "scope", "shared_nni"),
+        );
+    }
+    let snapshot = project(status(vec![a, b]), local::Local::default(), BTreeMap::new());
+    assert!(!snapshot
+        .reply
+        .issues
+        .iter()
+        .any(|issue| issue.code == "port_conflict"));
+    let links: Vec<_> = snapshot
+        .reply
+        .links
+        .iter()
+        .filter(|link| link.data_interface.as_deref() == Some("fttr0"))
+        .collect();
+    assert_eq!(links.len(), 2);
+    assert!(links.iter().all(|link| link.carrier.is_none()));
+}
+
+#[test]
 fn stable_identity_survives_slot_change_and_unknown_is_not_zero() {
     let first = project(
         status(vec![onu(" test00000001 ", 0)]),

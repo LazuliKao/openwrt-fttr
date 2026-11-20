@@ -6,6 +6,7 @@ use std::sync::atomic::Ordering;
 mod metrics;
 #[cfg(test)]
 mod tests;
+#[path = "../../ubus_topology.rs"]
 mod topology;
 
 fn bind<Q: DeserializeOwned + 'static, R: Serialize + 'static>(
@@ -98,81 +99,13 @@ impl Handlers {
         }
     }
     fn mib_start(&self, request: MibStartRequest) -> Result<JobStartReply, i32> {
-        use crate::pon_engine::ploam::OnuState;
-        if !self
-            .optics
-            .platform
-            .resources()
-            .onu_ids
-            .contains(&request.onu_id)
-        {
-            return Err(2);
-        }
-        let engine = self.engine.try_lock().map_err(|_| 9)?;
-        if !engine.active_onus.iter().any(|onu| {
-            onu.onu_id == request.onu_id
-                && onu.full_sn_str() == request.optical_sn
-                && onu.state == OnuState::O5Operation
-        }) {
-            return response(fttr_jobs::error(
-                "Device registration changed; reopen device details",
-            ));
-        }
-        let generation = self
-            .services
-            .try_lock()
-            .map_err(|_| 9)?
-            .get(&request.onu_id)
-            .map(|s| s.generation)
-            .ok_or(9)?;
-        drop(engine);
-        let handler = self.clone();
-        let guard: crate::controller::inventory::RegistrationGuard =
-            std::sync::Arc::new(move || {
-                let Ok(engine) = handler.engine.lock() else {
-                    return false;
-                };
-                let Ok(services) = handler.services.lock() else {
-                    return false;
-                };
-                engine.active_onus.iter().any(|onu| {
-                    onu.onu_id == request.onu_id
-                        && onu.full_sn_str() == request.optical_sn
-                        && onu.state == OnuState::O5Operation
-                }) && services
-                    .get(&request.onu_id)
-                    .is_some_and(|s| s.generation == generation)
-            });
-        let states = self.services.clone();
-        let id = request.onu_id;
-        let tables = request.tables;
-        let platform = self.optics.platform;
-        response(self.jobs.start_with_progress("mib", move |progress| {
-            progress.update(fttr_jobs::Phase::Starting, 0, None);
-            match crate::controller::inventory::control_guarded(
-                platform,
-                id,
-                tables,
-                Some(crate::controller::inventory::MibProgressReporter::Job(
-                    progress,
-                )),
-                &states,
-                Some(guard.clone()),
-            ) {
-                Ok(report) if guard() => match serde_json::to_value(report)
-                    .and_then(serde_json::from_value::<MibReport>)
-                {
-                    Ok(report) => serde_json::to_value(MibSnapshot {
-                        status: MibReady::Ready,
-                        report,
-                    })
-                    .expect("MIB snapshot is JSON serializable"),
-                    Err(_) => fttr_jobs::error("Invalid MIB report contract"),
-                },
-                Ok(_) => fttr_jobs::error("Device registration changed during MIB read"),
-                Err(error) => fttr_jobs::error(&error.to_string()),
-            }
-        }))
+        crate::controller::ubus_mib::start(
+            self.optics.platform,
+            self.engine.clone(),
+            self.services.clone(),
+            &self.jobs,
+            request,
+        )
     }
     fn mib_result(&self, request: JobRequest) -> Result<JobChunkReply, i32> {
         response(self.jobs.result(&request.job, request.chunk, Some("mib")))

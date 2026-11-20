@@ -17,6 +17,8 @@ use std::{
     },
     time::Duration,
 };
+#[path = "../ubus_topology.rs"]
+mod topology;
 
 fn bind<Q: DeserializeOwned + 'static, R: Serialize + 'static>(
     method: &Method<Q, R>,
@@ -58,6 +60,7 @@ struct Handlers {
     engine: Arc<Mutex<PonEngine>>,
     services: service::States,
     jobs: fttr_jobs::Jobs,
+    topology: Arc<Mutex<crate::controller::topology::Cache>>,
 }
 
 impl Handlers {
@@ -80,21 +83,19 @@ impl Handlers {
     }
     fn get_status(&self, _: EmptyRequest) -> Result<StatusReply, i32> {
         let provisioning =
-            serde_json::from_value::<SyncStatusReply>(crate::provisioning::snapshot()).ok();
-        let mut status = runtime::status_snapshot(&self.optics, &self.engine, provisioning);
+            serde_json::from_value::<SyncStatusReply>(crate::provisioning::snapshot())
+                .map_err(|_| 9)?;
+        let mut status = runtime::status_snapshot(
+            &self.optics,
+            &self.engine,
+            &self.devices,
+            &self.services,
+            provisioning,
+        )?;
         if let Some(jobs) = self.jobs.snapshot() {
             status.jobs = serde_json::from_value(jobs).ok();
         }
         Ok(status)
-    }
-    fn get_topology(&self, _: EmptyRequest) -> Result<TopologyReply, i32> {
-        Err(4)
-    }
-    fn get_topology_node(&self, _: TopologyNodeRequest) -> Result<TopologyNodeReply, i32> {
-        Err(4)
-    }
-    fn get_topology_clients(&self, _: TopologyClientsRequest) -> Result<TopologyClientsReply, i32> {
-        Err(4)
     }
     fn get_sync(&self, _: EmptyRequest) -> Result<SyncStatusReply, i32> {
         serde_json::from_value(crate::provisioning::snapshot()).map_err(|_| 9)
@@ -133,36 +134,13 @@ impl Handlers {
         Err(4)
     }
     fn mib_start(&self, request: MibStartRequest) -> Result<JobStartReply, i32> {
-        let platform = self.optics.platform;
-        let states = self.services.clone();
-        let id = request.onu_id;
-        let tables = request.tables;
-        let _ = &self.devices;
-        response(self.jobs.start_with_progress("mib", move |progress| {
-            progress.update(fttr_jobs::Phase::Starting, 0, None);
-            match crate::controller::inventory::control_guarded(
-                platform,
-                id,
-                tables,
-                Some(crate::controller::inventory::MibProgressReporter::Job(
-                    progress,
-                )),
-                &states,
-                None,
-            ) {
-                Ok(report) => match serde_json::to_value(report)
-                    .and_then(serde_json::from_value::<MibReport>)
-                {
-                    Ok(report) => serde_json::to_value(MibSnapshot {
-                        status: MibReady::Ready,
-                        report,
-                    })
-                    .expect("MIB snapshot is JSON serializable"),
-                    Err(_) => fttr_jobs::error("Invalid MIB report contract"),
-                },
-                Err(error) => fttr_jobs::error(&error.to_string()),
-            }
-        }))
+        crate::controller::ubus_mib::start(
+            self.optics.platform,
+            self.engine.clone(),
+            self.services.clone(),
+            &self.jobs,
+            request,
+        )
     }
     fn mib_result(&self, request: JobRequest) -> Result<JobChunkReply, i32> {
         response(self.jobs.result(&request.job, request.chunk, Some("mib")))
@@ -272,7 +250,17 @@ impl Handlers {
                     .as_ref()
                     .is_ok_and(|r| r.status == ReplyStatus::Success),
                 output: None,
-                error: reply.err().map(|c| format!("ubus error {c}")),
+                error: match reply {
+                    Ok(ref value) if value.status != ReplyStatus::Success => Some(
+                        value
+                            .error
+                            .as_ref()
+                            .map(|e| e.message.clone())
+                            .unwrap_or_else(|| "Calibration failed".into()),
+                    ),
+                    Err(code) => Some(format!("ubus error {code}")),
+                    _ => None,
+                },
             })
             .expect("calibration result is JSON serializable")
         }))
@@ -291,6 +279,7 @@ pub(super) fn start(
         devices,
         engine,
         services,
+        topology: Default::default(),
         jobs: {
             static JOBS: std::sync::OnceLock<fttr_jobs::Jobs> = std::sync::OnceLock::new();
             JOBS.get_or_init(|| fttr_jobs::Jobs::with_shutdown(stopping.clone()))

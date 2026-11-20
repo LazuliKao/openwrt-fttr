@@ -160,6 +160,52 @@ impl GdbaAllocConfig {
             ds_tail_flag: is_type7,
         })
     }
+
+    /// Builds a business data T-CONT allocation matching stock
+    /// `fslstack_gpon_addbw` / `fslstack_gpon_dba_config` bandwidth scaling.
+    ///
+    /// When `fixed_floor` is `None` or `Some(0)`, configures pure SR-DBA
+    /// best-effort (`alloc_type = 2`, `fixed_bw = 0`, full line-rate `max_bw`).
+    /// When a non-zero `fixed_floor` is requested (for ONUs needing a fixed
+    /// grant floor), preserves that floor while keeping full line-rate `max_bw`.
+    pub fn business_data(
+        tcont: u8,
+        onu_index: u16,
+        granularity_8x: u32,
+        is_2p5g: bool,
+        fixed_floor: Option<u32>,
+    ) -> io::Result<Self> {
+        if granularity_8x == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "DBA granularity must be non-zero",
+            ));
+        }
+        let gran = u64::from(granularity_8x);
+        let (scale, max_kbps) = if is_2p5g {
+            (8u64, 2_500_000u64)
+        } else {
+            (16u64, 1_250_000u64)
+        };
+        let max_bw = (((gran - 1) + scale * max_kbps) / gran).min(u64::from(MAX_BW_22BIT)) as u32;
+        let fixed_bw = fixed_floor.unwrap_or(0).min(max_bw);
+        let alloc_type = if fixed_bw == 0 { 2 } else { 0 };
+        Ok(Self {
+            tcont,
+            onu_index,
+            enable: true,
+            fixed_bw,
+            assured_bw: 0,
+            max_bw,
+            alloc_type,
+            priority: 0,
+            weight: 0x80,
+            ds_period: 7,
+            ds_flag: true,
+            ds_bw_flag: false,
+            ds_tail_flag: is_2p5g,
+        })
+    }
 }
 
 /// Maps a 12-bit GPON `Alloc-ID` to the 8-bit hardware T-CONT index,

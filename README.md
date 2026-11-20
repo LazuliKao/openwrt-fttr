@@ -59,7 +59,7 @@ make package/luci-app-fttr/compile V=s
 | OpenWrt 配置 | Cargo feature | OpenWrt 默认 | Cargo 默认 | 状态 |
 | --- | --- | --- | --- | --- |
 | `CONFIG_FTTR_PLATFORM_H3C_HM2004_DU` | `platform-h3c-hm2004-du` | ✅ | ✅ | 依赖 H3C FMCS 驱动 |
-| `CONFIG_FTTR_PLATFORM_FIBERHOME_AN4475_G2` | `platform-fiberhome-an4475-g2` | ❌ | ❌ | 仅寄存器诊断与静态适配（`DiagnosticsOnly`）；已核实 `fiberhome,an4475-g2` 身份，依赖 `kmod-fiberhome-fsl` 且完整运行态待实机验证 |
+| `CONFIG_FTTR_PLATFORM_FIBERHOME_AN4475_G2` | `platform-fiberhome-an4475-g2` | ❌ | ❌ | FSL 运行态及 ubus 接口，依赖 `kmod-fiberhome-fsl`；完整业务、逐 ONU 数据面和管理链路仍需分层实机验证 |
 | `CONFIG_FTTR_PLATFORM_TIANYI_TYFZA1` | `platform-tianyi-tyfza1` | ❌ | ❌ | 编译期 stub；板级身份及驱动尚未调查 |
 | — | `all-platforms` | — | ❌ | Cargo 聚合 feature |
 

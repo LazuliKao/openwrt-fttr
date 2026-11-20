@@ -10,4 +10,5 @@ pub mod h3c_hm2004_du;
 pub mod openwrt;
 pub mod resources;
 pub mod runtime;
+pub(crate) mod status;
 pub mod tianyi_tyfza1;

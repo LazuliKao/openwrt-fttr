@@ -642,3 +642,76 @@ fn blacklist_and_strict_whitelist_gate_discovery() {
         .expect("whitelisted 2.5G ONU allowed");
     assert_eq!(onu.state, OnuState::Ranging);
 }
+
+#[test]
+fn alarm_interrupts_respect_stock_losi_lofi_and_dying_gasp_thresholds() {
+    let mut cfg = OltSessionConfig::default();
+    cfg.init.max_onu_id = 16;
+    let mut session = FslOltSession::new(SimBus::new(), cfg);
+    session.initialize(&mut no_sleep).expect("initialize");
+
+    let sn = *b"TEST\x00\x00\x00\x44";
+    let onu = session
+        .process_o3_sn_discovery(sn, OnuUpstreamRate::Rate1p25G, &mut no_sleep)
+        .expect("O3");
+    session
+        .process_o4_o5_activation(onu.onu_id, &sn, 0x100, &mut no_sleep)
+        .expect("O4");
+    let ack = PloamRecord::decode(
+        encode_rx_ploam_words(&build_configure_port_id_ack(onu.onu_id, 0, true, 0), 0),
+        true,
+    );
+    session
+        .process_ploam_ack(&ack, &mut no_sleep)
+        .expect("ACK")
+        .expect("Active");
+    assert_eq!(session.find_onu_by_sn(&sn).map(|o| o.onu_id), Some(0));
+
+    // Stock LOSi threshold is >5 hits before deactivating.
+    session
+        .bus_mut()
+        .regs
+        .insert(GPON_LOSI_ALM, vec![1 << onu.onu_index, 0, 0, 0]);
+    for _ in 0..5 {
+        assert!(session
+            .evaluate_alarm_interrupts(&[GponInterrupt::Losi])
+            .unwrap()
+            .is_empty());
+    }
+    assert_eq!(
+        session
+            .evaluate_alarm_interrupts(&[GponInterrupt::Losi])
+            .unwrap(),
+        vec![(0, "losi")]
+    );
+
+    // Stock LOFi threshold is >2 hits before deactivating.
+    session
+        .bus_mut()
+        .regs
+        .insert(GPON_LOFI_ALM, vec![1 << onu.onu_index, 0, 0, 0]);
+    for _ in 0..2 {
+        assert!(session
+            .evaluate_alarm_interrupts(&[GponInterrupt::Lofi])
+            .unwrap()
+            .is_empty());
+    }
+    assert_eq!(
+        session
+            .evaluate_alarm_interrupts(&[GponInterrupt::Lofi])
+            .unwrap(),
+        vec![(0, "lofi")]
+    );
+
+    // DyingGasp triggers immediately on the active ONU bit.
+    session
+        .bus_mut()
+        .regs
+        .insert(GPON_DYING_GASP_ALM, vec![1 << onu.onu_index, 0, 0, 0]);
+    assert_eq!(
+        session
+            .evaluate_alarm_interrupts(&[GponInterrupt::DyingGasp])
+            .unwrap(),
+        vec![(0, "dying_gasp")]
+    );
+}

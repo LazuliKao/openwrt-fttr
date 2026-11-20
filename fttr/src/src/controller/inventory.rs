@@ -147,9 +147,6 @@ pub(super) fn collect(
             Err(error) => identity.errors.push(format!("{label}: {error}")),
         }
     }
-    if identity.equipment_id.is_some() {
-        super::telemetry::start(platform, id, cancellation);
-    }
     Ok(identity)
 }
 

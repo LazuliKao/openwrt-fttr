@@ -18,6 +18,8 @@ pub mod downstream;
 #[cfg(feature = "platform-fiberhome-an4475-g2")]
 pub mod gdba;
 #[cfg(feature = "platform-fiberhome-an4475-g2")]
+mod health;
+#[cfg(feature = "platform-fiberhome-an4475-g2")]
 pub mod initialization;
 #[cfg(feature = "platform-fiberhome-an4475-g2")]
 pub mod interrupts;
@@ -47,6 +49,8 @@ mod transport;
 mod ubus;
 #[cfg(feature = "platform-fiberhome-an4475-g2")]
 pub mod upstream;
+#[cfg(feature = "platform-fiberhome-an4475-g2")]
+pub(crate) mod vport;
 
 #[cfg(feature = "platform-fiberhome-an4475-g2")]
 pub const ONU_COUNT: usize = 16;
@@ -63,11 +67,17 @@ const ONU_IDS: [u8; ONU_COUNT] = {
 };
 
 #[cfg(feature = "platform-fiberhome-an4475-g2")]
+const DOWNSTREAM_INTERFACES: [&str; ONU_COUNT] = [
+    "fttr1", "fttr2", "fttr3", "fttr4", "fttr5", "fttr6", "fttr7", "fttr8", "fttr9", "fttr10",
+    "fttr11", "fttr12", "fttr13", "fttr14", "fttr15", "fttr16",
+];
+
+#[cfg(feature = "platform-fiberhome-an4475-g2")]
 pub const RESOURCES: super::resources::Resources = super::resources::Resources {
     onu_ids: &ONU_IDS,
     management_interfaces: &["fttr0"],
     capture_interface: Some("fttr0"),
-    downstream_interfaces: &[],
+    downstream_interfaces: &DOWNSTREAM_INTERFACES,
     allocations: &allocations(),
 };
 
@@ -86,7 +96,7 @@ const fn allocations() -> [super::resources::OnuResources; ONU_COUNT] {
             // FSL hardware maps data Alloc-IDs in 0x400..(0x500 - max_onus) for alloc_offset_mode=0.
             alloc_id: 0x400 + index as u16,
             gem_id: 0x100 + index as u16,
-            interface: None,
+            interface: Some(DOWNSTREAM_INTERFACES[index]),
         };
         index += 1;
     }
