@@ -104,7 +104,7 @@ fn handle_offload(args: &[String]) {
             } else {
                 println!("[*] NPU & Hardware Offload Status:");
                 println!(
-                    "    Engine attached: {} | Bridge offload enabled: {}",
+                    "    Engine attached: {} | Offload enabled: {}",
                     if status.engine_attached {
                         "YES (Ready)"
                     } else {
@@ -116,27 +116,49 @@ fn handle_offload(args: &[String]) {
                         "NO"
                     }
                 );
-                println!(
-                    "    Bridge: {} | Mask: 0x{:04x} ({}) | Active ports: {}",
-                    status.bridge,
-                    status.bridge_offload_mask,
-                    status.bridge_offload_mask,
-                    if status.active_ports.is_empty() {
-                        "none".into()
+                let active_ports = if status.active_ports.is_empty() {
+                    "none".into()
+                } else {
+                    status.active_ports.join(", ")
+                };
+                if status.admission_model == Some(fttr_api::NpuAdmissionModel::DirectionOnly) {
+                    let dir = if status.direction_mask_valid {
+                        format!("0x{:x} ({})", status.direction_mask, status.direction_mask)
                     } else {
-                        status.active_ports.join(", ")
-                    }
-                );
-                println!(
-                    "    Routed mask: 0x{:04x} | Driver debug: {} | Hooks ready: {}",
-                    status.routed_offload_mask,
-                    if status.bridge_offload_debug {
-                        "YES"
-                    } else {
-                        "NO"
-                    },
-                    if status.fw4_hooks_ready { "YES" } else { "NO" }
-                );
+                        "unavailable".into()
+                    };
+                    println!(
+                        "    Bridge: {} | Direction mask: {} | Eligible ports: {}",
+                        status.bridge, dir, active_ports
+                    );
+                    println!(
+                        "    PPE debug: {} | Hooks ready: {}",
+                        if status.bridge_offload_debug {
+                            "YES"
+                        } else {
+                            "NO"
+                        },
+                        if status.fw4_hooks_ready { "YES" } else { "NO" }
+                    );
+                } else {
+                    println!(
+                        "    Bridge: {} | Mask: 0x{:04x} ({}) | Active ports: {}",
+                        status.bridge,
+                        status.bridge_offload_mask,
+                        status.bridge_offload_mask,
+                        active_ports
+                    );
+                    println!(
+                        "    Routed mask: 0x{:04x} | Driver debug: {} | Hooks ready: {}",
+                        status.routed_offload_mask,
+                        if status.bridge_offload_debug {
+                            "YES"
+                        } else {
+                            "NO"
+                        },
+                        if status.fw4_hooks_ready { "YES" } else { "NO" }
+                    );
+                }
                 println!(
                     "    FOE Entries: total {} | bound {} (IPv4: {}, IPv6: {}) | Offload traffic: {} pkts, {} bytes",
                     status.total_entries,
@@ -165,14 +187,32 @@ fn handle_offload(args: &[String]) {
         }
         "on" | "off" => {
             let enabled = sub == "on";
-            #[cfg(all(feature = "npu", feature = "platform-h3c-hm2004-du"))]
+            #[cfg(all(
+                feature = "npu",
+                any(
+                    feature = "platform-h3c-hm2004-du",
+                    feature = "platform-fiberhome-an4475-g2"
+                )
+            ))]
             let bridge = args
                 .iter()
                 .position(|a| a == "--bridge")
                 .map(|i| args.get(i + 1).map(String::as_str).unwrap_or(""));
-            #[cfg(all(feature = "npu", feature = "platform-h3c-hm2004-du"))]
+            #[cfg(all(
+                feature = "npu",
+                any(
+                    feature = "platform-h3c-hm2004-du",
+                    feature = "platform-fiberhome-an4475-g2"
+                )
+            ))]
             let result = openwrt_fttr::npu::settings::set(enabled, bridge, None, None, None);
-            #[cfg(not(all(feature = "npu", feature = "platform-h3c-hm2004-du")))]
+            #[cfg(not(all(
+                feature = "npu",
+                any(
+                    feature = "platform-h3c-hm2004-du",
+                    feature = "platform-fiberhome-an4475-g2"
+                )
+            )))]
             let result: std::io::Result<()> = Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
                 "NPU adapter not compiled (enable Cargo feature npu)",

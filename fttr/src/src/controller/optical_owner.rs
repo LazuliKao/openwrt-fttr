@@ -100,7 +100,7 @@ impl OpticalClient {
             .try_send(OpticalRequest {
                 command,
                 reply,
-                deadline: Instant::now() + Duration::from_secs(5),
+                deadline: Instant::now() + Duration::from_secs(12),
             })
             .map_err(|error| match error {
                 mpsc::TrySendError::Full(_) => {
@@ -111,7 +111,7 @@ impl OpticalClient {
                 }
             })?;
         response
-            .recv_timeout(Duration::from_secs(6))
+            .recv_timeout(Duration::from_secs(15))
             .map_err(|error| {
                 io::Error::new(
                     io::ErrorKind::TimedOut,

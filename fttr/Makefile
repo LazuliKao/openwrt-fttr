@@ -18,7 +18,7 @@ define Package/openwrt-fttr
   CATEGORY:=Network
   SUBMENU:=PON
   TITLE:=OpenWrt FTTR controller and device management tools
-  DEPENDS:=$(RUST_ARCH_DEPENDS) +FTTR_PLATFORM_H3C_HM2004_DU:kmod-h3c-fmcs +FTTR_PLATFORM_FIBERHOME_AN4475_G2:kmod-fiberhome-fsl +FTTR_PLATFORM_FIBERHOME_AN4475_G2:kmod-8021q +FTTR_PLATFORM_FIBERHOME_AN4475_G2:ip-full +FTTR_NPU&&FTTR_PLATFORM_H3C_HM2004_DU:airoha-en7581-npu-firmware +uci +ubus +firewall4 +dnsmasq
+  DEPENDS:=$(RUST_ARCH_DEPENDS) +FTTR_PLATFORM_H3C_HM2004_DU:kmod-h3c-fmcs +FTTR_PLATFORM_FIBERHOME_AN4475_G2:kmod-fiberhome-fsl +FTTR_PLATFORM_FIBERHOME_AN4475_G2:ip-full +FTTR_NPU&&FTTR_PLATFORM_H3C_HM2004_DU:airoha-en7581-npu-firmware +FTTR_NPU&&FTTR_PLATFORM_FIBERHOME_AN4475_G2:airoha-en7581-mt7996-npu-firmware +uci +ubus +firewall4 +dnsmasq
 endef
 
 define Package/openwrt-fttr/description
@@ -83,15 +83,15 @@ define Package/openwrt-fttr/config
       Select mimalloc 3.5.3 for the daemon only, without explicit THP advice.
       Compare target RSS, swap and service behavior before enabling in production.
   config FTTR_NPU
-    bool "Compile fttrd NPU bridge offload coordination (runtime UCI switch)"
-    depends on PACKAGE_openwrt-fttr && FTTR_PLATFORM_H3C_HM2004_DU
+    bool "Compile fttrd NPU offload coordination (runtime UCI switch)"
+    depends on PACKAGE_openwrt-fttr && (FTTR_PLATFORM_H3C_HM2004_DU || FTTR_PLATFORM_FIBERHOME_AN4475_G2)
     default y
     help
       Coordinate driver admission and existing fw4 hooks inside fttrd.
       Disable to build without the NPU control service; software bridging remains available.
 endef
 
-RUST_PKG_FEATURES:=$(if $(CONFIG_FTTR_PLATFORM_H3C_HM2004_DU),platform-h3c-hm2004-du) $(if $(CONFIG_FTTR_PLATFORM_FIBERHOME_AN4475_G2),platform-fiberhome-an4475-g2) $(if $(CONFIG_FTTR_PLATFORM_TIANYI_TYFZA1),platform-tianyi-tyfza1) $(if $(CONFIG_FTTR_DEVICE_HL202),device-hl202) $(if $(CONFIG_FTTR_DEVICE_HWTC),device-hwtc) $(if $(CONFIG_FTTR_DEVICE_STAR),device-star) $(if $(CONFIG_FTTR_DEVICE_ZTE),device-zte) $(if $(CONFIG_FTTR_DEVICE_SCTY),device-scty) $(if $(CONFIG_FTTR_DEVICE_FIBERHOME),device-fiberhome) $(if $(CONFIG_FTTR_DEVICE_REALTEK),device-realtek) $(if $(CONFIG_FTTR_ACS),acs) $(if $(CONFIG_FTTR_MQTT),mqtt) $(if $(and $(CONFIG_FTTR_NPU),$(CONFIG_FTTR_PLATFORM_H3C_HM2004_DU)),npu) $(if $(CONFIG_FTTR_MIMALLOC),allocator-mimalloc)
+RUST_PKG_FEATURES:=$(if $(CONFIG_FTTR_PLATFORM_H3C_HM2004_DU),platform-h3c-hm2004-du) $(if $(CONFIG_FTTR_PLATFORM_FIBERHOME_AN4475_G2),platform-fiberhome-an4475-g2) $(if $(CONFIG_FTTR_PLATFORM_TIANYI_TYFZA1),platform-tianyi-tyfza1) $(if $(CONFIG_FTTR_DEVICE_HL202),device-hl202) $(if $(CONFIG_FTTR_DEVICE_HWTC),device-hwtc) $(if $(CONFIG_FTTR_DEVICE_STAR),device-star) $(if $(CONFIG_FTTR_DEVICE_ZTE),device-zte) $(if $(CONFIG_FTTR_DEVICE_SCTY),device-scty) $(if $(CONFIG_FTTR_DEVICE_FIBERHOME),device-fiberhome) $(if $(CONFIG_FTTR_DEVICE_REALTEK),device-realtek) $(if $(CONFIG_FTTR_ACS),acs) $(if $(CONFIG_FTTR_MQTT),mqtt) $(if $(and $(CONFIG_FTTR_NPU),$(or $(CONFIG_FTTR_PLATFORM_H3C_HM2004_DU),$(CONFIG_FTTR_PLATFORM_FIBERHOME_AN4475_G2))),npu) $(if $(CONFIG_FTTR_MIMALLOC),allocator-mimalloc)
 # Keep production installation independent of workspace SDK/diagnostic binaries.
 CARGO_PKG_ARGS+= --no-default-features --frozen --bin fttrd --bin fttrctl
 

@@ -18,11 +18,29 @@ pub mod mqtt;
 pub mod mqtt_identity;
 /// Optional offload API; implementations live with their hardware platform.
 pub mod npu {
-    #[cfg(not(all(feature = "npu", feature = "platform-h3c-hm2004-du")))]
+    #[cfg(not(all(
+        feature = "npu",
+        any(
+            feature = "platform-h3c-hm2004-du",
+            feature = "platform-fiberhome-an4475-g2"
+        )
+    )))]
     use crate::model::NpuStatus;
-    #[cfg(all(feature = "npu", feature = "platform-h3c-hm2004-du"))]
-    pub use crate::platform::h3c_hm2004_du::offload::*;
-    #[cfg(not(all(feature = "npu", feature = "platform-h3c-hm2004-du")))]
+    #[cfg(all(
+        feature = "npu",
+        any(
+            feature = "platform-h3c-hm2004-du",
+            feature = "platform-fiberhome-an4475-g2"
+        )
+    ))]
+    pub use crate::platform::openwrt::npu::*;
+    #[cfg(not(all(
+        feature = "npu",
+        any(
+            feature = "platform-h3c-hm2004-du",
+            feature = "platform-fiberhome-an4475-g2"
+        )
+    )))]
     pub fn status() -> NpuStatus {
         NpuStatus::default()
     }

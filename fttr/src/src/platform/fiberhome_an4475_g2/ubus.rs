@@ -128,10 +128,42 @@ impl Handlers {
         Ok(RestartReply { restarting: true })
     }
     fn npu_status(&self, _: EmptyRequest) -> Result<NpuStatus, i32> {
-        Err(4)
+        #[cfg(feature = "npu")]
+        {
+            Ok(crate::npu::status_for_platform(
+                crate::platform::adapter::PlatformId::FiberhomeAn4475G2,
+            ))
+        }
+        #[cfg(not(feature = "npu"))]
+        {
+            Err(4)
+        }
     }
-    fn npu_set(&self, _: NpuSetRequest) -> Result<NpuSetReply, i32> {
-        Err(4)
+    fn npu_set(&self, request: NpuSetRequest) -> Result<NpuSetReply, i32> {
+        #[cfg(feature = "npu")]
+        {
+            Ok(
+                match crate::npu::settings::set(
+                    request.enabled,
+                    Some(request.bridge.as_str()),
+                    Some(request.wan_upstream),
+                    Some(request.wan_downstream),
+                    Some(request.onu_bridge),
+                ) {
+                    Ok(()) => NpuSetReply::Success {
+                        enabled: request.enabled,
+                    },
+                    Err(error) => NpuSetReply::Error {
+                        error: error.to_string(),
+                    },
+                },
+            )
+        }
+        #[cfg(not(feature = "npu"))]
+        {
+            let _ = request;
+            Err(4)
+        }
     }
     fn mib_start(&self, request: MibStartRequest) -> Result<JobStartReply, i32> {
         crate::controller::ubus_mib::start(

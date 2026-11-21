@@ -8,7 +8,10 @@ use crate::platform::openwrt::command::run_sync;
 use std::{
     fs, io,
     path::Path,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Mutex,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -17,7 +20,10 @@ use std::{
 pub const NNI_MTU: u16 = 1508;
 const DEFAULT_BRIDGE: &str = "br-lan";
 const PORT_ALIAS: &str = "fttrd:fiberhome-vport";
-const COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+// Serialize all VPORT netlink/ip-link mutations so concurrent PortGate watchdogs
+// and optical quiesce do not stampede kernel rtnl_lock / synchronize_net().
+static VPORT_LOCK: Mutex<()> = Mutex::new(());
 
 pub fn gem_to_vid(gem_id: u16, offset: u16) -> io::Result<u16> {
     let vid = gem_id.checked_sub(offset).ok_or_else(|| {
@@ -81,6 +87,47 @@ fn matching_vlan_details(details: &str, vlan: &str, nni: &str, vid: u16) -> bool
     has_protocol && has_vid && parent
 }
 
+fn matching_proc_vlan(vlan: &str, iface: &str, nni: &str, vid: u16) -> bool {
+    let expected_vid = vid.to_string();
+    let has_header = vlan.lines().next().is_some_and(|line| {
+        let tokens: Vec<_> = line.split_whitespace().collect();
+        tokens.first() == Some(&iface)
+            && tokens
+                .windows(2)
+                .any(|w| w[0] == "VID:" && w[1] == expected_vid)
+    });
+    let parent = vlan
+        .lines()
+        .any(|line| line.trim() == format!("Device: {nni}"));
+    has_header && parent
+}
+
+fn verify_existing_port_fast(iface: &str, nni: &str, vid: u16) -> io::Result<()> {
+    let vlan = fs::read_to_string(format!("/proc/net/vlan/{iface}"))?;
+    let alias = fs::read_to_string(format!("/sys/class/net/{iface}/ifalias"))?;
+    if alias.trim() == PORT_ALIAS && matching_proc_vlan(&vlan, iface, nni, vid) {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("{iface} conflicts with expected {nni} VLAN {vid}"),
+        ))
+    }
+}
+
+fn is_port_flags_down(iface: &str) -> io::Result<bool> {
+    let path = format!("/sys/class/net/{iface}/flags");
+    match fs::read_to_string(path) {
+        Ok(flags) => {
+            let flags = u32::from_str_radix(flags.trim().trim_start_matches("0x"), 16)
+                .map_err(io::Error::other)?;
+            Ok(flags & 1 == 0)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error),
+    }
+}
+
 fn verify_existing_port(iface: &str, nni: &str, vid: u16) -> io::Result<()> {
     let output = run_sync("ip", &["-d", "link", "show", "dev", iface], COMMAND_TIMEOUT)?;
     let vlan = fs::read_to_string(format!("/proc/net/vlan/{iface}"))?;
@@ -106,6 +153,7 @@ fn attach_bridge(iface: &str, bridge: &str) -> io::Result<()> {
 }
 
 pub fn prepare_nni_and_ports(nni: &str, gem_offset: u16, stopping: &AtomicBool) -> io::Result<()> {
+    let _guard = VPORT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // Reject a foreign or legacy port before changing the NNI or any sibling.
     for entry in RESOURCES.allocations {
         let Some(iface) = entry.interface else {
@@ -157,13 +205,16 @@ pub fn prepare_nni_and_ports(nni: &str, gem_offset: u16, stopping: &AtomicBool) 
     Ok(())
 }
 
-pub fn set_port_up(onu_id: u8, up: bool) -> io::Result<()> {
+fn set_port_up_locked(onu_id: u8, up: bool) -> io::Result<()> {
     let iface = RESOURCES.interface(onu_id).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("ONU {onu_id} has no assigned VPORT interface"),
         )
     })?;
+    if !up && is_port_flags_down(iface)? {
+        return Ok(());
+    }
     if !Path::new(&format!("/sys/class/net/{iface}")).exists() {
         if !up {
             // No interface means no carrier. Teardown need not wait for a
@@ -176,45 +227,32 @@ pub fn set_port_up(onu_id: u8, up: bool) -> io::Result<()> {
         ));
     }
     let entry = RESOURCES.onu(onu_id)?;
-    verify_existing_port(
-        iface,
-        "fttr0",
-        gem_to_vid(
-            entry.gem_id,
-            super::initialization::defaults::DEFAULT_NNI_GEMPORT_OFFSET,
-        )?,
+    let vid = gem_to_vid(
+        entry.gem_id,
+        super::initialization::defaults::DEFAULT_NNI_GEMPORT_OFFSET,
     )?;
     if up {
+        verify_existing_port(iface, "fttr0", vid)?;
         let bridge = configured_bridge();
         attach_bridge(iface, &bridge)?;
         run_ip_link(&["set", iface, "up"])
     } else {
+        // Verify VPORT ownership via sysfs + procfs without spawning `ip -d link show`.
+        verify_existing_port_fast(iface, "fttr0", vid)?;
         run_ip_link(&["set", iface, "down"])
     }
 }
 
+pub fn set_port_up(onu_id: u8, up: bool) -> io::Result<()> {
+    let _guard = VPORT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    set_port_up_locked(onu_id, up)
+}
+
 pub fn bring_all_ports_down() -> io::Result<()> {
+    let _guard = VPORT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut errors = Vec::new();
     for entry in RESOURCES.allocations {
-        let result = (|| {
-            let iface = RESOURCES
-                .interface(entry.onu_id)
-                .ok_or_else(|| io::Error::other("missing VPORT resource"))?;
-            let path = format!("/sys/class/net/{iface}/flags");
-            match std::fs::read_to_string(path) {
-                Ok(flags) => {
-                    let flags = u32::from_str_radix(flags.trim().trim_start_matches("0x"), 16)
-                        .map_err(io::Error::other)?;
-                    if flags & 1 == 0 {
-                        return Ok(());
-                    }
-                }
-                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-                Err(error) => return Err(error),
-            }
-            set_port_up(entry.onu_id, false)
-        })();
-        if let Err(error) = result {
+        if let Err(error) = set_port_up_locked(entry.onu_id, false) {
             errors.push(format!("ONU {}: {error}", entry.onu_id));
         }
     }
@@ -271,5 +309,19 @@ mod tests {
             2
         ));
         assert!(!matching_vlan_details(details, "Device: fttr0", "fttr0", 3));
+    }
+
+    #[test]
+    fn fast_proc_vlan_verification_checks_iface_vid_and_parent() {
+        let proc_vlan = "\
+fttr1  VID: 1\t REORDER_HDR: 1  dev->priv_flags: 1021
+         total frames received        1200
+Device: fttr0
+INGRESS priority mappings: 0:0  1:0  2:0  3:0  4:0  5:0  6:0 7:0
+";
+        assert!(matching_proc_vlan(proc_vlan, "fttr1", "fttr0", 1));
+        assert!(!matching_proc_vlan(proc_vlan, "fttr2", "fttr0", 1));
+        assert!(!matching_proc_vlan(proc_vlan, "fttr1", "eth0", 1));
+        assert!(!matching_proc_vlan(proc_vlan, "fttr1", "fttr0", 2));
     }
 }

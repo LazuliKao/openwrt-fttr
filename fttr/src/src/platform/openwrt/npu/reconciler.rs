@@ -1,5 +1,6 @@
-//! HM2004-DU port masks and fw4 admission reconciliation.
+//! Platform-aware Airoha NPU/PPE admission and fw4 hook reconciliation.
 use super::command;
+use fttr_api::NpuAdmissionModel;
 use std::{
     fs, io,
     path::{Path, PathBuf},
@@ -19,9 +20,19 @@ pub struct Topology {
     pub bridge: String,
     pub routed: bool,
     pub onu_bridge: bool,
+    pub direction_mask: u8,
     pub mask: u16,
     // Includes ifindex, MTU, MAC and learning: even same-mask changes must drain.
     pub ports: Vec<(String, Vec<String>)>,
+}
+
+impl Topology {
+    pub fn target_token(&self, model: NpuAdmissionModel) -> u16 {
+        match model {
+            NpuAdmissionModel::PortMask => self.mask,
+            NpuAdmissionModel::DirectionOnly => u16::from(self.direction_mask),
+        }
+    }
 }
 
 pub(crate) fn text(path: impl AsRef<Path>) -> io::Result<String> {
@@ -87,11 +98,22 @@ impl Policy {
 }
 
 pub fn topology(policy: &Policy, net: &Path, mask: &Path) -> io::Result<Topology> {
+    topology_for_model(NpuAdmissionModel::PortMask, policy, net, mask)
+}
+
+pub fn topology_for_model(
+    model: NpuAdmissionModel,
+    policy: &Policy,
+    net: &Path,
+    gate_path: &Path,
+) -> io::Result<Topology> {
     let bridge = policy.bridge.as_str();
+    let requested_directions = policy.directions();
     let mut topology = Topology {
         bridge: bridge.into(),
-        routed: policy.directions() & 3 != 0,
-        onu_bridge: policy.directions() & 4 != 0,
+        routed: requested_directions & 3 != 0,
+        onu_bridge: requested_directions & 4 != 0,
+        direction_mask: 0,
         mask: 0,
         ports: Vec::new(),
     };
@@ -100,12 +122,17 @@ pub fn topology(policy: &Policy, net: &Path, mask: &Path) -> io::Result<Topology
         && bridge
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(&byte));
-    if !valid_bridge || policy.directions() == 0 {
+    if !valid_bridge || requested_directions == 0 || !policy.firewall_offload {
         return Ok(topology);
     }
-    if !policy.firewall_offload
-        || (topology.routed && !mask.with_file_name("routed_offload_mask").exists())
-        || (topology.onu_bridge && !mask.exists())
+    let gate_ready = match model {
+        NpuAdmissionModel::PortMask => {
+            (!topology.routed || gate_path.with_file_name("routed_offload_mask").exists())
+                && (!topology.onu_bridge || gate_path.exists())
+        }
+        NpuAdmissionModel::DirectionOnly => gate_path.exists(),
+    };
+    if !gate_ready
         || text(net.join("fttr0/carrier")).ok().as_deref() != Some("1")
         || text(net.join(bridge).join("bridge/vlan_filtering"))
             .ok()
@@ -134,6 +161,16 @@ pub fn topology(policy: &Policy, net: &Path, mask: &Path) -> io::Result<Topology
     let min_ports = if topology.routed { 1 } else { 2 };
     if topology.ports.len() < min_ports {
         topology.mask = 0;
+        topology.direction_mask = 0;
+    } else {
+        let mut effective = 0u8;
+        if topology.routed {
+            effective |= requested_directions & 3;
+        }
+        if topology.onu_bridge && topology.ports.len() >= 2 {
+            effective |= 4;
+        }
+        topology.direction_mask = effective;
     }
     Ok(topology)
 }
@@ -153,7 +190,6 @@ struct PolicyCache {
     verified: Instant,
 }
 
-// Include uncommitted UCI deltas: `uci show` observes these as well as /etc/config.
 fn policy_files(config: &Path, delta: &Path) -> io::Result<Vec<Option<Vec<u8>>>> {
     [config, delta]
         .into_iter()
@@ -169,7 +205,17 @@ fn policy_files(config: &Path, delta: &Path) -> io::Result<Vec<Option<Vec<u8>>>>
 impl Reconciler {
     /// Two unchanged observations after withdrawal, also on kernel invalidation.
     pub fn observe(&mut self, topology: Topology, current: u16) -> bool {
-        if self.last.as_ref() != Some(&topology) || (self.armed && current != topology.mask) {
+        self.observe_for_model(NpuAdmissionModel::PortMask, topology, current)
+    }
+
+    pub fn observe_for_model(
+        &mut self,
+        model: NpuAdmissionModel,
+        topology: Topology,
+        current: u16,
+    ) -> bool {
+        let target = topology.target_token(model);
+        if self.last.as_ref() != Some(&topology) || (self.armed && current != target) {
             self.last = Some(topology);
             self.stable = 0;
             self.armed = false;
@@ -177,19 +223,21 @@ impl Reconciler {
             return false;
         }
         self.stable = self.stable.saturating_add(1);
-        self.last.as_ref().unwrap().mask != 0 && self.stable >= 2
+        self.last.as_ref().unwrap().target_token(model) != 0 && self.stable >= 2
     }
 
     fn can_skip(
         &self,
+        model: NpuAdmissionModel,
         topology: &Topology,
         current: u16,
         files: &[Option<Vec<u8>>],
         now: Instant,
     ) -> bool {
+        let target = topology.target_token(model);
         self.armed
             && current != 0
-            && current == topology.mask
+            && current == target
             && self.last.as_ref() == Some(topology)
             && self.cache.as_ref().is_some_and(|cache| {
                 cache.files == files && now.duration_since(cache.verified) < FULL_CHECK
@@ -222,8 +270,6 @@ pub fn hooks_ready(table: &serde_json::Value, ports: &[(String, Vec<String>)], t
                 && flow["table"] == "fw4"
                 && flow["name"] == "fb"
                 && flow["hook"] == "ingress"
-                // nft 1.1.7 omits flowtable flags from JSON listings. Only use
-                // the named flowtable's text listing when that key is absent.
                 && match flow.get("flags") {
                     Some(flags) => flags
                         .as_array()
@@ -263,25 +309,72 @@ pub fn routed_hooks_ready(table: &serde_json::Value, text: &str) -> bool {
 }
 
 pub struct Admission {
+    pub model: NpuAdmissionModel,
     pub path: PathBuf,
+    pub directions_path: PathBuf,
     pub stopped: bool,
 }
 
 impl Admission {
+    pub fn for_model(model: NpuAdmissionModel) -> Self {
+        match model {
+            NpuAdmissionModel::PortMask => Self::new(MASK),
+            NpuAdmissionModel::DirectionOnly => Self::new_direction_only(DIRECTIONS),
+        }
+    }
+
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self::new_with_directions(path, DIRECTIONS)
+    }
+
+    pub fn new_with_directions(
+        path: impl Into<PathBuf>,
+        directions_path: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            model: NpuAdmissionModel::PortMask,
+            path: path.into(),
+            directions_path: directions_path.into(),
+            stopped: false,
+        }
+    }
+
+    pub fn new_direction_only(directions_path: impl Into<PathBuf>) -> Self {
+        Self {
+            model: NpuAdmissionModel::DirectionOnly,
+            path: PathBuf::new(),
+            directions_path: directions_path.into(),
+            stopped: false,
+        }
+    }
+
+    pub fn current_directions(&self) -> io::Result<u8> {
+        match text(&self.directions_path) {
+            Ok(value) => value.parse().map_err(io::Error::other),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(0),
+            Err(error) => Err(error),
+        }
+    }
+
     pub fn set_directions(&self, mask: u8) -> io::Result<()> {
         let mask = if self.stopped { 0 } else { mask };
-        let path = Path::new(DIRECTIONS);
+        let path = self.directions_path.as_path();
         if !path.try_exists()? {
-            // Older kernels can still enforce the bridge gate through MASK.
-            // Routed rules bypass that adapter: withdraw them before reporting
-            // that independent WAN policy needs the platform patch.
-            let routed = self.path.with_file_name("routed_offload_mask");
-            if routed.try_exists()? && text(&routed)? != "0" {
-                fs::write(routed, "0\n")?;
+            if self.model == NpuAdmissionModel::PortMask {
+                let routed = self.path.with_file_name("routed_offload_mask");
+                if routed.try_exists()? && text(&routed)? != "0" {
+                    fs::write(routed, "0\n")?;
+                }
+                if mask & 3 != 0 {
+                    return Err(io::Error::other(
+                        "WAN direction policy requires Airoha patch 933",
+                    ));
+                }
+                return Ok(());
             }
-            if mask & 3 != 0 {
+            if mask != 0 {
                 return Err(io::Error::other(
-                    "WAN direction policy requires Airoha patch 933",
+                    "fttr_offload_directions sysfs parameter unavailable",
                 ));
             }
             return Ok(());
@@ -299,17 +392,14 @@ impl Admission {
     }
 
     pub fn withdraw(&mut self) -> io::Result<()> {
-        // Attempt both withdrawals even if one sysfs write fails.
-        let directions = self.set_directions(0);
-        let bridge = self.set(0);
-        let routed = self.set_routed(0);
-        directions.and(bridge).and(routed)
-    }
-
-    pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self {
-            path: path.into(),
-            stopped: false,
+        match self.model {
+            NpuAdmissionModel::DirectionOnly => self.set_directions(0),
+            NpuAdmissionModel::PortMask => {
+                let directions = self.set_directions(0);
+                let bridge = self.set(0);
+                let routed = self.set_routed(0);
+                directions.and(bridge).and(routed)
+            }
         }
     }
 
@@ -356,117 +446,22 @@ impl Admission {
     }
 }
 
-/// Reconcile NPU admission state.
-/// Employs a Fast-Path check against sysfs to avoid expensive `uci` and `nft` forks
-/// when the physical topology and admission state remain in steady equilibrium.
-pub async fn reconcile(
-    admission: &Mutex<Admission>,
-    state: &mut Reconciler,
-) -> io::Result<Duration> {
-    let net = Path::new(NET);
-    let mask_path = Path::new(MASK);
-    let routed = state
-        .cache
-        .as_ref()
-        .is_some_and(|cache| cache.policy.directions() & 3 != 0);
-    let onu_bridge = state
-        .cache
-        .as_ref()
-        .is_some_and(|cache| cache.policy.directions() & 4 != 0);
-    let current_mask = {
-        let adm = admission.lock().unwrap();
-        let r = if routed { adm.current_mode(true)? } else { 0 };
-        let b = if onu_bridge {
-            adm.current_mode(false)?
-        } else {
-            0
-        };
-        r | b
-    };
-    let files = policy_files(Path::new("/etc/config"), Path::new("/tmp/.uci"))?;
-
-    // Fast-path: When already armed and the driver hasn't revoked the mask,
-    // verify the physical link status before spawning any external processes.
-    if let Some(cache) = &state.cache {
-        let policy = if cache.files == files {
-            cache.policy.directions()
-        } else {
-            0
-        };
-        admission.lock().unwrap().set_directions(policy)?;
-        // Reuse the complete topology predicate, including new ports, master,
-        // forwarding state and identity. Missing sysfs data is never healthy.
-        let live = topology(&cache.policy, net, mask_path)?;
-        if state.can_skip(&live, current_mask, &files, Instant::now()) {
-            return Ok(POLL_STEADY);
-        }
-        if state.armed
-            && (state.last.as_ref() != Some(&live)
-                || current_mask != live.mask
-                || cache.files != files)
-        {
-            // Withdraw before waiting on UCI/nft when a known prerequisite changed.
-            admission.lock().unwrap().withdraw()?;
+fn current_token(adm: &Admission, routed: bool, onu_bridge: bool) -> io::Result<u16> {
+    match adm.model {
+        NpuAdmissionModel::DirectionOnly => Ok(u16::from(adm.current_directions()?)),
+        NpuAdmissionModel::PortMask => {
+            let r = if routed { adm.current_mode(true)? } else { 0 };
+            let b = if onu_bridge {
+                adm.current_mode(false)?
+            } else {
+                0
+            };
+            Ok(r | b)
         }
     }
+}
 
-    // Slow-path: Inspect configuration and topology via native UCI
-    let policy = Policy::load()?;
-    if policy_files(Path::new("/etc/config"), Path::new("/tmp/.uci"))? != files {
-        admission.lock().unwrap().withdraw()?;
-        *state = Reconciler::default();
-        return Ok(POLL_FAST);
-    }
-    let topology = topology(&policy, net, mask_path)?;
-    {
-        let mut adm = admission.lock().unwrap();
-        if !topology.routed {
-            adm.set_routed(0)?;
-        }
-        if !topology.onu_bridge {
-            adm.set(0)?;
-        }
-        adm.set_directions(policy.directions())?;
-    }
-    // Timestamp is refreshed only after hooks pass, never by a cheap probe.
-    let verified = state
-        .cache
-        .as_ref()
-        .map(|cache| cache.verified)
-        .unwrap_or_else(Instant::now);
-    state.cache = Some(PolicyCache {
-        policy,
-        files,
-        verified,
-    });
-    let current = {
-        let adm = admission.lock().unwrap();
-        let r = if topology.routed {
-            adm.current_mode(true)?
-        } else {
-            0
-        };
-        let b = if topology.onu_bridge {
-            adm.current_mode(false)?
-        } else {
-            0
-        };
-        r | b
-    };
-
-    if !state.observe(topology.clone(), current) {
-        let mut adm = admission.lock().unwrap();
-        if topology.routed {
-            adm.set_routed(0)?;
-        }
-        if topology.onu_bridge {
-            adm.set(0)?;
-        }
-        return Ok(POLL_FAST);
-    }
-
-    let topology = state.last.as_ref().unwrap();
-
+async fn check_nft_flowtables(topology: &Topology) -> bool {
     let mut ready = true;
     if topology.routed {
         let json_table = command::run_async(
@@ -541,15 +536,121 @@ pub async fn reconcile(
             ready = false;
         }
     }
+    ready
+}
 
-    if !ready {
+/// Reconcile NPU admission state for either `PortMask` (HM2004-DU) or `DirectionOnly` (AN4475-G2).
+pub async fn reconcile(
+    admission: &Mutex<Admission>,
+    state: &mut Reconciler,
+) -> io::Result<Duration> {
+    let net = Path::new(NET);
+    let (model, gate_path) = {
+        let adm = admission.lock().unwrap();
+        let gate = match adm.model {
+            NpuAdmissionModel::PortMask => adm.path.clone(),
+            NpuAdmissionModel::DirectionOnly => adm.directions_path.clone(),
+        };
+        (adm.model, gate)
+    };
+    let cached_routed = state
+        .cache
+        .as_ref()
+        .is_some_and(|cache| cache.policy.directions() & 3 != 0);
+    let cached_bridge = state
+        .cache
+        .as_ref()
+        .is_some_and(|cache| cache.policy.directions() & 4 != 0);
+    let current_mask = {
+        let adm = admission.lock().unwrap();
+        current_token(&adm, cached_routed, cached_bridge)?
+    };
+    let files = policy_files(Path::new("/etc/config"), Path::new("/tmp/.uci"))?;
+
+    if let Some(cache) = &state.cache {
+        if model == NpuAdmissionModel::PortMask {
+            let policy_dirs = if cache.files == files {
+                cache.policy.directions()
+            } else {
+                0
+            };
+            admission.lock().unwrap().set_directions(policy_dirs)?;
+        }
+        let live = topology_for_model(model, &cache.policy, net, &gate_path)?;
+        if state.can_skip(model, &live, current_mask, &files, Instant::now()) {
+            return Ok(POLL_STEADY);
+        }
+        if state.armed
+            && (state.last.as_ref() != Some(&live)
+                || current_mask != live.target_token(model)
+                || cache.files != files)
+        {
+            admission.lock().unwrap().withdraw()?;
+        }
+    }
+
+    let policy = Policy::load()?;
+    if policy_files(Path::new("/etc/config"), Path::new("/tmp/.uci"))? != files {
+        admission.lock().unwrap().withdraw()?;
+        *state = Reconciler::default();
+        return Ok(POLL_FAST);
+    }
+    let topology = topology_for_model(model, &policy, net, &gate_path)?;
+    if model == NpuAdmissionModel::PortMask {
+        let mut adm = admission.lock().unwrap();
+        if !topology.routed {
+            adm.set_routed(0)?;
+        }
+        if !topology.onu_bridge {
+            adm.set(0)?;
+        }
+        adm.set_directions(policy.directions())?;
+    }
+    let verified = state
+        .cache
+        .as_ref()
+        .map(|cache| cache.verified)
+        .unwrap_or_else(Instant::now);
+    state.cache = Some(PolicyCache {
+        policy,
+        files,
+        verified,
+    });
+    let current = {
+        let adm = admission.lock().unwrap();
+        current_token(&adm, topology.routed, topology.onu_bridge)?
+    };
+
+    if !state.observe_for_model(model, topology.clone(), current) {
+        let mut adm = admission.lock().unwrap();
+        match model {
+            NpuAdmissionModel::DirectionOnly => adm.withdraw()?,
+            NpuAdmissionModel::PortMask => {
+                if topology.routed {
+                    adm.set_routed(0)?;
+                }
+                if topology.onu_bridge {
+                    adm.set(0)?;
+                }
+            }
+        }
+        return Ok(POLL_FAST);
+    }
+
+    let topology = state.last.as_ref().unwrap();
+    if !check_nft_flowtables(topology).await {
         {
             let mut adm = admission.lock().unwrap();
-            if topology.routed {
-                adm.set_routed(0)?;
-            }
-            if topology.onu_bridge {
-                adm.set(0)?;
+            match model {
+                NpuAdmissionModel::DirectionOnly => adm.withdraw()?,
+                NpuAdmissionModel::PortMask => {
+                    if topology.routed {
+                        adm.set_routed(0)?;
+                    }
+                    if topology.onu_bridge {
+                        adm.set(0)?;
+                    }
+                }
             }
         }
         state.armed = false;
@@ -570,20 +671,10 @@ pub async fn reconcile(
     let cache = state.cache.as_ref().unwrap();
     let current_check = {
         let adm = admission.lock().unwrap();
-        let r = if topology.routed {
-            adm.current_mode(true)?
-        } else {
-            0
-        };
-        let b = if topology.onu_bridge {
-            adm.current_mode(false)?
-        } else {
-            0
-        };
-        r | b
+        current_token(&adm, topology.routed, topology.onu_bridge)?
     };
     if policy_files(Path::new("/etc/config"), Path::new("/tmp/.uci"))? != cache.files
-        || self::topology(&cache.policy, net, mask_path)? != *topology
+        || topology_for_model(model, &cache.policy, net, &gate_path)? != *topology
         || current_check != current
     {
         admission.lock().unwrap().withdraw()?;
@@ -594,11 +685,18 @@ pub async fn reconcile(
     }
     {
         let mut adm = admission.lock().unwrap();
-        if topology.routed {
-            adm.set_routed(topology.mask)?;
-        }
-        if topology.onu_bridge && topology.ports.len() >= 2 {
-            adm.set(topology.mask)?;
+        match model {
+            NpuAdmissionModel::DirectionOnly => {
+                adm.set_directions(topology.direction_mask)?;
+            }
+            NpuAdmissionModel::PortMask => {
+                if topology.routed {
+                    adm.set_routed(topology.mask)?;
+                }
+                if topology.onu_bridge && topology.ports.len() >= 2 {
+                    adm.set(topology.mask)?;
+                }
+            }
         }
     }
     state.armed = true;
@@ -629,6 +727,7 @@ mod tests {
             bridge: "br-lan".into(),
             routed: false,
             onu_bridge: true,
+            direction_mask: 4,
             mask: 3,
             ports: vec![
                 ("fttr1".into(), vec![identity.into()]),
@@ -659,6 +758,31 @@ mod tests {
     }
 
     #[test]
+    fn direction_only_reconciler_settles_and_detects_kernel_revocation() {
+        let mut state = Reconciler::default();
+        let topo = Topology {
+            bridge: "br-lan".into(),
+            routed: true,
+            onu_bridge: true,
+            direction_mask: 7,
+            mask: 3,
+            ports: vec![
+                ("fttr1".into(), vec!["11".into()]),
+                ("fttr2".into(), vec!["12".into()]),
+            ],
+        };
+        assert!(!state.observe_for_model(NpuAdmissionModel::DirectionOnly, topo.clone(), 0));
+        assert!(!state.observe_for_model(NpuAdmissionModel::DirectionOnly, topo.clone(), 0));
+        assert!(state.observe_for_model(NpuAdmissionModel::DirectionOnly, topo.clone(), 0));
+        state.armed = true;
+        assert!(!state.observe_for_model(NpuAdmissionModel::DirectionOnly, topo.clone(), 0));
+        assert!(!state.observe_for_model(NpuAdmissionModel::DirectionOnly, topo.clone(), 0));
+        assert!(state.observe_for_model(NpuAdmissionModel::DirectionOnly, topo.clone(), 0));
+        state.armed = true;
+        assert!(!state.observe_for_model(NpuAdmissionModel::DirectionOnly, topo, 3));
+    }
+
+    #[test]
     fn steady_cache_requires_full_topology_policy_mask_and_periodic_hook_checks() {
         let now = Instant::now();
         let files = vec![Some(b"enabled".to_vec())];
@@ -672,17 +796,23 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert!(state.can_skip(&pair("old"), 3, &files, now));
+        assert!(state.can_skip(NpuAdmissionModel::PortMask, &pair("old"), 3, &files, now));
         for mask in [0, 1, 7] {
-            assert!(!state.can_skip(&pair("old"), mask, &files, now));
+            assert!(!state.can_skip(NpuAdmissionModel::PortMask, &pair("old"), mask, &files, now));
         }
-        assert!(!state.can_skip(&pair("new"), 3, &files, now));
+        assert!(!state.can_skip(NpuAdmissionModel::PortMask, &pair("new"), 3, &files, now));
         let mut added = pair("old");
         added.mask = 7;
         added.ports.push(("fttr3".into(), vec![]));
-        assert!(!state.can_skip(&added, 3, &files, now));
-        assert!(!state.can_skip(&pair("old"), 3, &[None], now));
-        assert!(!state.can_skip(&pair("old"), 3, &files, now + FULL_CHECK));
+        assert!(!state.can_skip(NpuAdmissionModel::PortMask, &added, 3, &files, now));
+        assert!(!state.can_skip(NpuAdmissionModel::PortMask, &pair("old"), 3, &[None], now));
+        assert!(!state.can_skip(
+            NpuAdmissionModel::PortMask,
+            &pair("old"),
+            3,
+            &files,
+            now + FULL_CHECK
+        ));
     }
 
     #[test]
@@ -758,9 +888,11 @@ mod tests {
     }
 
     #[test]
-    fn discovery_respects_policy_topology_and_defaults_without_persisted_onu_ids() {
+    fn discovery_respects_policy_topology_and_direction_only_thresholds() {
         let root = std::env::temp_dir().join(format!("fttr-npu-topology-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
         let mask = root.join("mask");
+        let directions = root.join("fttr_offload_directions");
         for (name, value) in [
             ("fttr0/carrier", "1"),
             ("br-lan/bridge/vlan_filtering", "0"),
@@ -788,12 +920,51 @@ mod tests {
             let _ = fs::write(root.join(port).join("master"), "../br-lan");
         }
         fs::write(&mask, "0").unwrap();
+        fs::write(&directions, "0").unwrap();
         let policy = Policy {
             firewall_offload: true,
             ..Default::default()
         };
         let discover = |policy: &Policy| topology(policy, &root, &mask).unwrap().mask;
         assert_eq!(discover(&policy), 3);
+
+        // DirectionOnly: 2 ports with all directions requested => direction_mask 7.
+        let all_policy = Policy {
+            firewall_offload: true,
+            wan_upstream: true,
+            wan_downstream: true,
+            onu_bridge: true,
+            ..Default::default()
+        };
+        let d2 = topology_for_model(
+            NpuAdmissionModel::DirectionOnly,
+            &all_policy,
+            &root,
+            &directions,
+        )
+        .unwrap();
+        assert_eq!(d2.direction_mask, 7);
+
+        // With only 1 port forwarding, routed bits (3) remain admissible while onu_bridge bit (4) is withheld.
+        fs::write(root.join("fttr2/brport/state"), "2").unwrap();
+        let d1 = topology_for_model(
+            NpuAdmissionModel::DirectionOnly,
+            &all_policy,
+            &root,
+            &directions,
+        )
+        .unwrap();
+        assert_eq!(d1.direction_mask, 3);
+        let bridge_only = topology_for_model(
+            NpuAdmissionModel::DirectionOnly,
+            &policy,
+            &root,
+            &directions,
+        )
+        .unwrap();
+        assert_eq!(bridge_only.direction_mask, 0);
+        fs::write(root.join("fttr2/brport/state"), "3").unwrap();
+
         let before = topology(&policy, &root, &mask).unwrap();
         fs::write(root.join("fttr1/mtu"), "1400").unwrap();
         let after = topology(&policy, &root, &mask).unwrap();
@@ -816,12 +987,6 @@ mod tests {
         );
         assert_eq!(discover(&Policy::default()), 0);
         fs::write(root.join("br-lan/bridge/vlan_filtering"), "1").unwrap();
-        assert_eq!(discover(&policy), 0);
-        fs::write(root.join("br-lan/bridge/vlan_filtering"), "0").unwrap();
-        fs::write(root.join("fttr2/brport/state"), "2").unwrap();
-        assert_eq!(discover(&policy), 0);
-        fs::write(root.join("fttr2/brport/state"), "3").unwrap();
-        fs::remove_file(root.join("br-lan/bridge/vlan_filtering")).unwrap();
         assert_eq!(discover(&policy), 0);
         fs::write(root.join("br-lan/bridge/vlan_filtering"), "0").unwrap();
         fs::write(root.join("fttr0/carrier"), "0").unwrap();

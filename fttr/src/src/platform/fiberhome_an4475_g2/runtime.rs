@@ -542,6 +542,8 @@ struct RuntimeOptics<'a> {
     services: &'a mut service::Services,
     engine: &'a Mutex<PonEngine>,
     stopping: &'a AtomicBool,
+    #[cfg(feature = "npu")]
+    npu: Option<&'a crate::npu::ServiceHandle>,
 }
 
 fn calibration_checkpoint(stopping: &AtomicBool, deadline: Instant) -> io::Result<()> {
@@ -616,6 +618,10 @@ impl OpticalBackend for RuntimeOptics<'_> {
         runtime_state()
             .cleanup_pending
             .store(true, Ordering::Release);
+        #[cfg(feature = "npu")]
+        if let Some(npu) = self.npu {
+            npu.withdraw();
+        }
         self.services.stop_all();
         let mut errors = Vec::new();
         // Software activation evidence must be withdrawn even if SPI inventory
@@ -837,7 +843,18 @@ pub(crate) fn status_snapshot(
                 })
                 .collect(),
             },
-            npu: None,
+            npu: {
+                #[cfg(feature = "npu")]
+                {
+                    Some(crate::npu::status_for_platform(
+                        crate::platform::adapter::PlatformId::FiberhomeAn4475G2,
+                    ))
+                }
+                #[cfg(not(feature = "npu"))]
+                {
+                    None
+                }
+            },
         },
     ))
 }
@@ -1056,7 +1073,7 @@ fn data_path(
             "current_bidirectional_forwarding_not_verified",
         ),
     );
-    fttr_api::DataPathStatus {
+    let mut status = fttr_api::DataPathStatus {
         interface,
         gem_ports,
         vlan_id: None,
@@ -1069,7 +1086,74 @@ fn data_path(
         forwarding_verified: None,
         offload: Default::default(),
         measurements,
+    };
+    collect_direction_offload(
+        &mut status,
+        Path::new("/sys/module/airoha_eth/parameters/fttr_offload_directions"),
+        Path::new("/sys/kernel/debug/ppe/config"),
+    );
+    status
+}
+
+fn collect_direction_offload(
+    status: &mut fttr_api::DataPathStatus,
+    directions_path: &Path,
+    ppe_path: &Path,
+) {
+    let directions = fs::read_to_string(directions_path)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u8>().ok())
+        .filter(|mask| *mask <= 7);
+    let attached = fs::read_to_string(ppe_path).ok().and_then(|raw| {
+        raw.lines().find_map(|line| match line.split_once(':') {
+            Some(("npu_attached", value)) => match value.trim() {
+                "0" => Some(false),
+                "1" => Some(true),
+                _ => None,
+            },
+            _ => None,
+        })
+    });
+    status.offload.routed_enabled = directions.map(|mask| mask & 3 != 0);
+    status.offload.bridge_enabled = directions.map(|mask| mask & 4 != 0);
+    status.offload.enabled = directions.map(|mask| mask != 0);
+    status.offload.engine_attached = attached;
+    for (field, value, path) in [
+        (
+            "offload_routed_enabled",
+            status.offload.routed_enabled,
+            directions_path,
+        ),
+        (
+            "offload_bridge_enabled",
+            status.offload.bridge_enabled,
+            directions_path,
+        ),
+        ("offload_engine_attached", attached, ppe_path),
+    ] {
+        let evidence = match value {
+            Some(value) => fttr_api::MeasurementEvidence::observed(
+                path.display().to_string(),
+                "boolean",
+                value.to_string(),
+            ),
+            None => fttr_api::MeasurementEvidence::unavailable(
+                path.display().to_string(),
+                "boolean",
+                "unreadable_or_invalid_offload_state",
+            ),
+        };
+        status.measurements.insert(field.into(), evidence);
     }
+    status.offload.forwarding_verified = None;
+    status.measurements.insert(
+        "offload_forwarding_proof".into(),
+        fttr_api::MeasurementEvidence::unavailable(
+            "per-flow PPE hardware hit evidence",
+            "forwarding_proof",
+            "not_verified; direction_gate_and_engine_attachment_do_not_prove_per_onu_hardware_forwarding",
+        ),
+    );
 }
 
 fn ipc_handler(
@@ -1279,7 +1363,13 @@ async fn run_async(platform: PlatformContext) {
         eprintln!("[-] Optical ownership failed: {error}");
         std::process::exit(1);
     });
+    #[cfg(feature = "npu")]
+    let npu = crate::npu::Service::start(platform);
+    #[cfg(feature = "npu")]
+    let npu_handle = npu.handle();
     let lifetime = lifetime::Lifetime::start().await.unwrap_or_else(|error| {
+        #[cfg(feature = "npu")]
+        npu.stop();
         eprintln!("[-] MQTT startup failed: {error}");
         std::process::exit(1);
     });
@@ -1371,6 +1461,8 @@ async fn run_async(platform: PlatformContext) {
                         services: &mut services,
                         engine: &pon_engine_loop,
                         stopping: &stopping_loop,
+                        #[cfg(feature = "npu")]
+                        npu: Some(&npu_handle),
                     };
                     let response = optics.handle(OpticalCommand::Shutdown, &mut backend);
                     ready_loop.store(false, Ordering::Release);
@@ -1385,6 +1477,8 @@ async fn run_async(platform: PlatformContext) {
                         services: &mut services,
                         engine: &pon_engine_loop,
                         stopping: &stopping_loop,
+                        #[cfg(feature = "npu")]
+                        npu: Some(&npu_handle),
                     };
                     for request in optical_receiver.try_iter().take(2) {
                         let response = optics.dispatch(&request, &mut backend, &stopping_loop);
@@ -1684,6 +1778,8 @@ async fn run_async(platform: PlatformContext) {
                     services: &mut services,
                     engine: &pon_engine_loop,
                     stopping: &stopping_loop,
+                    #[cfg(feature = "npu")]
+                    npu: Some(&npu_handle),
                 };
                 let mut handled_shutdown = false;
                 for request in optical_receiver.try_iter() {
@@ -1723,6 +1819,8 @@ async fn run_async(platform: PlatformContext) {
     };
     #[cfg(feature = "acs")]
     crate::acs::shutdown();
+    #[cfg(feature = "npu")]
+    npu.stop();
     crate::runtime::request_stop();
     let optical =
         crate::runtime::spawn_blocking(move || shutdown_client.request(OpticalCommand::Shutdown));

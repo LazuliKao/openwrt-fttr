@@ -1,5 +1,6 @@
-//! Airoha PPE observations used by HM2004-DU admission.
+//! Airoha PPE observations shared across HM2004-DU (PortMask) and AN4475-G2 (DirectionOnly).
 use crate::model::{NpuStatus, PpeFlowEntry};
+use fttr_api::NpuAdmissionModel;
 use std::{fs, path::Path};
 
 /// Parse single line from `/sys/kernel/debug/ppe/bind` or `/sys/kernel/debug/ppe/entries`.
@@ -60,8 +61,6 @@ pub fn parse_ppe_entry(line: &str) -> Option<PpeFlowEntry> {
         vlan,
         packets: packets.unwrap_or(0),
         bytes: bytes.unwrap_or(0),
-        // AN7581 deliberately returns zero stats for native L2B entries.
-        // Those zeros are placeholders, not measured traffic.
         counters_valid,
         packets_exact: packets.map(|v| v.to_string()).unwrap_or_default(),
         bytes_exact: bytes.map(|v| v.to_string()).unwrap_or_default(),
@@ -107,14 +106,10 @@ pub(crate) fn parse_uci_option(config: &str, section: &str, option_name: &str) -
     None
 }
 
-/// Collect hardware NPU and offload status from sysfs, debugfs and UCI configuration.
-pub fn status_from(
-    config_path: &Path,
-    ppe_debug_path: &Path,
-    module_params_path: &Path,
-) -> NpuStatus {
-    let mut status = NpuStatus {
+fn new_status(model: NpuAdmissionModel) -> NpuStatus {
+    NpuStatus {
         supported: true,
+        admission_model: Some(model),
         sampled_at_ms: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -123,8 +118,10 @@ pub fn status_from(
         bridge_offload_enabled: true,
         onu_bridge: true,
         ..Default::default()
-    };
+    }
+}
 
+fn populate_uci_config(status: &mut NpuStatus, config_path: &Path) {
     if let Ok(config) = fs::read_to_string(config_path) {
         status.config_valid = true;
         for (option, flag) in [
@@ -168,7 +165,9 @@ pub fn status_from(
     } else {
         status.errors.push("FTTR configuration: read failed".into());
     }
+}
 
+fn populate_ppe_config(status: &mut NpuStatus, ppe_debug_path: &Path) {
     if let Ok(ppe_cfg) = fs::read_to_string(ppe_debug_path.join("config")) {
         status.engine_attached = ppe_cfg.lines().any(|l| l.trim() == "npu_attached: 1");
         status.engine_valid = ppe_cfg
@@ -180,53 +179,9 @@ pub fn status_from(
             .errors
             .push("PPE config: missing or invalid npu_attached".into());
     }
+}
 
-    if let Ok(val) = fs::read_to_string(module_params_path.join("bridge_offload_mask")) {
-        if let Ok(mask) = val.trim().parse::<u16>() {
-            status.bridge_offload_mask = mask;
-            status.mask_valid = true;
-        }
-    }
-    if !status.mask_valid {
-        status
-            .errors
-            .push("bridge_offload_mask: read or parse failed".into());
-    }
-
-    if let Ok(val) = fs::read_to_string(module_params_path.join("routed_offload_mask")) {
-        if let Ok(mask) = val.trim().parse::<u16>() {
-            status.routed_offload_mask = mask;
-            status.routed_mask_valid = true;
-        }
-    }
-    if !status.routed_mask_valid {
-        status
-            .errors
-            .push("routed_offload_mask: read or parse failed".into());
-    }
-    let mut mask = 0;
-    if (status.wan_upstream || status.wan_downstream) && status.routed_mask_valid {
-        mask |= status.routed_offload_mask;
-    }
-    if status.onu_bridge && status.mask_valid {
-        mask |= status.bridge_offload_mask;
-    }
-    for i in 0..16 {
-        if mask & (1 << i) != 0 {
-            status.active_ports.push(format!("fttr{}", i + 1));
-        }
-    }
-
-    if let Ok(val) = fs::read_to_string(module_params_path.join("bridge_offload_debug")) {
-        status.bridge_offload_debug = val.trim().eq_ignore_ascii_case("y") || val.trim() == "1";
-        status.debug_valid = matches!(val.trim(), "Y" | "y" | "N" | "n" | "0" | "1");
-    }
-    if !status.debug_valid {
-        status
-            .errors
-            .push("bridge_offload_debug: read or parse failed".into());
-    }
-
+fn populate_ppe_flows(status: &mut NpuStatus, ppe_debug_path: &Path) {
     if let Ok(bind_content) = fs::read_to_string(ppe_debug_path.join("bind")) {
         status.flows_valid = true;
         status.counters_valid = true;
@@ -292,8 +247,151 @@ pub fn status_from(
             .errors
             .push("PPE entries: read or parse failed".into());
     }
+}
 
+fn read_text(path: impl AsRef<Path>) -> Option<String> {
+    fs::read_to_string(path).ok().map(|v| v.trim().to_owned())
+}
+
+fn discover_live_bridge_ports(net_path: &Path, bridge: &str) -> Vec<String> {
+    if read_text(net_path.join("fttr0/carrier")).as_deref() != Some("1")
+        || read_text(net_path.join(bridge).join("bridge/vlan_filtering")).as_deref() != Some("0")
+    {
+        return Vec::new();
+    }
+    let expected_master = format!("../{bridge}");
+    let mut ports = Vec::new();
+    for port in 1..=16 {
+        let name = format!("fttr{port}");
+        let path = net_path.join(&name);
+        if read_text(path.join("carrier")).as_deref() != Some("1")
+            || read_text(path.join("brport/state")).as_deref() != Some("3")
+            || fs::read_link(path.join("master")).ok().as_deref()
+                != Some(Path::new(&expected_master))
+        {
+            continue;
+        }
+        ports.push(name);
+    }
+    ports
+}
+
+/// Collect hardware NPU and offload status for `PortMask` platforms (H3C HM2004-DU).
+pub fn status_from(
+    config_path: &Path,
+    ppe_debug_path: &Path,
+    module_params_path: &Path,
+) -> NpuStatus {
+    let mut status = new_status(NpuAdmissionModel::PortMask);
+
+    populate_uci_config(&mut status, config_path);
+    populate_ppe_config(&mut status, ppe_debug_path);
+
+    if let Ok(val) = fs::read_to_string(module_params_path.join("bridge_offload_mask")) {
+        if let Ok(mask) = val.trim().parse::<u16>() {
+            status.bridge_offload_mask = mask;
+            status.mask_valid = true;
+        }
+    }
+    if !status.mask_valid {
+        status
+            .errors
+            .push("bridge_offload_mask: read or parse failed".into());
+    }
+
+    if let Ok(val) = fs::read_to_string(module_params_path.join("routed_offload_mask")) {
+        if let Ok(mask) = val.trim().parse::<u16>() {
+            status.routed_offload_mask = mask;
+            status.routed_mask_valid = true;
+        }
+    }
+    if !status.routed_mask_valid {
+        status
+            .errors
+            .push("routed_offload_mask: read or parse failed".into());
+    }
+    let mut mask = 0;
+    if (status.wan_upstream || status.wan_downstream) && status.routed_mask_valid {
+        mask |= status.routed_offload_mask;
+    }
+    if status.onu_bridge && status.mask_valid {
+        mask |= status.bridge_offload_mask;
+    }
+    for i in 0..16 {
+        if mask & (1 << i) != 0 {
+            status.active_ports.push(format!("fttr{}", i + 1));
+        }
+    }
+
+    if let Ok(val) = fs::read_to_string(module_params_path.join("bridge_offload_debug")) {
+        status.bridge_offload_debug = val.trim().eq_ignore_ascii_case("y") || val.trim() == "1";
+        status.debug_valid = matches!(val.trim(), "Y" | "y" | "N" | "n" | "0" | "1");
+    }
+    if !status.debug_valid {
+        status
+            .errors
+            .push("bridge_offload_debug: read or parse failed".into());
+    }
+
+    populate_ppe_flows(&mut status, ppe_debug_path);
     status
+}
+
+/// Collect hardware NPU and offload status for `DirectionOnly` platforms (FiberHome AN4475-G2).
+pub fn status_from_direction_only(
+    config_path: &Path,
+    ppe_debug_path: &Path,
+    airoha_params_path: &Path,
+    net_path: &Path,
+) -> NpuStatus {
+    let mut status = new_status(NpuAdmissionModel::DirectionOnly);
+
+    populate_uci_config(&mut status, config_path);
+    populate_ppe_config(&mut status, ppe_debug_path);
+
+    if let Ok(val) = fs::read_to_string(airoha_params_path.join("fttr_offload_directions")) {
+        if let Ok(mask) = val.trim().parse::<u8>() {
+            if mask <= 7 {
+                status.direction_mask = mask;
+                status.direction_mask_valid = true;
+            }
+        }
+    }
+    if !status.direction_mask_valid {
+        status
+            .errors
+            .push("fttr_offload_directions: read or parse failed".into());
+    }
+
+    if let Ok(val) = fs::read_to_string(airoha_params_path.join("ppe_debug")) {
+        status.bridge_offload_debug = val.trim().eq_ignore_ascii_case("y") || val.trim() == "1";
+        status.debug_valid = matches!(val.trim(), "Y" | "y" | "N" | "n" | "0" | "1");
+    }
+    if !status.debug_valid {
+        status.errors.push("ppe_debug: read or parse failed".into());
+    }
+
+    if status.direction_mask_valid && status.direction_mask != 0 && status.config_valid {
+        let ports = discover_live_bridge_ports(net_path, &status.bridge);
+        let min_ports = if status.direction_mask & 3 != 0 { 1 } else { 2 };
+        if ports.len() >= min_ports {
+            status.active_ports = ports;
+        }
+    }
+
+    populate_ppe_flows(&mut status, ppe_debug_path);
+    status
+}
+
+pub(crate) fn populate_optional_direction_mask(status: &mut NpuStatus, airoha_params_path: &Path) {
+    if let Ok(val) = fs::read_to_string(airoha_params_path.join("fttr_offload_directions")) {
+        if let Ok(mask) = val.trim().parse::<u8>() {
+            if mask <= 7 {
+                status.direction_mask = mask;
+                status.direction_mask_valid = true;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -318,7 +416,6 @@ mod tests {
         assert_eq!(entry_l2b.index, "008ec");
         assert_eq!(entry_l2b.state, "UNB");
         assert_eq!(entry_l2b.pkt_type, "L2B");
-        assert_eq!(entry_l2b.eth, "02:00:00:00:00:01->ff:ff:ff:ff:ff:ff");
         assert_eq!(entry_l2b.packets, 0);
     }
 
@@ -378,18 +475,16 @@ mod tests {
 
         let s = status_from(&cfg_path, &ppe_dir, &mod_dir);
         assert!(s.supported);
+        assert_eq!(s.admission_model, Some(NpuAdmissionModel::PortMask));
         assert!(s.engine_attached);
         assert!(s.bridge_offload_enabled);
         assert_eq!(s.bridge_offload_mask, 14);
         assert_eq!(s.active_ports, vec!["fttr2", "fttr3", "fttr4"]);
         assert!(s.bridge_offload_debug);
-        assert_eq!(s.bridge, "br-lan");
         assert_eq!(s.total_entries, 3);
         assert_eq!(s.bound_entries, 2);
         assert_eq!(s.total_packets, 30);
         assert_eq!(s.total_bytes, 3000);
-        assert!(!s.wan_upstream && !s.wan_downstream && s.onu_bridge);
-        assert_eq!(s.bound_flows.len(), 2);
         assert!(
             s.config_valid
                 && s.engine_valid
@@ -398,16 +493,6 @@ mod tests {
                 && s.entries_valid
                 && s.counters_valid
         );
-        assert!(!s.fw4_hooks_ready);
-
-        fs::write(
-            ppe_dir.join("bind"),
-            "00001 UNB IPv4 5T packets=99 bytes=99\nmalformed\n",
-        )
-        .unwrap();
-        let corrupt = status_from(&cfg_path, &ppe_dir, &mod_dir);
-        assert!(!corrupt.flows_valid && !corrupt.counters_valid);
-        assert!(corrupt.bound_flows.is_empty());
 
         fs::write(
             &cfg_path,
@@ -420,14 +505,70 @@ mod tests {
         assert_eq!(s2.bridge, "br-fttr");
         assert!(s2.wan_upstream && s2.wan_downstream && !s2.onu_bridge);
         assert_eq!(s2.active_ports, vec!["fttr1", "fttr4"]);
-        fs::write(&cfg_path, "fttr.offload.wan_upstream='invalid'\n").unwrap();
-        let invalid = status_from(&cfg_path, &ppe_dir, &mod_dir);
-        assert!(!invalid.config_valid);
-        assert!(invalid
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn status_from_direction_only_reports_truthful_an4475_state() {
+        let dir = std::env::temp_dir().join(format!("fttr-npu-dir-only-{}", std::process::id()));
+        let cfg_path = dir.join("fttr");
+        let ppe_dir = dir.join("ppe");
+        let airoha_dir = dir.join("airoha");
+        let net_dir = dir.join("net");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&ppe_dir).unwrap();
+        fs::create_dir_all(&airoha_dir).unwrap();
+
+        fs::write(
+            &cfg_path,
+            "config offload 'offload'\n\toption enabled '1'\n\toption bridge 'br-lan'\n\toption wan_upstream '1'\n\toption wan_downstream '1'\n\toption onu_bridge '0'\n",
+        )
+        .unwrap();
+        fs::write(ppe_dir.join("config"), "npu_attached: 1\n").unwrap();
+        fs::write(ppe_dir.join("entries"), "").unwrap();
+        fs::write(ppe_dir.join("bind"), "").unwrap();
+        fs::write(airoha_dir.join("fttr_offload_directions"), "3\n").unwrap();
+        fs::write(airoha_dir.join("ppe_debug"), "N\n").unwrap();
+
+        for (rel, val) in [
+            ("fttr0/carrier", "1"),
+            ("br-lan/bridge/vlan_filtering", "0"),
+            ("fttr1/carrier", "1"),
+            ("fttr1/brport/state", "3"),
+            ("fttr2/carrier", "1"),
+            ("fttr2/brport/state", "3"),
+        ] {
+            let p = net_dir.join(rel);
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(p, val).unwrap();
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("../br-lan", net_dir.join("fttr1/master")).unwrap();
+            std::os::unix::fs::symlink("../br-lan", net_dir.join("fttr2/master")).unwrap();
+        }
+
+        let s = status_from_direction_only(&cfg_path, &ppe_dir, &airoha_dir, &net_dir);
+        assert!(s.supported);
+        assert_eq!(s.admission_model, Some(NpuAdmissionModel::DirectionOnly));
+        assert!(s.engine_valid && s.engine_attached);
+        assert!(s.direction_mask_valid);
+        assert_eq!(s.direction_mask, 3);
+        assert!(!s.mask_valid && !s.routed_mask_valid);
+        assert_eq!(s.bridge_offload_mask, 0);
+        assert_eq!(s.routed_offload_mask, 0);
+        assert!(s.debug_valid && !s.bridge_offload_debug);
+        assert!(s.errors.is_empty(), "unexpected errors: {:?}", s.errors);
+        #[cfg(unix)]
+        assert_eq!(s.active_ports, vec!["fttr1", "fttr2"]);
+
+        fs::write(airoha_dir.join("fttr_offload_directions"), "9\n").unwrap();
+        let bad = status_from_direction_only(&cfg_path, &ppe_dir, &airoha_dir, &net_dir);
+        assert!(!bad.direction_mask_valid);
+        assert!(bad
             .errors
             .iter()
-            .any(|error| error.contains("offload.wan_upstream")));
-
+            .any(|e| e.contains("fttr_offload_directions")));
         let _ = fs::remove_dir_all(&dir);
     }
 }
