@@ -9,29 +9,43 @@ pub(super) fn configure(session: &mut OmciSession, port: u16, alloc: u16) -> io:
     let entity = 0x200u16;
     create_verified(session, 272, 1, &me::gal(), &[1])?;
     create_verified(session, 45, entity, &me::bridge_profile(), &[1, 2, 3])?;
-    assign_tcont(session, 0x8000, alloc)?;
+    assign_tcont(session, 0x8000, alloc)
+        .inspect_err(|error| eprintln!("HWTC_TCONT_ASSIGN_FAILED instance=8000: {error}"))?;
     // Stable instances survive ONU-ID changes; queue 8000 belongs to T-CONT 8000.
     // K155 rejects GET of direction (2000). Read supported pointers separately.
     let mut ctp_readback = Vec::new();
     ctp_readback.extend(port.to_be_bytes());
     ctp_readback.extend([0x80, 0, 0x80, 0, 0, 0]);
     match session.get(268, entity, 0x8000) {
-        Ok(_) => {
-            let frame = session.get(268, entity, 0x5000)?;
+        Ok(port_frame) => {
+            let frame = session.get(268, entity, 0x5000).inspect_err(|error| {
+                eprintln!("HWTC_CTP_POINTER_GET_FAILED instance={entity:04x}: {error}")
+            })?;
             if frame.payload[3..7] != [0x80, 0, 0x80, 0] {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "existing HWTC GEM topology differs",
                 ));
             }
-            session.set_attributes(268, entity, &[(1, V::number(port.into()))])?;
-            verify(session, 268, entity, 0xd200, &ctp_readback)?;
+            if u16::from_be_bytes([port_frame.payload[3], port_frame.payload[4]]) != port {
+                session
+                    .set_attributes(268, entity, &[(1, V::number(port.into()))])
+                    .inspect_err(|error| {
+                        eprintln!("HWTC_CTP_PORT_SET_FAILED instance={entity:04x}: {error}")
+                    })?;
+            }
+            verify(session, 268, entity, 0xd200, &ctp_readback).inspect_err(|error| {
+                eprintln!("HWTC_CTP_VERIFY_FAILED instance={entity:04x}: {error}")
+            })?;
         }
         Err(e) if crate::pon_engine::omci::error::is_unknown_instance(&e) => {
             session.create_attributes(268, entity, &me::gem_ctp(port, 0x8000, 0x8000))?;
             verify(session, 268, entity, 0xd200, &ctp_readback)?;
         }
-        Err(e) => return Err(e),
+        Err(e) => {
+            eprintln!("HWTC_CTP_PORT_GET_FAILED instance={entity:04x}: {e}");
+            return Err(e);
+        }
     }
     create_verified(
         session,
