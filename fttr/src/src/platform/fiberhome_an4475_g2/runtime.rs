@@ -795,6 +795,7 @@ pub(crate) fn status_snapshot(
     let ready = optics.hardware_ready.load(Ordering::Acquire);
     let tx_enabled = with_session(|session| session.fsl_mut().is_tx_enabled()).ok();
     let calibration = super::calibration::info().application;
+    let (measurements, measurement_evidence) = super::transceiver::snapshot();
     let devices = devices.lock().map_err(|_| 9)?;
     let engine = pon_engine.lock().map_err(|_| 9)?;
     Ok(crate::platform::status::snapshot(
@@ -817,31 +818,13 @@ pub(crate) fn status_snapshot(
                 wavelength_rx_nm: 1310,
                 phy_rate_downlink_gbps: 2.488,
                 phy_rate_uplink_gbps: 1.244,
-                tx_power_dbm: None,
-                laser_bias_current_ma: None,
-                temperature_celsius: None,
-                vcc_voltage: None,
+                tx_power_dbm: measurements[3],
+                laser_bias_current_ma: measurements[2],
+                temperature_celsius: measurements[0],
+                vcc_voltage: measurements[1],
                 cdr_locked: None,
                 tx_enabled,
-                measurements: [
-                    ("temperature_celsius", "C"),
-                    ("vcc_voltage", "V"),
-                    ("laser_bias_current_ma", "mA"),
-                    ("tx_power_dbm", "dBm"),
-                    ("cdr_locked", "boolean"),
-                ]
-                .into_iter()
-                .map(|(name, unit)| {
-                    (
-                        name.into(),
-                        fttr_api::MeasurementEvidence::unavailable(
-                            "UX3326S1/FSL",
-                            unit,
-                            "diagnostic_register_and_scaling_unverified",
-                        ),
-                    )
-                })
-                .collect(),
+                measurements: measurement_evidence,
             },
             npu: {
                 #[cfg(feature = "npu")]
@@ -1450,6 +1433,7 @@ async fn run_async(platform: PlatformContext) {
             let mut observation_counts = (0usize, 0usize, 0usize, 0usize);
             let mut receive_snapshots_remaining = 3u8;
             let mut mac_poll = crate::controller::pon_mac::Poll::default();
+            let mut next_transceiver_sample = Instant::now();
 
             while !stopping_loop.load(Ordering::Acquire) {
                 if with_session(|session| Ok(session.needs_reconciliation())).unwrap_or(false) {
@@ -1492,6 +1476,10 @@ async fn run_async(platform: PlatformContext) {
                 }
                 if stopping_loop.load(Ordering::Acquire) {
                     break;
+                }
+                if ready_loop.load(Ordering::Acquire) && Instant::now() >= next_transceiver_sample {
+                    super::transceiver::refresh();
+                    next_transceiver_sample = Instant::now() + Duration::from_secs(5);
                 }
                 if !ready_loop.load(Ordering::Acquire) || optics.state != OpticalState::Enabled
                     || crate::controller::pon_mac::snapshot().tx_enabled != Some(true) {

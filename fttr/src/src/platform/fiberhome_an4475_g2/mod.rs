@@ -46,6 +46,8 @@ pub mod serdes_apb;
 #[cfg(all(test, feature = "platform-fiberhome-an4475-g2"))]
 mod test_support;
 #[cfg(feature = "platform-fiberhome-an4475-g2")]
+mod transceiver;
+#[cfg(feature = "platform-fiberhome-an4475-g2")]
 mod transport;
 #[cfg(feature = "platform-fiberhome-an4475-g2")]
 mod ubus;

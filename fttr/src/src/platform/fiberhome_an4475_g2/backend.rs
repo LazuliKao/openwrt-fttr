@@ -24,7 +24,7 @@ impl PlatformBackend for An4475G2 {
     fn operations(&self) -> fttr_api::PlatformOperations {
         fttr_api::PlatformOperations {
             optical_control: true,
-            transceiver_telemetry: false,
+            transceiver_telemetry: true,
             fpga_diagnostics: false,
             bosa_diagnostics: true,
             calibration_profile: Some(fttr_api::PlatformCalibrationProfile::Ux3326sFactory),
