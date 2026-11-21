@@ -97,3 +97,104 @@ fn rejects_corrupt_header_sizes_crc_and_payload_without_returning_data() {
         "CalibrationTable { chip_id: 38, payload_bytes: 1920, .. }"
     );
 }
+
+#[test]
+fn native_metadata_rejects_wrong_chip_and_corruption_without_exposing_payload() {
+    let wrong_chip = table_info(Ok(fixture(false)));
+    assert!(!wrong_chip.valid);
+    assert!(wrong_chip.error.unwrap().contains("discriminator mismatch"));
+    let mut bytes = fixture(false);
+    bytes[0x30] = super::super::profile::UX3326S_CHIP_ID;
+    let header_crc = crc32(&bytes[..0x7c], 0);
+    bytes[0x7c..0x80].copy_from_slice(&header_crc.to_le_bytes());
+    let metadata = table_info(Ok(bytes.clone()));
+    assert!(metadata.valid);
+    assert_eq!(metadata.chip_id, Some(0x27));
+    assert_eq!(metadata.size, 2048);
+    let json = serde_json::to_value(&metadata).unwrap();
+    assert!(json.get("data").is_none());
+    assert!(json.get("payload").is_none());
+    bytes[0x100] ^= 1;
+    let corrupt = table_info(Ok(bytes));
+    assert!(!corrupt.valid);
+    assert!(corrupt.error.unwrap().contains("payload CRC"));
+    let missing = table_info(Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        "missing source",
+    )));
+    assert!(!missing.valid);
+    assert!(missing.sha256.is_none());
+}
+
+fn native_fixture() -> Vec<u8> {
+    let mut bytes = fixture(false);
+    bytes[0x30] = super::super::profile::UX3326S_CHIP_ID;
+    let crc = crc32(&bytes[..0x7c], 0);
+    bytes[0x7c..0x80].copy_from_slice(&crc.to_le_bytes());
+    bytes
+}
+
+#[test]
+fn source_programming_and_final_cancellation_failures_invalidate_previous_success() {
+    use std::cell::Cell;
+    let state = Mutex::new(NativeCalibrationApplication::default());
+    for failure in 0..4 {
+        // Establish a real successful receipt before each failure, then ensure
+        // neither stale success nor its hash/write count survives the attempt.
+        apply_with(
+            &state,
+            || Ok(native_fixture()),
+            |_, check| check(),
+            &mut || Ok(()),
+        )
+        .unwrap();
+        assert!(state.lock().unwrap().applied);
+        let cancelled = Cell::new(false);
+        let programmed = Cell::new(false);
+        let result = apply_with(
+            &state,
+            || {
+                if failure == 0 {
+                    Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "source unavailable",
+                    ))
+                } else {
+                    Ok(if failure == 3 {
+                        fixture(false)
+                    } else {
+                        native_fixture()
+                    })
+                }
+            },
+            |_, check| {
+                programmed.set(true);
+                check()?;
+                if failure == 1 {
+                    Err(io::Error::other("I2C write failed"))
+                } else {
+                    cancelled.set(true);
+                    Ok(())
+                }
+            },
+            &mut || {
+                if cancelled.get() {
+                    Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "stopping after last write",
+                    ))
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(programmed.get(), matches!(failure, 1 | 2));
+        let receipt = state.lock().unwrap();
+        assert!(!receipt.applied);
+        assert!(receipt.sha256.is_none());
+        assert_eq!(receipt.register_writes, 0);
+        assert!(!receipt.live_signature_verified);
+        assert!(receipt.error.is_some());
+    }
+}

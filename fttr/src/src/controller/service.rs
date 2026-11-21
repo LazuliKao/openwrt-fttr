@@ -106,6 +106,13 @@ impl Services {
             }
         }
     }
+    /// Cancel workers even when the hardware ONU inventory cannot be read.
+    pub fn stop_all(&mut self) {
+        let ids: Vec<_> = self.tokens.keys().copied().collect();
+        for id in ids {
+            self.stop(id);
+        }
+    }
     pub fn refresh_auth(&mut self) {
         let stale: Vec<_> = self
             .tokens
@@ -498,5 +505,26 @@ mod tests {
                 "phase": "not_started", "generation": 0, "error": null
             })
         );
+    }
+
+    #[test]
+    fn stop_all_cancels_every_worker_without_a_hardware_inventory() {
+        let mut services = super::Services::new(
+            crate::platform::context::PlatformContext::test_context(),
+            Default::default(),
+        );
+        let tokens: Vec<_> = (0..3)
+            .map(|id| {
+                let token = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                services.tokens.insert(id, token.clone());
+                token
+            })
+            .collect();
+        services.stop_all();
+        assert!(tokens
+            .iter()
+            .all(|token| token.load(std::sync::atomic::Ordering::Acquire)));
+        assert!(services.tokens.is_empty());
+        services.stop_all();
     }
 }

@@ -1,6 +1,48 @@
 //! Desired bits are reconciled only by the PLOAM hardware owner.
 use std::sync::{Mutex, OnceLock};
 
+/// Shared owner-side completion policy; platform adapters retain register layout.
+pub(crate) fn reconcile(
+    desired: (bool, bool),
+    quiesce: impl FnOnce() -> std::io::Result<()>,
+    write: impl FnOnce(bool, bool) -> std::io::Result<crate::platform::resources::PonMacReadback>,
+) -> std::io::Result<()> {
+    let result = apply(desired, quiesce, write).and_then(|value| {
+        if value.tx_enabled != Some(desired.0) || value.fec_enabled != Some(desired.1) {
+            Err(std::io::Error::other("GPON TX/FEC readback mismatch"))
+        } else {
+            Ok(value)
+        }
+    });
+    let error = result.as_ref().err().map(ToString::to_string);
+    record(result);
+    error.map_or(Ok(()), |error| Err(std::io::Error::other(error)))
+}
+
+/// Common cadence for external configuration updates and hardware readback.
+pub(crate) struct Poll {
+    last: std::time::Instant,
+}
+impl Default for Poll {
+    fn default() -> Self {
+        Self {
+            last: std::time::Instant::now() - std::time::Duration::from_secs(2),
+        }
+    }
+}
+impl Poll {
+    pub(crate) fn due(&mut self) -> bool {
+        if self.last.elapsed() < std::time::Duration::from_secs(1) {
+            return false;
+        }
+        self.last = std::time::Instant::now();
+        if let Err(error) = crate::optical::refresh() {
+            eprintln!("[-] Optical configuration: {error}");
+        }
+        true
+    }
+}
+
 pub(crate) fn apply<T>(
     desired: (bool, bool),
     quiesce: impl FnOnce() -> std::io::Result<()>,
@@ -114,6 +156,27 @@ mod tests {
                 }
             )
             .is_ok());
+        }
+    }
+
+    #[test]
+    fn completion_rejects_unknown_or_mismatched_readback() {
+        for (tx, fec) in [
+            (None, Some(true)),
+            (Some(false), Some(true)),
+            (Some(true), None),
+            (Some(true), Some(false)),
+        ] {
+            assert!(super::reconcile(
+                (true, true),
+                || panic!("active TX must not quiesce"),
+                |_, _| Ok(crate::platform::resources::PonMacReadback {
+                    raw: None,
+                    tx_enabled: tx,
+                    fec_enabled: fec
+                })
+            )
+            .is_err());
         }
     }
 }

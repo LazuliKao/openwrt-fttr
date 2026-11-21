@@ -150,6 +150,33 @@ impl<B: Bus> Fsl<B> {
     pub fn set_fec_enabled(&mut self, enabled: bool) -> io::Result<()> {
         self.update_bit(DS_FEC_CONFIG, DS_FEC_ENABLE, enabled)
     }
+
+    pub fn pon_mac_readback(&mut self) -> io::Result<crate::platform::resources::PonMacReadback> {
+        let tx = self.read_register(OPT_CONFIG)?;
+        let fec = self.read_register(DS_FEC_CONFIG)?;
+        Ok(crate::platform::resources::PonMacReadback {
+            raw: Some(tx),
+            tx_enabled: Some(tx & TX_DISABLE == 0),
+            fec_enabled: Some(fec & DS_FEC_ENABLE != 0),
+        })
+    }
+
+    /// Never start transmission with stale FEC settings. Always try disabling TX
+    /// first on the off path, even if a subsequent FEC operation fails.
+    pub fn set_downstream(
+        &mut self,
+        tx: bool,
+        fec: bool,
+    ) -> io::Result<crate::platform::resources::PonMacReadback> {
+        if !tx {
+            self.set_tx_enabled(false)?;
+        }
+        self.set_fec_enabled(fec)?;
+        if tx {
+            self.set_tx_enabled(true)?;
+        }
+        self.pon_mac_readback()
+    }
 }
 
 #[cfg(test)]
@@ -302,5 +329,38 @@ mod tests {
             .to_string()
             .contains("readback"));
         assert_eq!(fsl.bus.messages.len(), 3);
+    }
+
+    #[test]
+    fn downstream_uses_separate_registers_and_disables_tx_before_fec_failure() {
+        use super::super::test_support::{read, write, Mock as ScriptBus, Script};
+        use std::{cell::RefCell, rc::Rc};
+        let steps = vec![
+            read(DS_FEC_CONFIG, 0xa0),
+            write(DS_FEC_CONFIG, &[0xa1]),
+            read(DS_FEC_CONFIG, 0xa1),
+            read(OPT_CONFIG, 0x90),
+            write(OPT_CONFIG, &[0x80]),
+            read(OPT_CONFIG, 0x80),
+            read(OPT_CONFIG, 0x80),
+            read(DS_FEC_CONFIG, 0xa1),
+            read(OPT_CONFIG, 0x80),
+            write(OPT_CONFIG, &[0x90]),
+            read(OPT_CONFIG, 0x90),
+            read(DS_FEC_CONFIG, 0xa1),
+        ];
+        let script = Rc::new(RefCell::new(Script {
+            steps: steps.into(),
+            fail_at: 12,
+            ..Script::default()
+        }));
+        let mut fsl = Fsl::new(ScriptBus(script.clone()));
+        let actual = fsl.set_downstream(true, true).unwrap();
+        assert_eq!(
+            (actual.tx_enabled, actual.fec_enabled, actual.raw),
+            (Some(true), Some(true), Some(0x80))
+        );
+        assert!(fsl.set_downstream(false, false).is_err());
+        assert!(script.borrow().steps.is_empty());
     }
 }

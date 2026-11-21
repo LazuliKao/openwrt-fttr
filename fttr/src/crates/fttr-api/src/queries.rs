@@ -46,6 +46,7 @@ pub struct PlatformOperations {
 #[serde(rename_all = "snake_case")]
 pub enum PlatformCalibrationProfile {
     Ux3326,
+    Ux3326sFactory,
 }
 
 #[derive(Serialize, Deserialize)]

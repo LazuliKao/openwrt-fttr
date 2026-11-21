@@ -213,7 +213,45 @@ pub struct CalibrationInfo {
 #[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
 pub enum CalibrationInfoReply {
     Info(CalibrationInfo),
+    Native(NativeCalibrationInfo),
     Error(CommandError),
+}
+
+/// AN4475-G2 factory-table calibration; never interpreted as HM2004 ADC coefficients.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
+pub struct NativeCalibrationInfo {
+    pub profile: crate::PlatformCalibrationProfile,
+    pub factory_table: NativeCalibrationTable,
+    pub application: NativeCalibrationApplication,
+    pub can_apply: bool,
+    pub can_upload: bool,
+    pub can_select: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
+pub struct NativeCalibrationTable {
+    pub source: String,
+    pub offset: u32,
+    pub size: u32,
+    pub payload_bytes: u32,
+    pub chip_id: Option<u8>,
+    pub sha256: Option<String>,
+    pub valid: bool,
+    pub error: Option<String>,
+}
+
+/// A successful checked I2C write sequence, not full register or optical-power verification.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
+pub struct NativeCalibrationApplication {
+    pub applied: bool,
+    pub sha256: Option<String>,
+    pub applied_unix: Option<u32>,
+    pub register_writes: u32,
+    pub live_signature_verified: bool,
+    pub error: Option<String>,
 }
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(untagged)]

@@ -361,6 +361,31 @@ fn optical_failed_quiesce_resets_instead_of_reenabling() {
 }
 
 #[test]
+fn optical_failed_quiesce_cannot_skip_off_or_shutdown_hardware_write() {
+    for command in [OpticalCommand::Off, OpticalCommand::Shutdown] {
+        let mut actor = OpticalActor {
+            state: OpticalState::Enabled,
+        };
+        let mut backend = TestOptics {
+            ready: true,
+            desired: true,
+            tx: true,
+            quiesce_failure: true,
+            ..Default::default()
+        };
+        let response = actor.handle(command, &mut backend);
+        assert_eq!(response["status"], "error");
+        assert_eq!(response["tx_enabled"], false);
+        assert!(
+            !backend.tx,
+            "failed carrier cleanup must not leave transmission on"
+        );
+        assert_eq!(backend.desired, matches!(command, OpticalCommand::Shutdown));
+        assert_eq!(backend.events, ["quiesce", "disable", "read"]);
+    }
+}
+
+#[test]
 fn optical_partial_enable_resets_hardware_and_expired_queue_never_saves() {
     let mut actor = OpticalActor {
         state: OpticalState::Disabled,
@@ -429,7 +454,7 @@ fn optical_failures_pause_discovery_without_false_success() {
 }
 
 #[test]
-fn optical_status_reads_hardware_instead_of_promoting_paused_actor() {
+fn optical_status_closes_unconfirmed_hardware_instead_of_promoting_paused_actor() {
     let mut actor = OpticalActor {
         state: OpticalState::Unknown,
     };
@@ -441,10 +466,11 @@ fn optical_status_reads_hardware_instead_of_promoting_paused_actor() {
 
     let response = actor.handle(OpticalCommand::Status, &mut backend);
 
-    assert_eq!(response["tx_enabled"], true);
+    assert_eq!(response["status"], "error");
+    assert_eq!(response["tx_enabled"], false);
     assert_eq!(response["actor_state"], "unknown");
     assert_eq!(response["discovery_active"], false);
-    assert_eq!(backend.events, ["read"]);
+    assert_eq!(backend.events, ["read", "disable", "read", "quiesce"]);
 }
 
 #[test]

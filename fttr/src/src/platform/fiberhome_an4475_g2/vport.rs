@@ -193,9 +193,35 @@ pub fn set_port_up(onu_id: u8, up: bool) -> io::Result<()> {
     }
 }
 
-pub fn bring_all_ports_down() {
+pub fn bring_all_ports_down() -> io::Result<()> {
+    let mut errors = Vec::new();
     for entry in RESOURCES.allocations {
-        let _ = set_port_up(entry.onu_id, false);
+        let result = (|| {
+            let iface = RESOURCES
+                .interface(entry.onu_id)
+                .ok_or_else(|| io::Error::other("missing VPORT resource"))?;
+            let path = format!("/sys/class/net/{iface}/flags");
+            match std::fs::read_to_string(path) {
+                Ok(flags) => {
+                    let flags = u32::from_str_radix(flags.trim().trim_start_matches("0x"), 16)
+                        .map_err(io::Error::other)?;
+                    if flags & 1 == 0 {
+                        return Ok(());
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => return Err(error),
+            }
+            set_port_up(entry.onu_id, false)
+        })();
+        if let Err(error) = result {
+            errors.push(format!("ONU {}: {error}", entry.onu_id));
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(io::Error::other(errors.join("; ")))
     }
 }
 

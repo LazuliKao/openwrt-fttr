@@ -4,7 +4,6 @@ use super::{
         assign_alloc_id_ploam, configure_gem_port, set_gem_wmci_aes, PLOAM_MSG_ACK,
         PLOAM_MSG_ASSIGN_ALLOC_ID, PLOAM_MSG_BER_INTERVAL,
     },
-    diagnostics::FslDiagnostics,
     gdba::{alloc_to_tcont, GdbaAllocConfig},
     olt::{FslOltSession, OltSessionConfig, OnuState as FslOnuState, OnuUpstreamRate},
     transport::Device,
@@ -18,7 +17,6 @@ use crate::{
     },
     ipc::{self, SubDevice},
     platform::{
-        backend::PlatformDiagnostics,
         context::{ChannelGuard, ManagementLease, PlatformContext},
         openwrt::network,
     },
@@ -44,8 +42,6 @@ use std::{
 };
 
 const FSL_DEVICE_PATH: &str = "/dev/fsl-1fbd4000.fsl";
-const BOSA_CAL_SOURCE: &str = "/dev/ubi0_3";
-const BOSA_CAL_OFFSET: u64 = 0x1a_5000;
 const NNI_INTERFACE: &str = "fttr0";
 const SERIAL_NUMBER_ONU_MSG_ID: u8 = 1;
 const PLOAM_MSG_DYING_GASP: u8 = 3;
@@ -101,6 +97,10 @@ fn log_receive_path_snapshot(session: &mut FslOltSession<Device>) -> io::Result<
 struct FslRuntimeState {
     session: Mutex<Option<FslOltSession<Device>>>,
     omci_rx: Mutex<BTreeMap<u8, VecDeque<BaselineFrame>>>,
+    // FSL has no independently verified BOSA RESET_N control. This is the
+    // owner's committed master state; physical emission is reported by pon_mac.
+    master_enabled: AtomicBool,
+    cleanup_pending: AtomicBool,
 }
 
 static RUNTIME: OnceLock<FslRuntimeState> = OnceLock::new();
@@ -109,6 +109,8 @@ fn runtime_state() -> &'static FslRuntimeState {
     RUNTIME.get_or_init(|| FslRuntimeState {
         session: Mutex::new(None),
         omci_rx: Mutex::new(BTreeMap::new()),
+        master_enabled: AtomicBool::new(false),
+        cleanup_pending: AtomicBool::new(false),
     })
 }
 
@@ -139,6 +141,43 @@ impl FslOmciTransport {
             deadline: None,
             request: None,
         }
+    }
+}
+
+// A poll slice may expire after the irreversible submit write. Finish observing
+// that single handshake under a separate small budget, without replaying it.
+// Kernel I/O itself remains non-interruptible; the independent port gate still
+// enforces liveness while the owner is blocked.
+struct OmciSendCheckpoint {
+    preparation: Option<Instant>,
+    completion: Option<Instant>,
+}
+
+impl OmciSendCheckpoint {
+    fn check(&mut self, phase: super::downstream::TxPhase, delay: Duration) -> io::Result<()> {
+        let deadline = match phase {
+            super::downstream::TxPhase::Preparing => self.preparation,
+            super::downstream::TxPhase::Completing => Some(
+                *self
+                    .completion
+                    .get_or_insert_with(|| Instant::now() + Duration::from_millis(50)),
+            ),
+        };
+        let check = || {
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("FSL OMCI {phase:?} deadline exceeded"),
+                ))
+            } else {
+                Ok(())
+            }
+        };
+        check()?;
+        if !delay.is_zero() {
+            thread::sleep(delay);
+        }
+        check()
     }
 }
 
@@ -193,19 +232,22 @@ impl OmciTransport for FslOmciTransport {
                 "FSL runtime session is not initialized",
             )
         })?;
-        session.send_omci(self.onu_id, &bytes, &mut |_| {
-            if self
-                .deadline
-                .is_some_and(|deadline| Instant::now() >= deadline)
-            {
-                Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "FSL send deadline exceeded",
-                ))
-            } else {
-                Ok(())
+        let mut checkpoint = OmciSendCheckpoint {
+            preparation: self.deadline,
+            completion: None,
+        };
+        let result = session.send_omci_with_phases(self.onu_id, &bytes, &mut |phase, delay| {
+            checkpoint.check(phase, delay)
+        });
+        if let Err(error) = &result {
+            if session.needs_reconciliation() {
+                eprintln!(
+                    "[-] FSL OMCI send for ONU {} requires reconciliation: {error}",
+                    self.onu_id
+                );
             }
-        })?;
+        }
+        result?;
         self.request = Some(*frame);
         Ok(())
     }
@@ -240,6 +282,43 @@ fn queue_omci_response(queue: &mut VecDeque<BaselineFrame>, frame: BaselineFrame
 #[cfg(test)]
 mod omci_response_tests {
     use super::*;
+
+    #[test]
+    fn submitted_handshake_has_a_bounded_completion_budget_independent_of_poll_slice() {
+        use super::super::downstream::TxPhase;
+        let past = Instant::now() - Duration::from_millis(1);
+        let mut checkpoint = OmciSendCheckpoint {
+            preparation: Some(past),
+            completion: None,
+        };
+        assert_eq!(
+            checkpoint
+                .check(TxPhase::Preparing, Duration::ZERO)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+        checkpoint
+            .check(TxPhase::Completing, Duration::ZERO)
+            .unwrap();
+        let completion = checkpoint.completion.unwrap();
+        checkpoint
+            .check(TxPhase::Completing, Duration::ZERO)
+            .unwrap();
+        assert_eq!(
+            checkpoint.completion,
+            Some(completion),
+            "polls cannot extend the completion deadline"
+        );
+        checkpoint.completion = Some(past);
+        assert_eq!(
+            checkpoint
+                .check(TxPhase::Completing, Duration::ZERO)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+    }
 
     #[test]
     fn liveness_get_preserves_late_upload_reply() {
@@ -462,17 +541,37 @@ struct RuntimeOptics<'a> {
     ready: bool,
     services: &'a mut service::Services,
     engine: &'a Mutex<PonEngine>,
+    stopping: &'a AtomicBool,
+}
+
+fn calibration_checkpoint(stopping: &AtomicBool, deadline: Instant) -> io::Result<()> {
+    if stopping.load(Ordering::Acquire) {
+        Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "controller is stopping",
+        ))
+    } else if Instant::now() >= deadline {
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "calibration programming deadline",
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 impl OpticalBackend for RuntimeOptics<'_> {
     fn validate_calibration(&self) -> io::Result<()> {
-        let mut file = fs::File::open(BOSA_CAL_SOURCE)?;
-        use std::io::{Read, Seek, SeekFrom};
-        file.seek(SeekFrom::Start(BOSA_CAL_OFFSET))?;
-        let mut raw = [0u8; super::calibration::TABLE_BYTES];
-        file.read_exact(&mut raw)?;
-        let table = super::calibration::CalibrationTable::parse(&raw)?;
-        table.require_chip(super::profile::UX3326S_CHIP_ID)
+        super::calibration::load_factory().map(|_| ())
+    }
+
+    fn apply_calibration(&mut self) -> io::Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        super::calibration::apply_factory(|| calibration_checkpoint(self.stopping, deadline))
+    }
+
+    fn calibration_requires_disabled_tx(&self) -> bool {
+        true
     }
 
     fn save_settings(&mut self, settings: fttr_api::OpticalSettings) -> io::Result<()> {
@@ -480,7 +579,29 @@ impl OpticalBackend for RuntimeOptics<'_> {
     }
 
     fn mac_tx_allowed(&self) -> bool {
-        true
+        crate::controller::pon_mac::snapshot().tx_enabled == Some(true)
+    }
+
+    fn reconcile_controls(&mut self, master_enabled: bool) -> io::Result<()> {
+        let settings = crate::optical::settings();
+        let requested =
+            master_enabled && settings.enabled && !self.stopping.load(Ordering::Acquire);
+        let calibrated = !requested || super::calibration::info().application.applied;
+        let enabled = requested && calibrated;
+        crate::controller::pon_mac::reconcile(
+            (
+                enabled && settings.downstream_tx_enabled,
+                enabled && settings.fec_enabled,
+            ),
+            || self.quiesce(),
+            |tx, fec| with_session(|session| session.fsl_mut().set_downstream(tx, fec)),
+        )?;
+        if !calibrated {
+            return Err(io::Error::other(
+                "factory calibration must be successfully applied before enabling downstream",
+            ));
+        }
+        Ok(())
     }
 
     fn ready(&self) -> bool {
@@ -488,33 +609,95 @@ impl OpticalBackend for RuntimeOptics<'_> {
     }
 
     fn cleanup_pending(&self) -> bool {
-        false
+        runtime_state().cleanup_pending.load(Ordering::Acquire)
     }
 
     fn quiesce(&mut self) -> io::Result<()> {
-        let active: Vec<u8> =
-            with_session(|session| Ok(session.active_onus().map(|onu| onu.onu_id).collect()))
-                .unwrap_or_default();
-        for id in active {
-            self.services.stop(id);
-            if let Ok(mut engine) = self.engine.lock() {
-                engine.mark_offline(id);
+        runtime_state()
+            .cleanup_pending
+            .store(true, Ordering::Release);
+        self.services.stop_all();
+        let mut errors = Vec::new();
+        // Software activation evidence must be withdrawn even if SPI inventory
+        // or hardware deactivation fails. A frozen management queue is not O5.
+        match self.engine.lock() {
+            Ok(mut engine) => {
+                let ids: Vec<_> = engine.active_onus.iter().map(|onu| onu.onu_id).collect();
+                for id in ids {
+                    engine.mark_offline(id);
+                }
             }
-            let _ = with_session(|session| deactivate_session_onu(session, id).map(|_| ()));
-            if let Ok(mut queues) = runtime_state().omci_rx.lock() {
-                queues.remove(&id);
+            Err(error) => errors.push(error.to_string()),
+        }
+        match runtime_state().omci_rx.lock() {
+            Ok(mut queues) => queues.clear(),
+            Err(error) => errors.push(error.to_string()),
+        }
+        let active: Vec<u8> =
+            match with_session(|session| Ok(session.active_onus().map(|onu| onu.onu_id).collect()))
+            {
+                Ok(active) => active,
+                Err(error) => {
+                    errors.push(error.to_string());
+                    Vec::new()
+                }
+            };
+        for id in active {
+            if let Err(error) =
+                with_session(|session| deactivate_session_onu(session, id).map(|_| ()))
+            {
+                errors.push(format!("ONU {id} deactivate: {error}"));
             }
         }
-        super::vport::bring_all_ports_down();
-        Ok(())
+        if let Err(error) = super::vport::bring_all_ports_down() {
+            errors.push(error.to_string());
+        }
+        if errors.is_empty() {
+            runtime_state()
+                .cleanup_pending
+                .store(false, Ordering::Release);
+            Ok(())
+        } else {
+            Err(io::Error::other(errors.join("; ")))
+        }
     }
 
     fn set_tx(&mut self, enabled: bool) -> io::Result<()> {
-        with_session(|session| session.fsl_mut().set_tx_enabled(enabled))
+        if enabled && self.cleanup_pending() {
+            return Err(io::Error::other("optical cleanup is incomplete"));
+        }
+        if enabled && self.stopping.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "controller is stopping",
+            ));
+        }
+        if enabled && !super::calibration::info().application.applied {
+            return Err(io::Error::other(
+                "factory calibration must be successfully applied before enabling downstream",
+            ));
+        }
+        let settings = crate::optical::settings();
+        let result = with_session(|session| {
+            session.fsl_mut().set_downstream(
+                enabled && settings.downstream_tx_enabled,
+                enabled && settings.fec_enabled,
+            )
+        });
+        let ok = result.is_ok();
+        let error = result.as_ref().err().map(ToString::to_string);
+        crate::controller::pon_mac::record(result);
+        runtime_state()
+            .master_enabled
+            .store(enabled && ok, Ordering::Release);
+        error.map_or(Ok(()), |error| Err(io::Error::other(error)))
     }
 
     fn read_tx(&mut self) -> io::Result<bool> {
-        with_session(|session| session.fsl_mut().is_tx_enabled())
+        // Master state is not a claim of measured light or a BOSA reset readback.
+        // Subordinate register readback is checked by reconcile_controls.
+        with_session(|session| session.fsl_mut().pon_mac_readback())
+            .map(|_| runtime_state().master_enabled.load(Ordering::Acquire))
     }
 
     fn desired(&self) -> io::Result<bool> {
@@ -534,29 +717,62 @@ fn initialize_hardware(stopping: &AtomicBool) -> io::Result<OpticalState> {
     super::vport::prepare_nni_and_ports(NNI_INTERFACE, config.nni_gem_port_offset, stopping)?;
     let dev = Device::open(Path::new(FSL_DEVICE_PATH))?;
     let mut session = FslOltSession::new(dev, config);
-    session.initialize(&mut |delay| {
-        if stopping.load(Ordering::Acquire) {
-            return Err(io::Error::new(io::ErrorKind::Interrupted, "stopping"));
+    runtime_state()
+        .master_enabled
+        .store(false, Ordering::Release);
+    let initialized: io::Result<_> = (|| {
+        session.initialize(&mut |delay| {
+            if stopping.load(Ordering::Acquire) {
+                return Err(io::Error::new(io::ErrorKind::Interrupted, "stopping"));
+            }
+            thread::sleep(delay);
+            Ok(())
+        })?;
+        // Stock `apply_gemport_defaults` pre-maps GEM 256..271 to ONU 0 and enables
+        // WMCI on GEM 270. Clear our managed business GEM slots so each ONU's GEM
+        // is bound strictly to its own `onu_index` only after provisioning succeeds.
+        for entry in super::RESOURCES.allocations {
+            configure_gem_port(session.fsl_mut(), 0, 0, entry.gem_id, false)?;
+            set_gem_wmci_aes(session.fsl_mut(), entry.gem_id, false, false)?;
         }
-        thread::sleep(delay);
-        Ok(())
-    })?;
-    // Stock `apply_gemport_defaults` pre-maps GEM 256..271 to ONU 0 and enables
-    // WMCI on GEM 270. Clear our managed business GEM slots so each ONU's GEM
-    // is bound strictly to its own `onu_index` only after provisioning succeeds.
-    for entry in super::RESOURCES.allocations {
-        configure_gem_port(session.fsl_mut(), 0, 0, entry.gem_id, false)?;
-        set_gem_wmci_aes(session.fsl_mut(), entry.gem_id, false, false)?;
-    }
-    FslDiagnostics.calibrate_bosa(Path::new(BOSA_CAL_SOURCE), BOSA_CAL_OFFSET)?;
-    let desired = crate::optical::load_enabled().unwrap_or(false);
-    session.fsl_mut().set_tx_enabled(desired)?;
-    let enabled = session.fsl_mut().is_tx_enabled()?;
-    *runtime_state()
-        .session
-        .lock()
-        .map_err(|_| io::Error::other("FSL runtime session lock poisoned"))? = Some(session);
-    Ok(if enabled {
+        session.fsl_mut().set_downstream(false, false)?;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        super::calibration::apply_factory(|| calibration_checkpoint(stopping, deadline))?;
+        let desired = crate::optical::load_enabled().unwrap_or(false);
+        let settings = crate::optical::settings();
+        // Acquire the publication slot before enabling, so publication cannot fail
+        // after a successful on write. No global session exists during preparation.
+        let slot = runtime_state()
+            .session
+            .lock()
+            .map_err(|_| io::Error::other("FSL runtime session lock poisoned"))?;
+        calibration_checkpoint(stopping, deadline)?;
+        let readback = session.fsl_mut().set_downstream(
+            desired && settings.downstream_tx_enabled,
+            desired && settings.fec_enabled,
+        )?;
+        crate::controller::pon_mac::record(Ok(readback));
+        Ok((desired, slot))
+    })();
+    let (desired, mut slot) = match initialized {
+        Ok(initialized) => initialized,
+        Err(error) => {
+            // Initialization may already have released reset or written TX.
+            // Retain the local SPI session until an off write/readback is tried.
+            let disabled = session.fsl_mut().set_downstream(false, false);
+            let cleanup = disabled.as_ref().err().map(ToString::to_string);
+            crate::controller::pon_mac::record(disabled);
+            return Err(io::Error::other(match cleanup {
+                Some(cleanup) => format!("{error}; initialization shutdown failed: {cleanup}"),
+                None => error.to_string(),
+            }));
+        }
+    };
+    runtime_state()
+        .master_enabled
+        .store(desired, Ordering::Release);
+    *slot = Some(session);
+    Ok(if desired {
         OpticalState::Enabled
     } else {
         OpticalState::Disabled
@@ -572,6 +788,7 @@ pub(crate) fn status_snapshot(
 ) -> Result<fttr_api::StatusReply, i32> {
     let ready = optics.hardware_ready.load(Ordering::Acquire);
     let tx_enabled = with_session(|session| session.fsl_mut().is_tx_enabled()).ok();
+    let calibration = super::calibration::info().application;
     let devices = devices.lock().map_err(|_| 9)?;
     let engine = pon_engine.lock().map_err(|_| 9)?;
     Ok(crate::platform::status::snapshot(
@@ -582,25 +799,43 @@ pub(crate) fn status_snapshot(
             switch_port_count: super::ONU_COUNT as u8,
             supports_pinning: false,
             ranging_source: |_| "FSL upstream ranging time / calculated EqD".into(),
-            has_pon_mac_fec: false,
+            has_pon_mac_fec: true,
             data_path,
             fpga_status: if ready { "ready" } else { "not_ready" }.into(),
-            pon_mac: None,
+            pon_mac: Some(crate::controller::pon_mac::snapshot()),
             optical_transceiver: fttr_api::OpticalTransceiverStatus {
-                calibration_sha256: None,
-                calibration_applied: ready,
+                calibration_sha256: calibration.sha256,
+                calibration_applied: calibration.applied,
                 model: "UX3326S1".into(),
                 wavelength_tx_nm: 1490,
                 wavelength_rx_nm: 1310,
-                phy_rate_downlink_gbps: 2.5,
-                phy_rate_uplink_gbps: 1.25,
+                phy_rate_downlink_gbps: 2.488,
+                phy_rate_uplink_gbps: 1.244,
                 tx_power_dbm: None,
                 laser_bias_current_ma: None,
                 temperature_celsius: None,
                 vcc_voltage: None,
                 cdr_locked: None,
                 tx_enabled,
-                measurements: Default::default(),
+                measurements: [
+                    ("temperature_celsius", "C"),
+                    ("vcc_voltage", "V"),
+                    ("laser_bias_current_ma", "mA"),
+                    ("tx_power_dbm", "dBm"),
+                    ("cdr_locked", "boolean"),
+                ]
+                .into_iter()
+                .map(|(name, unit)| {
+                    (
+                        name.into(),
+                        fttr_api::MeasurementEvidence::unavailable(
+                            "UX3326S1/FSL",
+                            unit,
+                            "diagnostic_register_and_scaling_unverified",
+                        ),
+                    )
+                })
+                .collect(),
             },
             npu: None,
         },
@@ -1103,6 +1338,7 @@ async fn run_async(platform: PlatformContext) {
     let states_loop = service_states.clone();
     let stopping_loop = stopping.clone();
     let ready_loop = hardware_ready.clone();
+    let (fault_sender, fault_receiver) = tokio::sync::oneshot::channel::<String>();
     let fsl_thread = thread::Builder::new()
         .name("fsl-loop".into())
         .stack_size(256 * 1024)
@@ -1123,23 +1359,48 @@ async fn run_async(platform: PlatformContext) {
             let mut observation_first = true;
             let mut observation_counts = (0usize, 0usize, 0usize, 0usize);
             let mut receive_snapshots_remaining = 3u8;
+            let mut mac_poll = crate::controller::pon_mac::Poll::default();
 
             while !stopping_loop.load(Ordering::Acquire) {
+                if with_session(|session| Ok(session.needs_reconciliation())).unwrap_or(false) {
+                    // Never clear the software flag or replay the uncertain frame.
+                    // Withdraw activation, attempt TX off, and let procd create a
+                    // fresh process that performs full reset/calibration/registration.
+                    let mut backend = RuntimeOptics {
+                        ready: ready_loop.load(Ordering::Acquire),
+                        services: &mut services,
+                        engine: &pon_engine_loop,
+                        stopping: &stopping_loop,
+                    };
+                    let response = optics.handle(OpticalCommand::Shutdown, &mut backend);
+                    ready_loop.store(false, Ordering::Release);
+                    let _ = fault_sender.send(format!(
+                        "FSL management requires full reinitialization; shutdown: {response}"
+                    ));
+                    break;
+                }
                 {
                     let mut backend = RuntimeOptics {
                         ready: ready_loop.load(Ordering::Acquire),
                         services: &mut services,
                         engine: &pon_engine_loop,
+                        stopping: &stopping_loop,
                     };
                     for request in optical_receiver.try_iter().take(2) {
                         let response = optics.dispatch(&request, &mut backend, &stopping_loop);
                         let _ = request.reply.send(response);
                     }
+                    if backend.ready() && !stopping_loop.load(Ordering::Acquire) && mac_poll.due() {
+                        if let Err(error) = optics.reconcile(&mut backend) {
+                            eprintln!("[-] FSL GPON controls: {error}");
+                        }
+                    }
                 }
                 if stopping_loop.load(Ordering::Acquire) {
                     break;
                 }
-                if !ready_loop.load(Ordering::Acquire) || optics.state != OpticalState::Enabled {
+                if !ready_loop.load(Ordering::Acquire) || optics.state != OpticalState::Enabled
+                    || crate::controller::pon_mac::snapshot().tx_enabled != Some(true) {
                     thread::sleep(Duration::from_millis(20));
                     continue;
                 }
@@ -1422,6 +1683,7 @@ async fn run_async(platform: PlatformContext) {
                     ready: ready_loop.load(Ordering::Acquire),
                     services: &mut services,
                     engine: &pon_engine_loop,
+                    stopping: &stopping_loop,
                 };
                 let mut handled_shutdown = false;
                 for request in optical_receiver.try_iter() {
@@ -1436,44 +1698,47 @@ async fn run_async(platform: PlatformContext) {
                     }
                 }
             }
-            super::vport::bring_all_ports_down();
+            if let Err(error) = super::vport::bring_all_ports_down() { eprintln!("[-] FSL shutdown VPORT cleanup: {error}"); }
             if let Ok(mut guard) = runtime_state().session.lock() {
                 *guard = None;
             }
         })
         .ok();
 
-    tokio::select! {
+    let restart = tokio::select! {
         result = lifetime.wait(devices) => {
             eprintln!("[-] Controller supervision stopped: {result:?}");
-            stopping.store(true, Ordering::Release);
-            if let Some(handle) = fsl_thread {
-                let _ = handle.join();
-            }
-            std::process::exit(1);
+            true
+        }
+        result = fault_receiver => {
+            eprintln!("[-] FSL owner stopped: {result:?}; requesting supervised restart");
+            true
         }
         result = crate::runtime::termination() => {
             if let Err(error) = result {
                 eprintln!("[-] Signal handler failed: {error}");
             }
-            #[cfg(feature = "acs")]
-            crate::acs::shutdown();
-            crate::runtime::request_stop();
-            let optical = crate::runtime::spawn_blocking(move || {
-                shutdown_client.request(OpticalCommand::Shutdown)
-            });
-            let (optical, ()) = tokio::join!(
-                tokio::time::timeout(Duration::from_secs(4), optical),
-                crate::runtime::shutdown(),
-            );
-            match optical {
-                Ok(Ok(Ok(_))) => (),
-                result => eprintln!("[-] Optical shutdown not confirmed: {result:?}"),
-            }
-            stopping.store(true, Ordering::Release);
-            if let Some(handle) = fsl_thread {
-                let _ = handle.join();
-            }
+            false
         }
+    };
+    #[cfg(feature = "acs")]
+    crate::acs::shutdown();
+    crate::runtime::request_stop();
+    let optical =
+        crate::runtime::spawn_blocking(move || shutdown_client.request(OpticalCommand::Shutdown));
+    let (optical, ()) = tokio::join!(
+        tokio::time::timeout(Duration::from_secs(4), optical),
+        crate::runtime::shutdown(),
+    );
+    match optical {
+        Ok(Ok(Ok(_))) => (),
+        result => eprintln!("[-] Optical shutdown not confirmed: {result:?}"),
+    }
+    stopping.store(true, Ordering::Release);
+    if let Some(handle) = fsl_thread {
+        let _ = handle.join();
+    }
+    if restart {
+        std::process::exit(1);
     }
 }

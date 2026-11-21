@@ -283,6 +283,35 @@ fn build_configure_port_id_ack(
 }
 
 #[test]
+fn ambiguous_submit_remains_fatal_even_when_idle_until_full_initialization() {
+    let mut session = FslOltSession::new(SimBus::new(), OltSessionConfig::default());
+    session.initialize(&mut no_sleep).unwrap();
+    assert!(!session.needs_reconciliation());
+    // Simulate a successful submit followed by loss of its completion observation.
+    session
+        .mgmt
+        .submit(PLOAM_INFO, 0x101, &mut no_sleep)
+        .unwrap();
+    assert!(session.needs_reconciliation());
+    let submitted = session.bus().ploam_tx_frames.len();
+    let error = session.send_ploam(&[0; 12], &mut no_sleep).unwrap_err();
+    assert!(error.to_string().contains("Indeterminate"));
+    assert_eq!(session.bus().ploam_tx_frames.len(), submitted);
+    assert!(
+        session.needs_reconciliation(),
+        "idle does not authorize replay"
+    );
+
+    let mut fresh = FslOltSession::new(session.mgmt.fsl.bus, OltSessionConfig::default());
+    assert!(!fresh.is_initialized());
+    assert!(fresh.send_ploam(&[0; 12], &mut no_sleep).is_err());
+    fresh.initialize(&mut no_sleep).unwrap();
+    assert!(!fresh.needs_reconciliation());
+    fresh.send_ploam(&[0; 12], &mut no_sleep).unwrap();
+    assert_eq!(fresh.bus().ploam_tx_frames.len(), submitted + 1);
+}
+
+#[test]
 fn full_offline_olt_lifecycle_init_discover_activate_omci_fec_and_deactivate() {
     let mut cfg = OltSessionConfig::default();
     cfg.init.max_onu_id = 16;

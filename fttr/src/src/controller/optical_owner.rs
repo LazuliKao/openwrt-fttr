@@ -125,6 +125,14 @@ pub(crate) trait OpticalBackend {
     fn validate_calibration(&self) -> io::Result<()> {
         Ok(())
     }
+    /// Platform-specific programming after quiescing and disabling transmission.
+    /// HM2004 restores its calibration as part of set_tx; FSL needs a separate recipe.
+    fn apply_calibration(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+    fn calibration_requires_disabled_tx(&self) -> bool {
+        false
+    }
     fn save_settings(&mut self, _settings: fttr_api::OpticalSettings) -> io::Result<()> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -133,6 +141,11 @@ pub(crate) trait OpticalBackend {
     }
     fn mac_tx_allowed(&self) -> bool {
         true
+    }
+    /// Apply and verify the subordinate MAC settings before acknowledging a request.
+    /// A master switch that is already enabled must not skip a TX/FEC-only change.
+    fn reconcile_controls(&mut self, _master_enabled: bool) -> io::Result<()> {
+        Ok(())
     }
     fn ready(&self) -> bool;
     fn cleanup_pending(&self) -> bool;
@@ -146,6 +159,48 @@ pub(crate) struct OpticalActor {
     pub state: OpticalState,
 }
 impl OpticalActor {
+    /// Reuse request failure policy for autonomous TX/FEC reconciliation too.
+    pub(crate) fn reconcile(&mut self, backend: &mut impl OpticalBackend) -> io::Result<()> {
+        backend
+            .reconcile_controls(self.state == OpticalState::Enabled)
+            .map_err(|error| self.fail_closed(backend, &mut None, error, false))
+    }
+
+    fn fail_closed(
+        &mut self,
+        backend: &mut impl OpticalBackend,
+        tx_enabled: &mut Option<bool>,
+        error: io::Error,
+        quiesced: bool,
+    ) -> io::Error {
+        self.state = OpticalState::Unknown;
+        let mut errors = vec![error.to_string()];
+        if backend.ready() {
+            // Neither cleanup failure nor a status read failure may skip the off write.
+            if let Err(error) = backend.set_tx(false) {
+                errors.push(format!("recovery reset failed: {error}"));
+            }
+            match backend.read_tx() {
+                Ok(actual) => {
+                    *tx_enabled = Some(actual);
+                    if actual {
+                        errors.push("recovery TX readback remains enabled".into());
+                    }
+                }
+                Err(error) => {
+                    *tx_enabled = None;
+                    errors.push(format!("recovery readback failed: {error}"));
+                }
+            }
+            if !quiesced {
+                if let Err(error) = backend.quiesce() {
+                    errors.push(format!("quiesce failed: {error}"));
+                }
+            }
+        }
+        io::Error::new(error.kind(), errors.join("; "))
+    }
+
     pub(crate) fn dispatch(
         &mut self,
         request: &OpticalRequest,
@@ -209,9 +264,18 @@ impl OpticalActor {
                     let target = match command {
                         OpticalCommand::On | OpticalCommand::Off => {
                             let enabled = matches!(command, OpticalCommand::On);
-                            backend.save(enabled).map(|()| {
-                                desired_enabled = Some(enabled);
-                                enabled
+                            backend.save(enabled).and_then(|()| {
+                                // Reload the committed settings before either platform
+                                // applies subordinate MAC controls. The settings cache
+                                // may still reflect the value read before save().
+                                let actual = backend.desired()?;
+                                desired_enabled = Some(actual);
+                                if actual != enabled {
+                                    return Err(io::Error::other(
+                                        "saved optical setting did not match readback",
+                                    ));
+                                }
+                                Ok(actual)
                             })
                         }
                         OpticalCommand::Shutdown => Ok(false),
@@ -260,30 +324,30 @@ impl OpticalActor {
                     };
                     // A failed quiesce must still permit reset, never a fresh enable.
                     let target_tx = enabled && quiesced.is_ok();
-                    let transition = backend.set_tx(target_tx).and_then(|()| {
-                        let actual = backend.read_tx()?;
-                        tx_enabled = Some(actual);
-                        if actual == target_tx {
-                            Ok(())
+                    let preparation = if quiesced.is_err() {
+                        Err(io::Error::other("optical users could not be quiesced"))
+                    } else if matches!(command, OpticalCommand::Reinitialize) {
+                        let disabled = if backend.calibration_requires_disabled_tx() {
+                            backend.set_tx(false)
                         } else {
-                            Err(io::Error::other("optical TX readback mismatch"))
-                        }
-                    });
-                    let transition = transition.map_err(|error| {
-                        if enabled {
-                            let reset = backend.set_tx(false);
-                            tx_enabled = backend.read_tx().ok();
-                            if let Err(reset) = reset {
-                                return io::Error::other(format!(
-                                    "{error}; recovery reset failed: {reset}"
-                                ));
+                            Ok(())
+                        };
+                        disabled.and_then(|()| backend.apply_calibration())
+                    } else {
+                        Ok(())
+                    };
+                    let transition = preparation
+                        .and_then(|()| backend.set_tx(target_tx))
+                        .and_then(|()| backend.reconcile_controls(target_tx))
+                        .and_then(|()| {
+                            let actual = backend.read_tx()?;
+                            tx_enabled = Some(actual);
+                            if actual == target_tx {
+                                Ok(())
+                            } else {
+                                Err(io::Error::other("optical TX readback mismatch"))
                             }
-                        }
-                        if tx_enabled.is_none() {
-                            tx_enabled = backend.read_tx().ok();
-                        }
-                        error
-                    });
+                        });
                     let result = match (quiesced, transition) {
                         (Ok(()), result) => result,
                         (Err(error), Ok(())) => Err(error),
@@ -301,6 +365,14 @@ impl OpticalActor {
                 }
                 OpticalCommand::Status => backend.read_tx().and_then(|actual| {
                     tx_enabled = Some(actual);
+                    if self.state == OpticalState::Unknown
+                        || (self.state == OpticalState::Disabled && actual)
+                    {
+                        return Err(io::Error::other(
+                            "optical state is unconfirmed; explicit reload required",
+                        ));
+                    }
+                    backend.reconcile_controls(actual)?;
                     if self.state == OpticalState::Enabled && !actual {
                         self.state = OpticalState::Disabled;
                         quiesce_attempted = true;
@@ -311,19 +383,7 @@ impl OpticalActor {
             }
         };
         let result = match result {
-            Err(error) => {
-                self.state = OpticalState::Unknown;
-                if backend.ready() && !quiesce_attempted {
-                    match backend.quiesce() {
-                        Ok(()) => Err(error),
-                        Err(cleanup) => Err(io::Error::other(format!(
-                            "{error}; quiesce failed: {cleanup}"
-                        ))),
-                    }
-                } else {
-                    Err(error)
-                }
-            }
+            Err(error) => Err(self.fail_closed(backend, &mut tx_enabled, error, quiesce_attempted)),
             result => result,
         };
         OpticalReply {
@@ -351,5 +411,290 @@ impl OpticalActor {
             }),
         }
         .value()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn on_and_off_refresh_committed_settings_before_reconciling_mac() {
+        struct CachedBackend {
+            stored: bool,
+            cached: Cell<bool>,
+            master: bool,
+            mac: bool,
+        }
+        impl OpticalBackend for CachedBackend {
+            fn ready(&self) -> bool {
+                true
+            }
+            fn cleanup_pending(&self) -> bool {
+                false
+            }
+            fn quiesce(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+            fn desired(&self) -> io::Result<bool> {
+                self.cached.set(self.stored);
+                Ok(self.stored)
+            }
+            fn save(&mut self, enabled: bool) -> io::Result<()> {
+                self.stored = enabled;
+                Ok(())
+            }
+            fn set_tx(&mut self, enabled: bool) -> io::Result<()> {
+                self.master = enabled;
+                Ok(())
+            }
+            fn read_tx(&mut self) -> io::Result<bool> {
+                Ok(self.master)
+            }
+            fn reconcile_controls(&mut self, master: bool) -> io::Result<()> {
+                self.mac = master && self.cached.get();
+                Ok(())
+            }
+        }
+        let mut backend = CachedBackend {
+            stored: false,
+            cached: Cell::new(false),
+            master: false,
+            mac: false,
+        };
+        let mut actor = OpticalActor {
+            state: OpticalState::Disabled,
+        };
+        for (command, expected) in [(OpticalCommand::On, true), (OpticalCommand::Off, false)] {
+            let reply = actor.handle(command, &mut backend);
+            assert_eq!(reply["status"], "success");
+            assert_eq!(reply["desired_enabled"], expected);
+            assert_eq!(backend.master, expected);
+            assert_eq!(
+                backend.mac, expected,
+                "MAC must use the freshly saved setting"
+            );
+        }
+    }
+
+    struct Backend {
+        master: bool,
+        settings: fttr_api::OpticalSettings,
+        mac: (bool, bool),
+        resets: usize,
+        fail: bool,
+        programs: usize,
+        program_fails: bool,
+        quiesce_fails: bool,
+        ignore_disable: bool,
+    }
+    impl OpticalBackend for Backend {
+        fn calibration_requires_disabled_tx(&self) -> bool {
+            true
+        }
+        fn apply_calibration(&mut self) -> io::Result<()> {
+            assert!(
+                !self.master,
+                "programming must happen with transmission disabled"
+            );
+            self.programs += 1;
+            if self.program_fails {
+                Err(io::Error::other("I2C write failed"))
+            } else {
+                Ok(())
+            }
+        }
+        fn ready(&self) -> bool {
+            true
+        }
+        fn cleanup_pending(&self) -> bool {
+            false
+        }
+        fn quiesce(&mut self) -> io::Result<()> {
+            if self.quiesce_fails {
+                Err(io::Error::other("deactivation failed"))
+            } else {
+                Ok(())
+            }
+        }
+        fn set_tx(&mut self, enabled: bool) -> io::Result<()> {
+            self.resets += 1;
+            if enabled || !self.ignore_disable {
+                self.master = enabled;
+            }
+            Ok(())
+        }
+        fn read_tx(&mut self) -> io::Result<bool> {
+            Ok(self.master)
+        }
+        fn desired(&self) -> io::Result<bool> {
+            Ok(self.settings.enabled)
+        }
+        fn save(&mut self, enabled: bool) -> io::Result<()> {
+            self.settings.enabled = enabled;
+            Ok(())
+        }
+        fn save_settings(&mut self, settings: fttr_api::OpticalSettings) -> io::Result<()> {
+            self.settings = settings;
+            Ok(())
+        }
+        fn reconcile_controls(&mut self, master: bool) -> io::Result<()> {
+            if self.fail {
+                return Err(io::Error::other("FEC write failed"));
+            }
+            self.mac = (
+                master && self.settings.enabled && self.settings.downstream_tx_enabled,
+                master && self.settings.enabled && self.settings.fec_enabled,
+            );
+            Ok(())
+        }
+    }
+    #[test]
+    fn subordinate_changes_are_acknowledged_only_after_application_without_master_reset() {
+        let settings = fttr_api::OpticalSettings {
+            enabled: true,
+            downstream_tx_enabled: true,
+            fec_enabled: false,
+        };
+        let mut backend = Backend {
+            master: true,
+            settings,
+            mac: (true, false),
+            resets: 0,
+            fail: false,
+            programs: 0,
+            program_fails: false,
+            quiesce_fails: false,
+            ignore_disable: false,
+        };
+        let mut actor = OpticalActor {
+            state: OpticalState::Enabled,
+        };
+        for (tx, fec) in [(true, true), (false, true), (true, false)] {
+            let response = actor.handle(
+                OpticalCommand::Set(fttr_api::OpticalSettings {
+                    downstream_tx_enabled: tx,
+                    fec_enabled: fec,
+                    ..settings
+                }),
+                &mut backend,
+            );
+            assert_eq!(response["status"], "success");
+            assert_eq!(backend.mac, (tx, fec));
+            assert_eq!(backend.resets, 0);
+            assert!(actor.state == OpticalState::Enabled);
+        }
+        actor.handle(OpticalCommand::Shutdown, &mut backend);
+        assert!(!backend.master);
+        assert_eq!(backend.mac, (false, false));
+        assert!(
+            backend.settings.enabled,
+            "shutdown must not overwrite saved startup configuration"
+        );
+        backend.master = true;
+        actor.state = OpticalState::Enabled;
+        backend.fail = true;
+        let response = actor.handle(OpticalCommand::Reload, &mut backend);
+        assert_eq!(response["status"], "error");
+        assert!(actor.state == OpticalState::Unknown);
+    }
+
+    #[test]
+    fn reinitialize_programs_while_disabled_and_failure_never_restores_transmission() {
+        for enabled in [true, false] {
+            let mut backend = Backend {
+                master: enabled,
+                settings: fttr_api::OpticalSettings {
+                    enabled,
+                    downstream_tx_enabled: true,
+                    fec_enabled: false,
+                },
+                mac: (enabled, false),
+                resets: 0,
+                fail: false,
+                programs: 0,
+                program_fails: false,
+                quiesce_fails: false,
+                ignore_disable: false,
+            };
+            let mut actor = OpticalActor {
+                state: if enabled {
+                    OpticalState::Enabled
+                } else {
+                    OpticalState::Disabled
+                },
+            };
+            let reply = actor.handle(OpticalCommand::Reinitialize, &mut backend);
+            assert_eq!(reply["status"], "success");
+            assert_eq!(backend.programs, 1);
+            assert_eq!(backend.master, enabled);
+            assert_eq!(backend.settings.enabled, enabled);
+            backend.program_fails = true;
+            let reply = actor.handle(OpticalCommand::Reinitialize, &mut backend);
+            assert_eq!(reply["status"], "error");
+            assert!(!backend.master);
+            assert_eq!(backend.settings.enabled, enabled);
+            assert!(actor.state == OpticalState::Unknown);
+            backend.program_fails = false;
+            backend.quiesce_fails = true;
+            let count = backend.programs;
+            let reply = actor.handle(OpticalCommand::Reinitialize, &mut backend);
+            assert_eq!(reply["status"], "error");
+            assert_eq!(
+                backend.programs, count,
+                "no programming after failed quiesce"
+            );
+            assert!(!backend.master);
+        }
+    }
+
+    #[test]
+    fn status_and_periodic_failures_close_tx_and_unknown_status_never_reenables() {
+        let mut backend = Backend {
+            master: true,
+            settings: fttr_api::OpticalSettings {
+                enabled: true,
+                downstream_tx_enabled: true,
+                fec_enabled: false,
+            },
+            mac: (true, false),
+            resets: 0,
+            fail: true,
+            programs: 0,
+            program_fails: false,
+            quiesce_fails: false,
+            ignore_disable: false,
+        };
+        let mut actor = OpticalActor {
+            state: OpticalState::Enabled,
+        };
+        let reply = actor.handle(OpticalCommand::Status, &mut backend);
+        assert_eq!(reply["status"], "error");
+        assert_eq!(reply["tx_enabled"], false);
+        assert!(!backend.master);
+        backend.master = true;
+        actor.state = OpticalState::Enabled;
+        assert!(actor.reconcile(&mut backend).is_err());
+        assert!(!backend.master);
+        assert!(actor.state == OpticalState::Unknown);
+        backend.fail = false;
+        backend.master = true;
+        let reply = actor.handle(OpticalCommand::Status, &mut backend);
+        assert_eq!(reply["status"], "error");
+        assert!(!backend.master, "unknown state requires an explicit reload");
+        backend.fail = true;
+        backend.master = true;
+        backend.ignore_disable = true;
+        let reply = actor.handle(OpticalCommand::Status, &mut backend);
+        assert_eq!(reply["tx_enabled"], true);
+        assert!(reply["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("readback remains enabled"));
+        assert!(
+            backend.settings.enabled,
+            "failures must preserve saved settings"
+        );
     }
 }

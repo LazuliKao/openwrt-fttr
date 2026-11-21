@@ -31,6 +31,14 @@ pub enum Submission {
     Indeterminate,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TxPhase {
+    Preparing,
+    /// The frame has been submitted. Only observe its bounded completion;
+    /// never submit it again when the preparation budget expires.
+    Completing,
+}
+
 #[derive(Debug)]
 pub struct SendError {
     pub submission: Submission,
@@ -111,7 +119,21 @@ impl<B: Bus> Management<B> {
         policy: PollPolicy,
         checkpoint: &mut impl FnMut(Duration) -> io::Result<()>,
     ) -> Result<(), SendError> {
+        self.send_omci_frame_with_phases(port_id, selection, frame, policy, &mut |_, delay| {
+            checkpoint(delay)
+        })
+    }
+
+    pub fn send_omci_frame_with_phases(
+        &mut self,
+        port_id: u16,
+        selection: bool,
+        frame: &[u8],
+        policy: PollPolicy,
+        checkpoint: &mut impl FnMut(TxPhase, Duration) -> io::Result<()>,
+    ) -> Result<(), SendError> {
         let result = (|| {
+            let mut prepare = |delay| checkpoint(TxPhase::Preparing, delay);
             self.ensure_ready()?;
             if port_id > 0xfff || !(1..=MAX_OMCI_BYTES).contains(&frame.len()) {
                 return Err(io::Error::new(
@@ -120,21 +142,21 @@ impl<B: Bus> Management<B> {
                 ));
             }
             // Added idle preflight: never overwrite a known busy buffer.
-            if self.read(OMCI_STATUS, checkpoint)? & OMCI_BUSY != 0 {
+            if self.read(OMCI_STATUS, &mut prepare)? & OMCI_BUSY != 0 {
                 return Err(io::Error::new(io::ErrorKind::WouldBlock, "OMCI TX busy"));
             }
             // Stock GPON path clears CRC mode bit1, then enables SPI bits7/0.
             // Combine independent fields into one RMW, preserving all others.
-            let old = self.read(OMCI_CONFIG, checkpoint)?;
+            let old = self.read(OMCI_CONFIG, &mut prepare)?;
             let config = (old & !2) | 0x81;
             if old != config {
-                self.write(OMCI_CONFIG, config, checkpoint)?;
+                self.write(OMCI_CONFIG, config, &mut prepare)?;
             }
-            if self.read(OMCI_CONFIG, checkpoint)? & 0x83 != 0x81 {
+            if self.read(OMCI_CONFIG, &mut prepare)? & 0x83 != 0x81 {
                 return Err(io::Error::other("FSL OMCI configuration readback mismatch"));
             }
             for (row, bytes) in frame.chunks(8).enumerate() {
-                checkpoint(Duration::ZERO)?;
+                prepare(Duration::ZERO)?;
                 self.fsl.write(
                     RegisterSpace::Memory,
                     OMCI_MEMORY,
@@ -145,9 +167,16 @@ impl<B: Bus> Management<B> {
             let control = ((selection as u32) << 27)
                 | ((frame.len() as u32) << 13)
                 | (u32::from(port_id) << 1);
-            self.write(OMCI_CONTROL, control, checkpoint)?;
-            self.submit(OMCI_CONTROL, control | 1, checkpoint)?;
-            polling::register(&mut self.fsl, OMCI_STATUS, OMCI_BUSY, 0, policy, checkpoint)?;
+            self.write(OMCI_CONTROL, control, &mut prepare)?;
+            self.submit(OMCI_CONTROL, control | 1, &mut prepare)?;
+            polling::register(
+                &mut self.fsl,
+                OMCI_STATUS,
+                OMCI_BUSY,
+                0,
+                policy,
+                &mut |delay| checkpoint(TxPhase::Completing, delay),
+            )?;
             self.indeterminate = false;
             Ok(())
         })();

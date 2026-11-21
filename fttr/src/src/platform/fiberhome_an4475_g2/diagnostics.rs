@@ -75,22 +75,7 @@ impl PlatformDiagnostics for FslDiagnostics {
         file.seek(SeekFrom::Start(offset))?;
         let mut raw = [0u8; calibration::TABLE_BYTES];
         file.read_exact(&mut raw)?;
-        let table = CalibrationTable::parse(&raw)?;
-        let mut bus = OpticalBus::new(I2cDevice::open(Path::new(DOWNSTREAM_OPTICAL_I2C_DEV))?);
-        struct SleepPacer;
-        impl StockPacer for SleepPacer {
-            fn after_write(&mut self, _loop_iterations: u32) -> io::Result<()> {
-                std::thread::sleep(Duration::from_micros(200));
-                Ok(())
-            }
-        }
-        let mut pacer = SleepPacer;
-        let chip = initialize_ux3326s(&mut bus, &table, &mut pacer, || Ok(()))?;
-        Ok(BosaCalibrationEvidence {
-            chip_id: chip.discriminator(),
-            page: chip.current_page(),
-            table_bytes: raw.len(),
-        })
+        program_table(&raw, || Ok(()))
     }
     fn set_optical_tx_enable(&self, enabled: bool) -> io::Result<()> {
         let mut fsl = Fsl::new(Device::open(Path::new(FSL_DEVICE_PATH))?);
@@ -100,6 +85,29 @@ impl PlatformDiagnostics for FslDiagnostics {
         let mut fsl = Fsl::new(Device::open(Path::new(FSL_DEVICE_PATH))?);
         fsl.is_tx_enabled()
     }
+}
+
+pub(super) fn program_table(
+    raw: &[u8],
+    mut checkpoint: impl FnMut() -> io::Result<()>,
+) -> io::Result<BosaCalibrationEvidence> {
+    checkpoint()?;
+    let table = CalibrationTable::parse(&raw)?;
+    let mut bus = OpticalBus::new(I2cDevice::open(Path::new(DOWNSTREAM_OPTICAL_I2C_DEV))?);
+    struct SleepPacer;
+    impl StockPacer for SleepPacer {
+        fn after_write(&mut self, _loop_iterations: u32) -> io::Result<()> {
+            std::thread::sleep(Duration::from_micros(200));
+            Ok(())
+        }
+    }
+    let mut pacer = SleepPacer;
+    let chip = initialize_ux3326s(&mut bus, &table, &mut pacer, checkpoint)?;
+    Ok(BosaCalibrationEvidence {
+        chip_id: chip.discriminator(),
+        page: chip.current_page(),
+        table_bytes: raw.len(),
+    })
 }
 
 impl RegisterSession for Fsl<Device> {
@@ -122,13 +130,7 @@ impl RegisterSession for Fsl<Device> {
         Fsl::write(self, space, address, row, words)
     }
     fn pon_mac_readback(&mut self) -> io::Result<PonMacReadback> {
-        let tx = self.read_register(protocol::OPT_CONFIG)?;
-        let fec = self.read_register(protocol::DS_FEC_CONFIG)?;
-        Ok(PonMacReadback {
-            raw: Some(tx),
-            tx_enabled: Some(tx & protocol::TX_DISABLE == 0),
-            fec_enabled: Some(fec & protocol::DS_FEC_ENABLE != 0),
-        })
+        Fsl::pon_mac_readback(self)
     }
     fn set_optical_tx_enable(&mut self, enabled: bool) -> io::Result<()> {
         self.set_tx_enabled(enabled)

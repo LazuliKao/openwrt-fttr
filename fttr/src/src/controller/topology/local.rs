@@ -2,6 +2,57 @@
 use super::*;
 use serde_json::Value;
 use std::time::Instant;
+use std::{io, path::Path};
+
+// Absence is established from both configured radios and live hardware. Probe
+// errors remain unknown: a broken driver/service on a wireless router is not N/A.
+fn has_local_wireless(config: &Path, phys: &Path, net: &Path) -> io::Result<bool> {
+    if config.try_exists()? {
+        return Ok(true);
+    }
+    match std::fs::read_dir(phys) {
+        Ok(mut entries) => {
+            if entries.next().transpose()?.is_some() {
+                return Ok(true);
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    for entry in std::fs::read_dir(net)? {
+        let path = entry?.path();
+        // sysfs also exposes control files such as bonding_masters here.
+        if !std::fs::metadata(&path)?.is_dir() {
+            continue;
+        }
+        if path.join("wireless").try_exists()? || path.join("phy80211").try_exists()? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(test)]
+#[test]
+fn wireless_absence_requires_absent_configuration_and_hardware_and_successful_probe() {
+    let root = std::env::temp_dir().join(format!("fttr-wireless-probe-{}", std::process::id()));
+    std::fs::create_dir_all(root.join("net/eth0")).unwrap();
+    std::fs::write(root.join("net/bonding_masters"), "").unwrap();
+    let config = root.join("wireless");
+    let phys = root.join("phys");
+    let net = root.join("net");
+    assert!(!has_local_wireless(&config, &phys, &net).unwrap());
+    std::fs::write(&config, "config wifi-device 'radio0'").unwrap();
+    assert!(has_local_wireless(&config, &phys, &net).unwrap());
+    std::fs::remove_file(&config).unwrap();
+    std::fs::create_dir_all(net.join("eth0/wireless")).unwrap();
+    assert!(has_local_wireless(&config, &phys, &net).unwrap());
+    std::fs::remove_dir_all(&net).unwrap();
+    assert!(has_local_wireless(&config, &phys, &net).is_err());
+    std::fs::create_dir_all(phys.join("phy0")).unwrap();
+    assert!(has_local_wireless(&config, &phys, &net).unwrap());
+    std::fs::remove_dir_all(root).unwrap();
+}
 
 #[derive(Default)]
 pub(super) struct Local {
@@ -53,15 +104,34 @@ impl Reader {
         } else {
             Err("ubus_unavailable")
         };
+        let wireless_probe = (object == "network.wireless"
+            && method == "status"
+            && matches!(result, Err("ubus_read_failed")))
+        .then(|| {
+            has_local_wireless(
+                Path::new("/etc/config/wireless"),
+                Path::new("/sys/class/ieee80211"),
+                Path::new("/sys/class/net"),
+            )
+        });
+        let not_applicable = matches!(wireless_probe, Some(Ok(false)));
         self.sources.push(TopologySource {
             id: format!("{object}.{method}"),
-            state: if result.is_ok() {
+            state: if not_applicable {
+                TopologySourceState::NotApplicable
+            } else if result.is_ok() {
                 TopologySourceState::Ok
             } else {
                 TopologySourceState::Unavailable
             },
             sampled_at: now,
-            reason: result.as_ref().err().map(|e| (*e).into()),
+            reason: if not_applicable {
+                Some("no_local_wireless_hardware_or_configuration".into())
+            } else if let Some(Err(error)) = wireless_probe {
+                Some(format!("wireless_presence_probe_failed: {error}"))
+            } else {
+                result.as_ref().err().map(|e| (*e).into())
+            },
         });
         result.ok()
     }
@@ -75,6 +145,11 @@ pub(super) fn collect() -> Local {
     };
     let mut local = collect_with(|object, method| reader.call(object, method));
     local.sources = reader.sources;
+    if local.sources.iter().any(|source| {
+        source.id == "network.wireless.status" && source.state == TopologySourceState::NotApplicable
+    }) {
+        local.association_complete = true;
+    }
     local
 }
 

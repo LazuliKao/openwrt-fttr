@@ -11,6 +11,7 @@ pub const UX3326S_DEVICE_ADDRESS: u8 = 0x63;
 pub const UX3326S_SIGNATURE_REGISTER: u8 = 0xc4;
 pub const UX3326S_PAGE_REGISTER: u8 = 0x7f;
 pub const UX3326S_PROFILE_BYTES: usize = 0x400;
+pub const UX3326S_REGISTER_WRITES: u32 = 802;
 /// The stock helper performs this many busy-loop iterations after every write.
 /// It is an iteration count, not a portable time duration.
 pub const STOCK_DELAY_ITERATIONS: u32 = 0x320 * 0xa7;

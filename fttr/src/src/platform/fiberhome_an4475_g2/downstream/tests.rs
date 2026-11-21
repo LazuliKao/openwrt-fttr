@@ -191,6 +191,34 @@ fn polling_timeout_does_not_resubmit_or_read_past_budget() {
 }
 
 #[test]
+fn submitted_omci_can_finish_after_preparation_slice_expires_without_replay() {
+    let (mut tx, bus) = session(omci_steps(), 0);
+    let mut preparation_checks = 0;
+    let mut completion_checks = 0;
+    let mut expired = false;
+    tx.send_omci_frame_with_phases(0xabc, true, &OMCI, policy(2), &mut |phase, _| {
+        match phase {
+            TxPhase::Preparing => {
+                assert!(!expired, "preparation continued after its deadline");
+                preparation_checks += 1;
+                // The submit itself consumes the remaining preparation slice.
+                expired = preparation_checks == 8;
+            }
+            TxPhase::Completing => {
+                assert!(expired);
+                completion_checks += 1;
+            }
+        }
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!((preparation_checks, completion_checks), (8, 2));
+    assert!(!tx.needs_reconciliation());
+    assert!(bus.0.borrow().steps.is_empty());
+    assert_eq!(bus.0.borrow().calls, 10, "must not resubmit the frame");
+}
+
+#[test]
 fn invalid_omci_arguments_fail_before_io() {
     let (mut tx, bus) = session(vec![], 0);
     for (port, frame) in [(0x1000, vec![0; 8]), (1, vec![]), (1, vec![0; 1981])] {

@@ -177,11 +177,11 @@ pub fn parse_upstream_ploam(record: &PloamRecord) -> Option<PloamFrame> {
 }
 
 fn map_send_err(err: SendError) -> io::Error {
-    err.source
+    io::Error::new(err.source.kind(), err)
 }
 
 fn map_recv_err(err: ReceiveError) -> io::Error {
-    err.source
+    io::Error::new(err.source.kind(), err)
 }
 
 /// Stateful GPON OLT controller driving the FSL SPI primitives over a generic `Bus`.
@@ -316,6 +316,12 @@ impl<B: Bus> FslOltSession<B> {
 
     pub fn is_initialized(&self) -> bool {
         self.initialized
+    }
+
+    /// An ambiguous management submit/consume cannot be replayed in this generation.
+    /// Only a complete hardware reset and fresh owner session can clear this fault.
+    pub(crate) fn needs_reconciliation(&self) -> bool {
+        self.mgmt.needs_reconciliation()
     }
 
     pub fn base_b_all_set_thd(&self) -> u16 {
@@ -882,6 +888,15 @@ impl<B: Bus> FslOltSession<B> {
         payload: &[u8],
         checkpoint: &mut impl FnMut(Duration) -> io::Result<()>,
     ) -> io::Result<()> {
+        self.send_omci_with_phases(onu_id, payload, &mut |_, delay| checkpoint(delay))
+    }
+
+    pub fn send_omci_with_phases(
+        &mut self,
+        onu_id: u8,
+        payload: &[u8],
+        checkpoint: &mut impl FnMut(super::downstream::TxPhase, Duration) -> io::Result<()>,
+    ) -> io::Result<()> {
         self.require_initialized()?;
         let onu = self.onus.get(&onu_id).ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotFound, "unknown ONU-ID in OLT session")
@@ -893,7 +908,7 @@ impl<B: Bus> FslOltSession<B> {
             ));
         }
         self.mgmt
-            .send_omci_frame(
+            .send_omci_frame_with_phases(
                 u16::from(onu_id),
                 true,
                 payload,

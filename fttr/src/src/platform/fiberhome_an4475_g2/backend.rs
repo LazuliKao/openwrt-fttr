@@ -27,7 +27,7 @@ impl PlatformBackend for An4475G2 {
             transceiver_telemetry: false,
             fpga_diagnostics: false,
             bosa_diagnostics: true,
-            calibration_profile: Some(fttr_api::PlatformCalibrationProfile::Ux3326),
+            calibration_profile: Some(fttr_api::PlatformCalibrationProfile::Ux3326sFactory),
             npu_offload: false,
             omci_mib: true,
             downstream_fec: true,

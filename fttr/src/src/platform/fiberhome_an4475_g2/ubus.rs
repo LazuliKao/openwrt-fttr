@@ -226,9 +226,7 @@ impl Handlers {
         })?)
     }
     fn get_calibration(&self, _: EmptyRequest) -> Result<CalibrationInfoReply, i32> {
-        Ok(CalibrationInfoReply::Error(CommandError {
-            error: "UX3326S calibration is loaded from /dev/ubi0_3 @ 0x1a5000".into(),
-        }))
+        Ok(CalibrationInfoReply::Native(super::calibration::info()))
     }
     fn select_calibration(&self, _: CalibrationSelectRequest) -> Result<CalibrationInfoReply, i32> {
         Ok(CalibrationInfoReply::Error(CommandError {

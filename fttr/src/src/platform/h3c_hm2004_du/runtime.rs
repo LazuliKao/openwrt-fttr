@@ -78,6 +78,14 @@ impl OpticalBackend for RuntimeOptics<'_> {
     fn mac_tx_allowed(&self) -> bool {
         super::pon_mac::snapshot().tx_enabled == Some(true)
     }
+    fn reconcile_controls(&mut self, master_enabled: bool) -> io::Result<()> {
+        let (tx, fec) = super::pon_mac::desired();
+        crate::controller::pon_mac::reconcile(
+            (master_enabled && tx, master_enabled && fec),
+            || self.quiesce(),
+            super::mac::set_downstream,
+        )
+    }
     fn ready(&self) -> bool {
         self.ready
     }
@@ -608,13 +616,11 @@ async fn run_async(platform: PlatformContext) {
             let mut services = super::service::Services::new(platform, service_states);
             let mut grant_cycle = 0usize;
             let mut optics = OpticalActor { state };
-            let mut mac_allowed = false;
-            let mut last_mac_poll = Instant::now() - Duration::from_secs(2);
-            let mut last_mac_desired = None;
+            let mut mac_poll = crate::controller::pon_mac::Poll::default();
             let mut temperature_compensation = optical_calibration::Compensator::default();
             loop {
                 let ready = hardware_ready.load(Ordering::Acquire);
-                {
+                let mac_allowed = {
                     let mut backend = RuntimeOptics {
                         ready, ranging: &mut ranging, online: &mut online,
                         pending_cleanup: &mut pending_cleanup, services: &mut services,
@@ -626,23 +632,13 @@ async fn run_async(platform: PlatformContext) {
                             eprintln!("[-] Optical reply receiver unavailable: {error}");
                         }
                     }
-                    if last_mac_poll.elapsed() >= Duration::from_secs(1) {
-                        if let Err(error) = crate::optical::refresh() {
-                            eprintln!("[-] Optical configuration: {error}");
+                    if ready && !stopping.load(Ordering::Acquire) && mac_poll.due() {
+                        if let Err(error) = optics.reconcile(&mut backend) {
+                            eprintln!("[-] GPON controls: {error}");
                         }
                     }
-                    let desired = super::pon_mac::desired();
-                    if ready && !stopping.load(Ordering::Acquire)
-                        && (last_mac_poll.elapsed() >= Duration::from_secs(1) || last_mac_desired != Some(desired))
-                    {
-                        // Invalidate workers and carrier before stopping GPON transmission.
-                        // Even failed cleanup must still permit disabling the MAC.
-                        let result = super::pon_mac::apply(desired, || backend.quiesce(), super::mac::set_downstream);
-                        mac_allowed = super::pon_mac::record(result);
-                        last_mac_poll = Instant::now();
-                        last_mac_desired = Some(desired);
-                    }
-                }
+                    backend.mac_tx_allowed()
+                };
                 // Independent of the MAC TX flag: compensate the released BOSA even
                 // when downstream GPON frames are administratively disabled.
                 if let Err(error) = temperature_compensation.poll(

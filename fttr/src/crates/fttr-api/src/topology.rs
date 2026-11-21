@@ -47,6 +47,7 @@ pub enum TopologySourceState {
     Ok,
     Partial,
     Unavailable,
+    NotApplicable,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
