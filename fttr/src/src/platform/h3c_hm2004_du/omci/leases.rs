@@ -29,6 +29,12 @@ fn business_grant_control(id: u8) -> u32 {
     grant_control(id, &BUSINESS_GRANT_FLOORS)
 }
 
+// An active OMCC lease needs its own grant before business ownership exists:
+// identity collection itself runs before the device adapter can be selected.
+fn management_grant_control(id: u8) -> u32 {
+    0x11000000 | u32::from(MANAGEMENT_GRANT_FLOORS[id as usize].load(Ordering::SeqCst))
+}
+
 fn grant_control(id: u8, floors: &[AtomicU16; 16]) -> u32 {
     let floor = if allocation_enabled_after_lease(BUSINESS_ALLOCATIONS.load(Ordering::SeqCst), id) {
         floors[id as usize].load(Ordering::SeqCst)
@@ -114,13 +120,13 @@ impl StockOmccLease {
             saved,
             disarmed: false,
             business_grant_floor: (business_grant_control(id) & 0xffff) as u16,
-            management_grant_floor: (grant_control(id, &MANAGEMENT_GRANT_FLOORS) & 0xffff) as u16,
+            management_grant_floor: (management_grant_control(id) & 0xffff) as u16,
         };
         for (i, &(addr, old)) in lease.saved.iter().enumerate() {
             let value = match i {
                 0 => old | (1 << id),
                 2 => business_grant_control(id),
-                _ => grant_control(id, &MANAGEMENT_GRANT_FLOORS),
+                _ => management_grant_control(id),
             };
             println!("STOCK_OMCC {addr:08x}: {old:08x}->{value:08x}");
             if i == 0 {
@@ -244,14 +250,16 @@ mod tests {
         service.disarm();
         drop(service); // Persistent service must not run temporary teardown.
         assert_eq!(business_grant_control(15), 0x110000fe);
-        assert_eq!(grant_control(15, &MANAGEMENT_GRANT_FLOORS), 0x1100003c);
+        assert_eq!(management_grant_control(15), 0x1100003c);
         assert!(allocation_enabled_after_lease(
             BUSINESS_ALLOCATIONS.load(Ordering::SeqCst),
             15
         ));
         forget_business_allocation(15);
         assert_eq!(business_grant_control(15), 0x11000000);
-        assert_eq!(grant_control(15, &MANAGEMENT_GRANT_FLOORS), 0x11000000);
+        // Initial identity reads still get the management floor, but cannot
+        // create or retain a business allocation.
+        assert_eq!(management_grant_control(15), 0x1100003c);
         assert!(!allocation_enabled_after_lease(
             BUSINESS_ALLOCATIONS.load(Ordering::SeqCst),
             15
