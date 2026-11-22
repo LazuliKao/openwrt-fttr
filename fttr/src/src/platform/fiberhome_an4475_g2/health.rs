@@ -1,5 +1,5 @@
 //! Serialized OMCI liveness, diagnostic work, and per-ONU VPORT carrier gating
-//! on the FSL transport (`fttr1..fttr16` 802.1ad ports over `fttr0`).
+//! on the FSL transport (`fttr1..fttr128` 802.1ad ports over `fttr0`).
 use super::{port_gate::PortGate, vport, RESOURCES};
 use crate::{
     controller::{attribute_probe, fec, inventory, service, telemetry},

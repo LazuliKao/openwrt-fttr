@@ -339,7 +339,7 @@ fn print_status_table(status: &FttrSystemStatus) {
 
     // 2. Switch Ports Table
     println!("------------------------------------------------------------------------------------------");
-    println!(" Downstream DSA Switch Ports (fttr1 ~ fttr16)");
+    println!(" Downstream ports");
     println!("----------------------------------------------------------------------------------------------------");
     println!(
         " {:<6} {:<10} {:<10} {:<12} {:<8} {:<16} {:<24}",

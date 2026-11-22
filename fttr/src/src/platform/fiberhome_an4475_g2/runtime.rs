@@ -716,6 +716,12 @@ impl OpticalBackend for RuntimeOptics<'_> {
 }
 
 fn initialize_hardware(stopping: &AtomicBool) -> io::Result<OpticalState> {
+    let pins = crate::provisioning::load_config()
+        .map_err(|error| io::Error::other(format!("cannot load ONU pins: {error}")))?
+        .onu_pins;
+    super::RESOURCES
+        .validate_pins(&pins)
+        .map_err(io::Error::other)?;
     let config = OltSessionConfig {
         nni_eth_tpid: super::initialization::defaults::IEEE_8021AD_TPID,
         ..OltSessionConfig::default()
@@ -723,6 +729,7 @@ fn initialize_hardware(stopping: &AtomicBool) -> io::Result<OpticalState> {
     super::vport::prepare_nni_and_ports(NNI_INTERFACE, config.nni_gem_port_offset, stopping)?;
     let dev = Device::open(Path::new(FSL_DEVICE_PATH))?;
     let mut session = FslOltSession::new(dev, config);
+    session.set_onu_pins(pins);
     runtime_state()
         .master_enabled
         .store(false, Ordering::Release);

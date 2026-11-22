@@ -195,6 +195,7 @@ pub struct FslOltSession<B: Bus> {
     gdba_pending_initialized: bool,
     active_na_tconts: BTreeSet<u8>,
     onus: BTreeMap<u8, ManagedOnu>,
+    onu_pins: BTreeMap<String, u8>,
     state_entered_at: BTreeMap<u8, Instant>,
     losi_counts: BTreeMap<u8, u8>,
     lofi_counts: BTreeMap<u8, u8>,
@@ -218,6 +219,7 @@ impl<B: Bus> FslOltSession<B> {
             gdba_pending_initialized: false,
             active_na_tconts: BTreeSet::new(),
             onus: BTreeMap::new(),
+            onu_pins: BTreeMap::new(),
             state_entered_at: BTreeMap::new(),
             losi_counts: BTreeMap::new(),
             lofi_counts: BTreeMap::new(),
@@ -420,8 +422,37 @@ impl<B: Bus> FslOltSession<B> {
         Ok(())
     }
 
-    fn allocate_onu_slot(&self) -> io::Result<(u16, u8)> {
+    pub(crate) fn set_onu_pins(&mut self, pins: BTreeMap<String, u8>) {
+        self.onu_pins = pins;
+    }
+
+    fn allocate_onu_slot(&self, serial_number: &[u8; 8]) -> io::Result<(u16, u8)> {
         let max_onus = self.config.init.max_onu_id.min(128);
+        let identity = crate::pon_engine::ploam::GponOnu::new(
+            0,
+            serial_number[..4].try_into().unwrap(),
+            serial_number[4..].try_into().unwrap(),
+        )
+        .full_sn_str()
+        .to_ascii_uppercase();
+        if let Some(&id) = self.onu_pins.get(&identity) {
+            let index = u16::from(id)
+                .checked_sub(u16::from(self.onu_id_offset))
+                .filter(|index| *index < max_onus)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "pinned ONU-ID outside hardware range",
+                    )
+                })?;
+            if self.onus.values().any(|onu| onu.onu_index == index) {
+                return Err(io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    "pinned ONU-ID already occupied",
+                ));
+            }
+            return Ok((index, id));
+        }
         for onu_idx in 0..max_onus {
             if self.onus.values().any(|onu| onu.onu_index == onu_idx) {
                 continue;
@@ -430,6 +461,9 @@ impl<B: Bus> FslOltSession<B> {
             let onu_id = u8::try_from(raw_id).map_err(|_| {
                 io::Error::new(io::ErrorKind::InvalidInput, "allocated ONU-ID exceeds u8")
             })?;
+            if self.onu_pins.values().any(|reserved| *reserved == onu_id) {
+                continue;
+            }
             return Ok((onu_idx, onu_id));
         }
         Err(io::Error::new(
@@ -568,7 +602,7 @@ impl<B: Bus> FslOltSession<B> {
             }
         }
 
-        let (onu_index, onu_id) = self.allocate_onu_slot()?;
+        let (onu_index, onu_id) = self.allocate_onu_slot(&serial_number)?;
         set_onu_upstream_rate_2p5g(
             &mut self.mgmt.fsl,
             onu_index,

@@ -41,6 +41,41 @@ use crate::platform::fiberhome_an4475_g2::{
 };
 use std::collections::{BTreeMap, VecDeque};
 
+#[test]
+fn pinned_high_slot_is_reserved_and_allocated_to_matching_identity() {
+    let mut session = FslOltSession::new(SimBus::new(), OltSessionConfig::default());
+    session.set_onu_pins(BTreeMap::from([
+        ("TEST01020304".into(), 127),
+        ("FAKE01020304".into(), 0),
+    ]));
+    assert_eq!(
+        session.allocate_onu_slot(b"TEST\x01\x02\x03\x04").unwrap(),
+        (127, 127)
+    );
+    assert_eq!(
+        session.allocate_onu_slot(b"OTHR\x01\x02\x03\x04").unwrap(),
+        (1, 1)
+    );
+    session.onus.insert(
+        127,
+        ManagedOnu {
+            onu_id: 127,
+            onu_index: 127,
+            serial_number: *b"OTHR\x01\x02\x03\x04",
+            rate: OnuUpstreamRate::Rate1p25G,
+            eqd: 0,
+            state: OnuState::Ranging,
+        },
+    );
+    assert_eq!(
+        session
+            .allocate_onu_slot(b"TEST\x01\x02\x03\x04")
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::AddrInUse
+    );
+}
+
 const SERDES_APB_CTRL: u32 = 0x1103;
 const SERDES_APB_RDATA: u32 = 0x1102;
 const APB_ACK: u32 = 1 << 17;

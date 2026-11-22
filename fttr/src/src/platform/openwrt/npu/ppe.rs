@@ -261,7 +261,7 @@ fn discover_live_bridge_ports(net_path: &Path, bridge: &str) -> Vec<String> {
     }
     let expected_master = format!("../{bridge}");
     let mut ports = Vec::new();
-    for port in 1..=16 {
+    for port in 1..=128 {
         let name = format!("fttr{port}");
         let path = net_path.join(&name);
         if read_text(path.join("carrier")).as_deref() != Some("1")

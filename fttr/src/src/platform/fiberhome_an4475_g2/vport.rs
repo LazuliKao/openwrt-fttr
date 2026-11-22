@@ -2,7 +2,7 @@
 //!
 //! FSL maps upstream/downstream NNI outer VLAN IDs using `VID = gem_port_id - NNI_GEMPORT_OFFSET`.
 //! Programming the FSL NNI TPID to `0x88a8` lets the standard Linux `8021q` stack demultiplex
-//! each ONU onto its own `fttr1..fttr16` netdev while preserving inner `0x8100` business/TR-069 VLANs.
+//! each ONU onto its own `fttr1..fttr128` netdev while preserving inner `0x8100` business/TR-069 VLANs.
 use super::RESOURCES;
 use crate::platform::openwrt::command::run_sync;
 use std::{
@@ -272,6 +272,7 @@ mod tests {
         assert_eq!(gem_to_vid(0x100, 255).unwrap(), 1);
         assert_eq!(gem_to_vid(0x101, 255).unwrap(), 2);
         assert_eq!(gem_to_vid(0x10f, 255).unwrap(), 16);
+        assert_eq!(gem_to_vid(0x17f, 255).unwrap(), 128);
         assert!(gem_to_vid(255, 255).is_err());
         assert!(gem_to_vid(254, 255).is_err());
         assert!(gem_to_vid(4095, 0).is_err());

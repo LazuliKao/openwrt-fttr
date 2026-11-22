@@ -141,7 +141,11 @@ pub fn topology_for_model(
     {
         return Ok(topology);
     }
-    for port in 1..=16 {
+    let max_port = match model {
+        NpuAdmissionModel::PortMask => 16,
+        NpuAdmissionModel::DirectionOnly => 128,
+    };
+    for port in 1..=max_port {
         let name = format!("fttr{port}");
         let path = net.join(&name);
         if text(path.join("carrier")).ok().as_deref() != Some("1")
@@ -155,7 +159,9 @@ pub fn topology_for_model(
             .iter()
             .map(|field| text(path.join(field)))
             .collect::<io::Result<Vec<_>>>()?;
-        topology.mask |= 1 << (port - 1);
+        if port <= 16 {
+            topology.mask |= 1 << (port - 1);
+        }
         topology.ports.push((name, identity));
     }
     let min_ports = if topology.routed { 1 } else { 2 };
@@ -944,6 +950,37 @@ mod tests {
         )
         .unwrap();
         assert_eq!(d2.direction_mask, 7);
+
+        // A high-numbered live port participates in direction-only admission,
+        // but never in the HM2004 16-bit hardware mask.
+        for (field, value) in [
+            ("carrier", "1"),
+            ("brport/state", "3"),
+            ("brport/learning", "1"),
+            ("ifindex", "128"),
+            ("mtu", "1500"),
+            ("address", "00:00:00:00:00:80"),
+        ] {
+            let path = root.join("fttr128").join(field);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, value).unwrap();
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("../br-lan", root.join("fttr128/master")).unwrap();
+        #[cfg(unix)]
+        {
+            let high = topology_for_model(
+                NpuAdmissionModel::DirectionOnly,
+                &all_policy,
+                &root,
+                &directions,
+            )
+            .unwrap();
+            assert!(high.ports.iter().any(|(name, _)| name == "fttr128"));
+            assert_eq!(high.mask, 3);
+            assert_eq!(topology(&policy, &root, &mask).unwrap().ports.len(), 2);
+            fs::write(root.join("fttr128/brport/state"), "2").unwrap();
+        }
 
         // With only 1 port forwarding, routed bits (3) remain admissible while onu_bridge bit (4) is withheld.
         fs::write(root.join("fttr2/brport/state"), "2").unwrap();

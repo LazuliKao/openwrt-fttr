@@ -6,6 +6,8 @@
 //! provides persistence mechanics without choosing formats or retry behavior.
 pub(crate) use crate::bootstrap;
 mod config;
+#[cfg(feature = "platform-fiberhome-an4475-g2")]
+pub(crate) use config::load as load_config;
 pub(crate) use config::words as uci_words;
 pub(crate) mod command;
 pub(crate) mod controller;

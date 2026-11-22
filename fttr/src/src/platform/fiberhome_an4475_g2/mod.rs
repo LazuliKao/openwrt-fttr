@@ -57,7 +57,7 @@ pub mod upstream;
 pub(crate) mod vport;
 
 #[cfg(feature = "platform-fiberhome-an4475-g2")]
-pub const ONU_COUNT: usize = 16;
+pub const ONU_COUNT: usize = 128;
 
 #[cfg(feature = "platform-fiberhome-an4475-g2")]
 const ONU_IDS: [u8; ONU_COUNT] = {
@@ -73,7 +73,20 @@ const ONU_IDS: [u8; ONU_COUNT] = {
 #[cfg(feature = "platform-fiberhome-an4475-g2")]
 const DOWNSTREAM_INTERFACES: [&str; ONU_COUNT] = [
     "fttr1", "fttr2", "fttr3", "fttr4", "fttr5", "fttr6", "fttr7", "fttr8", "fttr9", "fttr10",
-    "fttr11", "fttr12", "fttr13", "fttr14", "fttr15", "fttr16",
+    "fttr11", "fttr12", "fttr13", "fttr14", "fttr15", "fttr16", "fttr17", "fttr18", "fttr19",
+    "fttr20", "fttr21", "fttr22", "fttr23", "fttr24", "fttr25", "fttr26", "fttr27", "fttr28",
+    "fttr29", "fttr30", "fttr31", "fttr32", "fttr33", "fttr34", "fttr35", "fttr36", "fttr37",
+    "fttr38", "fttr39", "fttr40", "fttr41", "fttr42", "fttr43", "fttr44", "fttr45", "fttr46",
+    "fttr47", "fttr48", "fttr49", "fttr50", "fttr51", "fttr52", "fttr53", "fttr54", "fttr55",
+    "fttr56", "fttr57", "fttr58", "fttr59", "fttr60", "fttr61", "fttr62", "fttr63", "fttr64",
+    "fttr65", "fttr66", "fttr67", "fttr68", "fttr69", "fttr70", "fttr71", "fttr72", "fttr73",
+    "fttr74", "fttr75", "fttr76", "fttr77", "fttr78", "fttr79", "fttr80", "fttr81", "fttr82",
+    "fttr83", "fttr84", "fttr85", "fttr86", "fttr87", "fttr88", "fttr89", "fttr90", "fttr91",
+    "fttr92", "fttr93", "fttr94", "fttr95", "fttr96", "fttr97", "fttr98", "fttr99", "fttr100",
+    "fttr101", "fttr102", "fttr103", "fttr104", "fttr105", "fttr106", "fttr107", "fttr108",
+    "fttr109", "fttr110", "fttr111", "fttr112", "fttr113", "fttr114", "fttr115", "fttr116",
+    "fttr117", "fttr118", "fttr119", "fttr120", "fttr121", "fttr122", "fttr123", "fttr124",
+    "fttr125", "fttr126", "fttr127", "fttr128",
 ];
 
 #[cfg(feature = "platform-fiberhome-an4475-g2")]
@@ -122,4 +135,23 @@ impl PlatformAdapter for An4475G2 {
         identification: IdentificationStatus::Verified,
         implementation: PlatformImplementation::Runtime,
     };
+}
+
+#[cfg(all(test, feature = "platform-fiberhome-an4475-g2"))]
+mod resource_tests {
+    use super::*;
+
+    #[test]
+    fn all_slots_have_distinct_valid_allocations_and_interfaces() {
+        for id in 0..128u8 {
+            let entry = RESOURCES.onu(id).unwrap();
+            assert_eq!(entry.alloc_id, 0x400 + u16::from(id));
+            assert_eq!(entry.gem_id, 0x100 + u16::from(id));
+            assert_eq!(
+                entry.interface.unwrap(),
+                format!("fttr{}", u16::from(id) + 1)
+            );
+        }
+        assert!(RESOURCES.onu(128).is_err());
+    }
 }
