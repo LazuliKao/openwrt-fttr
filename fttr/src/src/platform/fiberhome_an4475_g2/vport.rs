@@ -156,6 +156,11 @@ pub fn prepare_nni_and_ports(nni: &str, gem_offset: u16, stopping: &AtomicBool) 
     let _guard = VPORT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // Reject a foreign or legacy port before changing the NNI or any sibling.
     for entry in RESOURCES.allocations {
+        // Same responsiveness rule as the creation loop below: this pass also
+        // shells out once per port.
+        if stopping.load(Ordering::Acquire) {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "stopping"));
+        }
         let Some(iface) = entry.interface else {
             continue;
         };
@@ -185,6 +190,12 @@ pub fn prepare_nni_and_ports(nni: &str, gem_offset: u16, stopping: &AtomicBool) 
 
     let bridge = configured_bridge();
     for entry in RESOURCES.allocations {
+        // 128 ports × several bounded `ip` calls each: keep a shutdown request
+        // responsive instead of finishing the whole loop. The next start
+        // re-runs this idempotent preparation for the remaining ports.
+        if stopping.load(Ordering::Acquire) {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "stopping"));
+        }
         let Some(iface) = entry.interface else {
             continue;
         };

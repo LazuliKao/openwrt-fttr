@@ -1,5 +1,13 @@
 //! `OmciTransport` adapter over shared FiberHome FSL `Management` ownership.
 //!
+//! NOT used by the AN4475-G2 backend: `platform::backend` wires
+//! `runtime::FslOmciTransport` (session-scoped queues, `selection = true`).
+//! This module stays for two reasons: (1) it is the only integration test
+//! driving `Management` OMCI send/receive end to end through `OmciTransport`,
+//! and (2) it documents the raw (`selection = false`) path as a reference
+//! implementation — whether the OMCI downstream selector bit is 0 or 1 is an
+//! unresolved hardware question (see downstream.rs on descriptor bit 27).
+//!
 //! Sends 48-byte ITU-T G.984.4 baseline frames (`BaselineFrame::to_bytes`) on
 //! the raw OMCI (`selection = false`) path and decodes matching `OmciKind::Omci`
 //! upstream frames. Ambiguous (`Indeterminate`) SPI/handshake errors propagate

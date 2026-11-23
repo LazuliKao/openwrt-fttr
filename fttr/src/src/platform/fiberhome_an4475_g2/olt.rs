@@ -199,6 +199,9 @@ pub struct FslOltSession<B: Bus> {
     state_entered_at: BTreeMap<u8, Instant>,
     losi_counts: BTreeMap<u8, u8>,
     lofi_counts: BTreeMap<u8, u8>,
+    /// Previous DyingGasp bitmap observation for edge detection; the register
+    /// itself is never written (its latch/clear semantics are unverified).
+    last_dying_gasp_bitmap: [u32; 4],
     pending_port_id_acks: Vec<PendingPortIdAck>,
     blacklist: BTreeSet<([u8; 8], OnuUpstreamRate)>,
     whitelist: BTreeSet<([u8; 8], OnuUpstreamRate)>,
@@ -223,6 +226,7 @@ impl<B: Bus> FslOltSession<B> {
             state_entered_at: BTreeMap::new(),
             losi_counts: BTreeMap::new(),
             lofi_counts: BTreeMap::new(),
+            last_dying_gasp_bitmap: [0; 4],
             pending_port_id_acks: Vec::new(),
             blacklist: BTreeSet::new(),
             whitelist: BTreeSet::new(),
@@ -377,14 +381,27 @@ impl<B: Bus> FslOltSession<B> {
 
         if interrupts.contains(&GponInterrupt::DyingGasp) {
             let bitmap = read_alarm_bitmap(&mut self.mgmt.fsl, GPON_DYING_GASP_ALM)?;
+            // The bitmap's latch/clear semantics are unverified (see
+            // read_alarm_bitmap). React only to newly set bits so a latched
+            // stale bit cannot kill a slot-reused ONU; a missed event on
+            // read-clears hardware is covered by the independent PLOAM
+            // Dying_Gasp path in the runtime poll loop.
             for &(onu_id, onu_index) in &active {
                 if alarm_bitmap_contains(&bitmap, onu_index)
+                    && !alarm_bitmap_contains(&self.last_dying_gasp_bitmap, onu_index)
                     && !offline.iter().any(|&(id, _)| id == onu_id)
                 {
                     offline.push((onu_id, "dying_gasp"));
                 }
             }
+            self.last_dying_gasp_bitmap = bitmap;
         }
+        // LOSI/LOFI intentionally keep per-event counting (no DG-style edge
+        // gate): unlike DyingGasp there is no independent backstop path, so a
+        // gate that never fires on a persistent latched bit would blind the
+        // offline detection. Slot reuse starts from cleared counters (removed
+        // on deactivation), leaving only the unverified latched-bit case --
+        // see EVIDENCE/BENCH-CHECKLIST.md section 1 before changing this.
         if interrupts.contains(&GponInterrupt::Losi) {
             let bitmap = read_alarm_bitmap(&mut self.mgmt.fsl, GPON_LOSI_ALM)?;
             for &(onu_id, onu_index) in &active {
@@ -481,6 +498,31 @@ impl<B: Bus> FslOltSession<B> {
     ) -> io::Result<()> {
         initialization::release_reset(&mut self.mgmt.fsl, &self.config.init, checkpoint)?;
         self.onu_id_offset = apply_gpon_defaults(&mut self.mgmt.fsl, self.config.init.max_onu_id)?;
+        // The whole stack below keys hardware rows by ONU-ID == ONU-index: the
+        // static RESOURCES table, GDBA Alloc-ID math (alloc_offset_mode 0), the
+        // OMCC GEM mapping and the OMCI response queue key. Refuse to run when
+        // the board was provisioned with a non-zero offset instead of misrouting.
+        if self.onu_id_offset != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "hardware GPON_ONUID_OFFSET_CFG={} is unsupported; this stack assumes \
+                     ONU-ID == ONU-index (offset 0) for RESOURCES/GDBA/OMCC mapping",
+                    self.onu_id_offset
+                ),
+            ));
+        }
+        let alloc_offset_mode = activation::read_alloc_offset_mode(&mut self.mgmt.fsl)?;
+        if alloc_offset_mode != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "hardware BWMAP_CFG_BASIC.ALLOCID_OFFSET={} is unsupported; the static \
+                     Alloc-ID table (0x400+index) assumes alloc_offset_mode 0",
+                    alloc_offset_mode
+                ),
+            ));
+        }
         configure_rssi_ad_ctrl(&mut self.mgmt.fsl, None, None, Some(true))?;
         configure_nni_vport(
             &mut self.mgmt.fsl,

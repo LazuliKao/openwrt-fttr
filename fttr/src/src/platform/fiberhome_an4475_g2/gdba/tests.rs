@@ -73,7 +73,13 @@ fn alloc_to_tcont_handles_omcc_and_data_bands() {
     assert_eq!(alloc_to_tcont(0x400, 0, 128, 0).unwrap(), 128);
     assert_eq!(alloc_to_tcont(0x47f, 0, 128, 0).unwrap(), 255);
     assert_eq!(alloc_to_tcont(0x800, 0, 128, 1).unwrap(), 128);
+    assert_eq!(alloc_to_tcont(2050, 0, 128, 1).unwrap(), 130);
     assert_eq!(alloc_to_tcont(0xc00, 0, 128, 2).unwrap(), 128);
+    assert_eq!(alloc_to_tcont(3080, 0, 128, 2).unwrap(), 136);
+
+    // Default T-CONT window with a non-zero hardware ONU-ID offset.
+    assert_eq!(alloc_to_tcont(10, 4, 128, 0).unwrap(), 6);
+    assert!(alloc_to_tcont(3, 4, 128, 0).is_err());
 
     assert!(alloc_to_tcont(0x480, 0, 128, 0).is_err());
     assert!(alloc_to_tcont(0x400, 0, 128, 1).is_err());

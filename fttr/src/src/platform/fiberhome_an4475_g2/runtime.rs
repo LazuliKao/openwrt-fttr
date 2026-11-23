@@ -6,6 +6,7 @@ use super::{
     },
     gdba::{alloc_to_tcont, GdbaAllocConfig},
     olt::{FslOltSession, OltSessionConfig, OnuState as FslOnuState, OnuUpstreamRate},
+    protocol::Bus,
     transport::Device,
     ONU_COUNT,
 };
@@ -14,6 +15,7 @@ use crate::{
         ipc_server, lifetime,
         optical_owner::{OpticalActor, OpticalBackend, OpticalClient, OpticalCommand},
         service,
+        ubus_mib::UBUS_ERROR_INTERNAL,
     },
     ipc::{self, SubDevice},
     platform::{
@@ -94,12 +96,12 @@ fn log_receive_path_snapshot(session: &mut FslOltSession<Device>) -> io::Result<
     Ok(())
 }
 
+/// Shared runtime slots. Optical replies always report the actual TX register
+/// via read_tx (FSL has no independently verified BOSA RESET_N control whose
+/// state a software flag could be trusted over the hardware).
 struct FslRuntimeState {
     session: Mutex<Option<FslOltSession<Device>>>,
     omci_rx: Mutex<BTreeMap<u8, VecDeque<BaselineFrame>>>,
-    // FSL has no independently verified BOSA RESET_N control. This is the
-    // owner's committed master state; physical emission is reported by pon_mac.
-    master_enabled: AtomicBool,
     cleanup_pending: AtomicBool,
 }
 
@@ -109,7 +111,6 @@ fn runtime_state() -> &'static FslRuntimeState {
     RUNTIME.get_or_init(|| FslRuntimeState {
         session: Mutex::new(None),
         omci_rx: Mutex::new(BTreeMap::new()),
-        master_enabled: AtomicBool::new(false),
         cleanup_pending: AtomicBool::new(false),
     })
 }
@@ -277,6 +278,17 @@ fn queue_omci_response(queue: &mut VecDeque<BaselineFrame>, frame: BaselineFrame
         queue.pop_front();
     }
     queue.push_back(frame);
+}
+
+/// OMCI responses are queued per raw source (upstream metadata bits 21:14),
+/// which only routes meaningfully while that value matches a live ONU. With the
+/// offset-0 invariant enforced at initialize, source == ONU-ID holds; accepting
+/// anything else would grow unbounded queues for unknown sources and mask a
+/// wrong field interpretation behind silent drops.
+pub(super) fn omci_source_is_live<B: Bus>(session: &FslOltSession<B>, source: u8) -> bool {
+    session
+        .onu(source)
+        .is_some_and(|onu| onu.state == FslOnuState::Active)
 }
 
 #[cfg(test)]
@@ -690,20 +702,22 @@ impl OpticalBackend for RuntimeOptics<'_> {
                 enabled && settings.fec_enabled,
             )
         });
-        let ok = result.is_ok();
         let error = result.as_ref().err().map(ToString::to_string);
         crate::controller::pon_mac::record(result);
-        runtime_state()
-            .master_enabled
-            .store(enabled && ok, Ordering::Release);
         error.map_or(Ok(()), |error| Err(io::Error::other(error)))
     }
 
     fn read_tx(&mut self) -> io::Result<bool> {
-        // Master state is not a claim of measured light or a BOSA reset readback.
-        // Subordinate register readback is checked by reconcile_controls.
-        with_session(|session| session.fsl_mut().pon_mac_readback())
-            .map(|_| runtime_state().master_enabled.load(Ordering::Acquire))
+        // Same semantics as the HM2004 backend: the actual register value, not
+        // the software's committed state. A sticky register after a failed
+        // recovery write must be visible to the owner instead of being masked;
+        // this is not a claim of measured light or a BOSA reset readback.
+        with_session(|session| {
+            session
+                .fsl_mut()
+                .pon_mac_readback()
+                .and_then(readback_tx_enabled)
+        })
     }
 
     fn desired(&self) -> io::Result<bool> {
@@ -715,13 +729,26 @@ impl OpticalBackend for RuntimeOptics<'_> {
     }
 }
 
-fn initialize_hardware(stopping: &AtomicBool) -> io::Result<OpticalState> {
-    let pins = crate::provisioning::load_config()
-        .map_err(|error| io::Error::other(format!("cannot load ONU pins: {error}")))?
-        .onu_pins;
-    super::RESOURCES
-        .validate_pins(&pins)
-        .map_err(io::Error::other)?;
+fn initialize_hardware(
+    engine: &Mutex<PonEngine>,
+    stopping: &AtomicBool,
+) -> io::Result<OpticalState> {
+    // ONU pins are an allocation preference, not a hardware prerequisite: a
+    // malformed UCI section must not take the whole optical service down. Fall
+    // back to pure automatic allocation and surface the reason via the log.
+    let pins = match crate::provisioning::load_config() {
+        Ok(config) => match super::RESOURCES.validate_pins(&config.onu_pins) {
+            Ok(()) => config.onu_pins,
+            Err(error) => {
+                eprintln!("[-] FSL ONU pins invalid, using automatic allocation: {error}");
+                BTreeMap::new()
+            }
+        },
+        Err(error) => {
+            eprintln!("[-] FSL cannot load ONU pins, using automatic allocation: {error}");
+            BTreeMap::new()
+        }
+    };
     let config = OltSessionConfig {
         nni_eth_tpid: super::initialization::defaults::IEEE_8021AD_TPID,
         ..OltSessionConfig::default()
@@ -729,10 +756,18 @@ fn initialize_hardware(stopping: &AtomicBool) -> io::Result<OpticalState> {
     super::vport::prepare_nni_and_ports(NNI_INTERFACE, config.nni_gem_port_offset, stopping)?;
     let dev = Device::open(Path::new(FSL_DEVICE_PATH))?;
     let mut session = FslOltSession::new(dev, config);
-    session.set_onu_pins(pins);
-    runtime_state()
-        .master_enabled
-        .store(false, Ordering::Release);
+    session.set_onu_pins(pins.clone());
+    // Report the session-enforced set as the active pinning state: provisioning
+    // seeds the engine with the raw desired configuration, and a degraded set
+    // must show up as desired != active (pending_restart), not as enforced.
+    if let Ok(mut engine) = engine.lock() {
+        engine.onu_pins = pins;
+    } else {
+        // A poisoned engine lock leaves the status view on its seeded pin set
+        // while the session enforces the degraded set; say so instead of
+        // silently diverging.
+        eprintln!("[-] FSL engine lock poisoned; status keeps the seeded pin set");
+    }
     let initialized: io::Result<_> = (|| {
         session.initialize(&mut |delay| {
             if stopping.load(Ordering::Acquire) {
@@ -781,15 +816,55 @@ fn initialize_hardware(stopping: &AtomicBool) -> io::Result<OpticalState> {
             }));
         }
     };
-    runtime_state()
-        .master_enabled
-        .store(desired, Ordering::Release);
     *slot = Some(session);
     Ok(if desired {
         OpticalState::Enabled
     } else {
         OpticalState::Disabled
     })
+}
+
+/// Whether another full initialization attempt is worth running. Each attempt
+/// rebuilds vports and reopens the device from scratch, so retrying is only
+/// meaningful before service shutdown and only after a failure.
+fn init_should_retry(initial: &io::Result<OpticalState>, stopping: bool) -> bool {
+    match initial {
+        // A rejected platform invariant (e.g. the offset=0 fail-fast) is a
+        // configuration mismatch: retrying cannot fix it and only burns
+        // bounded hardware reset cycles before the supervised restart.
+        Err(error) if error.kind() == io::ErrorKind::Unsupported => false,
+        Err(_) => !stopping,
+        Ok(_) => false,
+    }
+}
+
+/// Register truth for optical replies; the committed master flag stays
+/// owner-internal and must never mask a sticky hardware bit.
+fn readback_tx_enabled(readback: crate::platform::resources::PonMacReadback) -> io::Result<bool> {
+    readback
+        .tx_enabled
+        .ok_or_else(|| io::Error::other("FSL PON-MAC readback lost the TX bit"))
+}
+
+/// Returns the fault message for a permanent initialization failure, or None
+/// when initialization succeeded or was interrupted by a service shutdown
+/// (procd stop is not a fault).
+fn init_fault_message(initial: &io::Result<OpticalState>, stopping: bool) -> Option<String> {
+    match initial {
+        Ok(_) => None,
+        Err(_) if stopping => None,
+        Err(error) => Some(format!(
+            "FSL hardware initialization failed permanently: {error}"
+        )),
+    }
+}
+
+/// Bounded backoff between full initialization attempts; wakes early on stop.
+fn init_retry_backoff(attempt: u32, stopping: &AtomicBool) {
+    let deadline = Instant::now() + Duration::from_secs(u64::from(2 * attempt));
+    while Instant::now() < deadline && !stopping.load(Ordering::Acquire) {
+        thread::sleep(Duration::from_millis(100));
+    }
 }
 
 pub(crate) fn status_snapshot(
@@ -800,18 +875,34 @@ pub(crate) fn status_snapshot(
     provisioning: fttr_api::SyncStatusReply,
 ) -> Result<fttr_api::StatusReply, i32> {
     let ready = optics.hardware_ready.load(Ordering::Acquire);
-    let tx_enabled = with_session(|session| session.fsl_mut().is_tx_enabled()).ok();
+    // Same discipline as data_path: never wait for the session lock in the
+    // status path — a busy fsl-loop transaction (PLOAM/OMCI bursts, deactivate)
+    // would otherwise stall the single IPC STATUS worker. An unavailable
+    // sample beats blocking; committed state remains visible via pon_mac.
+    let tx_enabled = runtime_state()
+        .session
+        .try_lock()
+        .ok()
+        .and_then(|mut guard| {
+            guard
+                .as_mut()
+                .and_then(|session| session.fsl_mut().is_tx_enabled().ok())
+        });
     let calibration = super::calibration::info().application;
     let (measurements, measurement_evidence) = super::transceiver::snapshot();
-    let devices = devices.lock().map_err(|_| 9)?;
-    let engine = pon_engine.lock().map_err(|_| 9)?;
+    let devices = devices.lock().map_err(|_| UBUS_ERROR_INTERNAL)?;
+    let engine = pon_engine.lock().map_err(|_| UBUS_ERROR_INTERNAL)?;
     Ok(crate::platform::status::snapshot(
         &engine,
         services,
         (&devices, provisioning),
         crate::platform::status::Hardware {
             switch_port_count: super::ONU_COUNT as u8,
-            supports_pinning: false,
+            // initialize_hardware publishes the session-enforced pin set to the
+            // engine, so the pinning report distinguishes the enforced set from
+            // the desired configuration (pending_restart on divergence) instead
+            // of rendering an unenforced desired state as active.
+            supports_pinning: true,
             ranging_source: |_| "FSL upstream ranging time / calculated EqD".into(),
             has_pon_mac_fec: true,
             data_path,
@@ -1234,7 +1325,7 @@ fn ipc_handler(
             let _ = writeln!(stream, "{}", crate::capabilities::json());
         } else if line == "STATUS" {
             let reply = serde_json::from_value(crate::provisioning::snapshot())
-                .map_err(|_| 9)
+                .map_err(|_| UBUS_ERROR_INTERNAL)
                 .and_then(|provisioning| {
                     status_snapshot(&optics, &pon_engine, &devices, &services, provisioning)
                 });
@@ -1383,22 +1474,30 @@ async fn run_async(platform: PlatformContext) {
     };
     let service_states: service::States = Arc::new(Mutex::new(BTreeMap::new()));
 
-    if let Ok(listener) = ipc::create_socket_listener() {
-        ipc_server::start(
-            listener,
-            ipc_handler(
-                devices.clone(),
-                pon_engine.clone(),
-                service_states.clone(),
-                OpticalClient {
-                    platform,
-                    requests: optical_requests.clone(),
-                    hardware_ready: hardware_ready.clone(),
-                    stopping: stopping.clone(),
-                },
-            ),
-        );
-        println!("[+] IPC socket server listening on {}", ipc::SOCKET_PATH);
+    match ipc::create_socket_listener() {
+        Ok(listener) => {
+            ipc_server::start(
+                listener,
+                ipc_handler(
+                    devices.clone(),
+                    pon_engine.clone(),
+                    service_states.clone(),
+                    OpticalClient {
+                        platform,
+                        requests: optical_requests.clone(),
+                        hardware_ready: hardware_ready.clone(),
+                        stopping: stopping.clone(),
+                    },
+                ),
+            );
+            println!("[+] IPC socket server listening on {}", ipc::SOCKET_PATH);
+        }
+        Err(error) => {
+            // fttrctl is unreachable without the socket; let procd rebuild the
+            // process instead of running an unmanageable daemon.
+            eprintln!("[-] IPC socket listener unavailable: {error}");
+            std::process::exit(1);
+        }
     }
 
     let _ubus_thread = super::ubus::start(
@@ -1419,19 +1518,47 @@ async fn run_async(platform: PlatformContext) {
     let stopping_loop = stopping.clone();
     let ready_loop = hardware_ready.clone();
     let (fault_sender, fault_receiver) = tokio::sync::oneshot::channel::<String>();
+    // send() consumes the sender; the permanent-initialization, session-loss and
+    // needs-reconciliation paths must each be able to fire it exactly once.
+    let mut fault_sender = Some(fault_sender);
     let fsl_thread = thread::Builder::new()
         .name("fsl-loop".into())
         .stack_size(256 * 1024)
         .spawn(move || {
-            let initial = initialize_hardware(&stopping_loop);
+            // Bounded full retries absorb transient device/config timing without
+            // burning procd's finite respawn budget; persistent failure escalates
+            // through the fault channel so procd creates a fresh process.
+            const INIT_ATTEMPTS: u32 = 3;
+            let mut initial = initialize_hardware(&pon_engine_loop, &stopping_loop);
+            for attempt in 1..INIT_ATTEMPTS {
+                if !init_should_retry(&initial, stopping_loop.load(Ordering::Acquire)) {
+                    break;
+                }
+                if let Err(error) = &initial {
+                    eprintln!(
+                        "[-] FSL hardware initialization failed (retry {attempt}/{}): {error}",
+                        INIT_ATTEMPTS - 1
+                    );
+                }
+                init_retry_backoff(attempt, &stopping_loop);
+                initial = initialize_hardware(&pon_engine_loop, &stopping_loop);
+            }
+            let mut permanent_fault =
+                init_fault_message(&initial, stopping_loop.load(Ordering::Acquire));
             let (ready, state) = match initial {
                 Ok(state) => (true, state),
-                Err(error) => {
-                    eprintln!("[-] FSL hardware initialization failed: {error}");
-                    (false, OpticalState::Unknown)
-                }
+                Err(_) => (false, OpticalState::Unknown),
             };
             ready_loop.store(ready, Ordering::Release);
+            if let Some(message) = permanent_fault.clone() {
+                // No session was ever published, so in-process recovery is
+                // impossible: request a supervised restart instead of spinning
+                // as a non-functional daemon. The flag itself must survive so
+                // the loop below stays skipped until the process exits.
+                if let Some(sender) = fault_sender.take() {
+                    let _ = sender.send(message);
+                }
+            }
             let mut services = service::Services::new(platform, states_loop);
             let mut optics = OpticalActor { state };
             let mut observation_start = Instant::now();
@@ -1441,26 +1568,53 @@ async fn run_async(platform: PlatformContext) {
             let mut receive_snapshots_remaining = 3u8;
             let mut mac_poll = crate::controller::pon_mac::Poll::default();
             let mut next_transceiver_sample = Instant::now();
+            let mut last_unknown_source_log = Instant::now();
+            let mut unknown_source_total = 0usize;
 
-            while !stopping_loop.load(Ordering::Acquire) {
-                if with_session(|session| Ok(session.needs_reconciliation())).unwrap_or(false) {
-                    // Never clear the software flag or replay the uncertain frame.
-                    // Withdraw activation, attempt TX off, and let procd create a
-                    // fresh process that performs full reset/calibration/registration.
-                    let mut backend = RuntimeOptics {
-                        ready: ready_loop.load(Ordering::Acquire),
-                        services: &mut services,
-                        engine: &pon_engine_loop,
-                        stopping: &stopping_loop,
-                        #[cfg(feature = "npu")]
-                        npu: Some(&npu_handle),
-                    };
-                    let response = optics.handle(OpticalCommand::Shutdown, &mut backend);
-                    ready_loop.store(false, Ordering::Release);
-                    let _ = fault_sender.send(format!(
-                        "FSL management requires full reinitialization; shutdown: {response}"
-                    ));
-                    break;
+            let mut session_probe_failures = 0u32;
+            while permanent_fault.is_none() && !stopping_loop.load(Ordering::Acquire) {
+                match with_session(|session| Ok(session.needs_reconciliation())) {
+                    Ok(true) => {
+                        // Never clear the software flag or replay the uncertain frame.
+                        // Withdraw activation, attempt TX off, and let procd create a
+                        // fresh process that performs full reset/calibration/registration.
+                        let mut backend = RuntimeOptics {
+                            ready: ready_loop.load(Ordering::Acquire),
+                            services: &mut services,
+                            engine: &pon_engine_loop,
+                            stopping: &stopping_loop,
+                            #[cfg(feature = "npu")]
+                            npu: Some(&npu_handle),
+                        };
+                        let response = optics.handle(OpticalCommand::Shutdown, &mut backend);
+                        ready_loop.store(false, Ordering::Release);
+                        if let Some(sender) = fault_sender.take() {
+                            let _ = sender.send(format!(
+                                "FSL management requires full reinitialization; shutdown: {response}"
+                            ));
+                        }
+                        break;
+                    }
+                    Ok(false) => session_probe_failures = 0,
+                    Err(error) if ready_loop.load(Ordering::Acquire) => {
+                        // A session that was published and now cannot be probed
+                        // (poisoned mutex or withdrawn slot) has no in-process
+                        // recovery: the poll loop below would spin on errors.
+                        session_probe_failures += 1;
+                        if session_probe_failures >= 3 {
+                            eprintln!(
+                                "[-] FSL session probe failed {session_probe_failures} times: {error}"
+                            );
+                            ready_loop.store(false, Ordering::Release);
+                            if let Some(sender) = fault_sender.take() {
+                                let _ = sender.send(format!(
+                                    "FSL session unreachable after being ready: {error}"
+                                ));
+                            }
+                            break;
+                        }
+                    }
+                    Err(_) => session_probe_failures = 0,
                 }
                 {
                     let mut backend = RuntimeOptics {
@@ -1527,10 +1681,28 @@ async fn run_async(platform: PlatformContext) {
 
                     for frame in &report.omci_frames {
                         if let Ok(parsed) = BaselineFrame::from_bytes(&frame.payload) {
-                            if let Ok(mut queues) = runtime_state().omci_rx.lock() {
-                                queue_omci_response(queues.entry(frame.source).or_default(), parsed);
+                            // Queue keys must match a live ONU: unknown sources
+                            // would otherwise grow unbounded queues and mask a
+                            // wrong bits21:14 interpretation behind silent drops.
+                            if omci_source_is_live(session, frame.source) {
+                                if let Ok(mut queues) = runtime_state().omci_rx.lock() {
+                                    queue_omci_response(queues.entry(frame.source).or_default(), parsed);
+                                }
+                            } else {
+                                unknown_source_total += 1;
                             }
                         }
+                    }
+                    if unknown_source_total > 0
+                        && last_unknown_source_log.elapsed() >= Duration::from_secs(1)
+                    {
+                        // Report the accumulated total so the 1s rate limit
+                        // cannot undercount sustained unknown-source traffic.
+                        last_unknown_source_log = Instant::now();
+                        eprintln!(
+                            "[*] FSL dropped {unknown_source_total} OMCI frame(s) from unknown/inactive ONU sources"
+                        );
+                        unknown_source_total = 0;
                     }
 
                     let mut deactivated = Vec::new();
@@ -1782,10 +1954,19 @@ async fn run_async(platform: PlatformContext) {
                     let response = optics.dispatch(&request, &mut backend, &stopping_loop);
                     let _ = request.reply.send(response);
                 }
-                if !handled_shutdown {
-                    if let Ok(request) = optical_receiver.recv_timeout(Duration::from_millis(50)) {
-                        let response = optics.dispatch(&request, &mut backend, &stopping_loop);
-                        let _ = request.reply.send(response);
+                // Bounded drain: a request queued right as `stopping` flipped may
+                // still be in flight from the sender side; the main thread waits
+                // up to 4s for its Shutdown confirmation, so stay well within it.
+                let drain_deadline = Instant::now() + Duration::from_millis(500);
+                while !handled_shutdown && Instant::now() < drain_deadline {
+                    match optical_receiver.recv_timeout(Duration::from_millis(50)) {
+                        Ok(request) => {
+                            handled_shutdown |= matches!(request.command, OpticalCommand::Shutdown);
+                            let response = optics.dispatch(&request, &mut backend, &stopping_loop);
+                            let _ = request.reply.send(response);
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
                     }
                 }
             }
@@ -1794,6 +1975,9 @@ async fn run_async(platform: PlatformContext) {
                 *guard = None;
             }
         })
+        // The closure owns the fault sender; a spawn failure drops it, which
+        // resolves `fault_receiver` below into a supervised restart.
+        .inspect_err(|error| eprintln!("[-] FSL loop thread spawn failed: {error}"))
         .ok();
 
     let restart = tokio::select! {
@@ -1827,11 +2011,84 @@ async fn run_async(platform: PlatformContext) {
         Ok(Ok(Ok(_))) => (),
         result => eprintln!("[-] Optical shutdown not confirmed: {result:?}"),
     }
+    // Defensive: the optical client usually set this before dispatching Shutdown;
+    // keep the store so the fsl loop also stops when the client never got through.
     stopping.store(true, Ordering::Release);
     if let Some(handle) = fsl_thread {
         let _ = handle.join();
     }
     if restart {
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod init_recovery_tests {
+    use super::*;
+
+    fn failing() -> io::Result<OpticalState> {
+        Err(io::Error::new(io::ErrorKind::NotConnected, "no device"))
+    }
+
+    #[test]
+    fn successful_or_stopped_initialization_never_requests_a_fault() {
+        assert_eq!(init_fault_message(&Ok(OpticalState::Disabled), false), None);
+        assert_eq!(init_fault_message(&Ok(OpticalState::Enabled), true), None);
+        assert_eq!(init_fault_message(&failing(), true), None);
+    }
+
+    #[test]
+    fn persistent_initialization_failure_requests_exactly_one_fault() {
+        let message = match init_fault_message(&failing(), false) {
+            Some(message) => message,
+            None => panic!("expected a permanent-failure fault message"),
+        };
+        assert!(message.contains("failed permanently"));
+        assert!(message.contains("no device"));
+        // The shutdown-interrupted case must stay a clean stop, not a fault.
+        assert_eq!(init_fault_message(&failing(), true), None);
+    }
+
+    #[test]
+    fn retries_are_bounded_to_failed_and_running_states() {
+        assert!(!init_should_retry(&Ok(OpticalState::Disabled), false));
+        assert!(!init_should_retry(&failing(), true));
+        assert!(init_should_retry(&failing(), false));
+        // A rejected platform invariant (Unsupported) is deterministic; the
+        // bounded retries cannot change its outcome.
+        let unsupported = Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "GPON_ONUID_OFFSET_CFG read back 4",
+        ));
+        assert!(!init_should_retry(&unsupported, false));
+    }
+
+    #[test]
+    fn read_tx_reports_the_register_bit_even_when_the_flag_disagrees() {
+        use crate::platform::resources::PonMacReadback;
+        // 0x102 bit4 is TX_DISABLE (inverted); bit0 of 0x202 is FEC.
+        let disabled = PonMacReadback {
+            raw: Some(0x10),
+            tx_enabled: Some(false),
+            fec_enabled: Some(true),
+        };
+        let enabled = PonMacReadback {
+            raw: Some(0x00),
+            tx_enabled: Some(true),
+            fec_enabled: Some(false),
+        };
+        assert_eq!(readback_tx_enabled(disabled).unwrap(), false);
+        assert_eq!(readback_tx_enabled(enabled).unwrap(), true);
+        assert_eq!(
+            readback_tx_enabled(PonMacReadback {
+                raw: None,
+                tx_enabled: None,
+                fec_enabled: None
+            })
+            .unwrap_err()
+            .to_string()
+            .contains("lost the TX bit"),
+            true
+        );
     }
 }

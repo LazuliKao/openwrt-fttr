@@ -278,8 +278,17 @@ pub fn poll_and_clear_pending<B: Bus>(fsl: &mut Fsl<B>) -> io::Result<Vec<GponIn
     Ok(pending)
 }
 
-/// Reads (and read-clears) one 128-bit per-ONU alarm bitmap register
+/// Reads one 128-bit per-ONU alarm bitmap register
 /// (`GPON_DYING_GASP_ALM`, `GPON_LOSI_ALM`, or `GPON_LOFI_ALM`).
+///
+/// TODO(bench): the hardware latch/clear semantics of these bitmaps are
+/// unverified — no stock driver fragment in this repository reads or clears
+/// them, and the software deliberately never writes them back. Before changing
+/// that, read the same bitmap twice around one event on real hardware: the
+/// second read still containing the bit means latched (software must diff
+/// snapshots); the second read being clear means read-clears/level semantics.
+/// Until then, consumers must tolerate stale bits (see the DyingGasp edge
+/// detection in `olt.rs`).
 pub fn read_alarm_bitmap<B: Bus>(fsl: &mut Fsl<B>, reg_addr: u32) -> io::Result<[u32; 4]> {
     if !matches!(
         reg_addr,

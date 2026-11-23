@@ -316,48 +316,9 @@ pub fn read_alloc_offset_mode<B: Bus>(fsl: &mut Fsl<B>) -> io::Result<u8> {
     Ok(((words[0] >> 3) & 0x3) as u8)
 }
 
-/// Maps a 12-bit Alloc-ID to its internal 8-bit hardware T-CONT index
-/// (`fsldrv_gpon_alloc_to_tcont`).
-pub fn alloc_id_to_tcont(
-    alloc_id: u16,
-    onu_id_offset: u8,
-    max_onu_id: u16,
-    alloc_offset_mode: u8,
-) -> io::Result<u8> {
-    if u32::from(alloc_id) > MAX_ROW {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "Alloc-ID exceeds 12-bit GPON range",
-        ));
-    }
-    let offset = u16::from(onu_id_offset);
-    let tcont = if alloc_id >= offset && alloc_id < offset.saturating_add(max_onu_id) {
-        alloc_id - offset
-    } else if alloc_offset_mode == 0
-        && (1024..1280u16.saturating_sub(max_onu_id)).contains(&alloc_id)
-    {
-        alloc_id - 1024 + max_onu_id
-    } else if alloc_offset_mode == 1
-        && (2048..2304u16.saturating_sub(max_onu_id)).contains(&alloc_id)
-    {
-        alloc_id - 2048 + max_onu_id
-    } else if alloc_offset_mode == 2
-        && (3072..3328u16.saturating_sub(max_onu_id)).contains(&alloc_id)
-    {
-        alloc_id - 3072 + max_onu_id
-    } else {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "Alloc-ID outside active hardware T-CONT mapping window",
-        ));
-    };
-    u8::try_from(tcont).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "mapped T-CONT index exceeds 8-bit hardware range",
-        )
-    })
-}
+// Alloc-ID → T-CONT mapping (`fsldrv_gpon_alloc_to_tcont`) lives once in
+// `gdba::alloc_to_tcont`; this module only reads the offset mode that selects
+// the carrier Alloc-ID window.
 
 /// Triggers RSM T-CONT buffer flush via `RSM_CFG_TCONT_CLR` (`0x800`), polls for
 /// completion under `policy`, and checks `RSM_ALM.TCONT_CLR_FAIL_ALM` (`0x810` bit 22)

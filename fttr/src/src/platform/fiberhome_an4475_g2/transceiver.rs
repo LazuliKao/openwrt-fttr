@@ -28,6 +28,10 @@ fn cache() -> &'static Mutex<Option<Sample>> {
     CACHE.get_or_init(|| Mutex::new(None))
 }
 
+// All four registers are < 0x80, so the module page select that calibration
+// leaves on 0x85 should not affect them; this follows from the stock write
+// plan targeting only 0x80..0xFF and is not independently verified. Compare
+// readings before/after a calibration run during the next bench window.
 fn read_words<T: Transfer>(bus: &mut OpticalBus<T>) -> [Result<u16, String>; 4] {
     FIELDS.map(|(_, _, register)| {
         let mut bytes = [0; 2];
@@ -37,7 +41,9 @@ fn read_words<T: Transfer>(bus: &mut OpticalBus<T>) -> [Result<u16, String>; 4] 
     })
 }
 
-/// Called only by the optical owner, never concurrently with calibration.
+/// Called only by the optical owner, never concurrently with calibration:
+/// both run on the fsl-loop thread, and the offline fttrctl path is excluded
+/// by the owner flock. A poisoned cache mutex silently keeps the stale sample.
 pub(super) fn refresh() {
     let values = match I2cDevice::open(Path::new("/dev/i2c-0")) {
         Ok(device) => read_words(&mut OpticalBus::new(device)),
@@ -51,6 +57,10 @@ pub(super) fn refresh() {
     }
 }
 
+/// SFF-8472 conventional scales; the register addresses and scaling follow the
+/// stock convention but are not yet cross-checked against measured hardware.
+/// `raw == 0` on the power register is the stock -40 dBm sentinel, not a
+/// measurement, and the evidence text keeps the raw value for that reason.
 fn convert(index: usize, raw: u16) -> f32 {
     match index {
         0 => f32::from(raw as i16) / 256.0,

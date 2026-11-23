@@ -19,7 +19,8 @@ fn stock_upstream_rate_metadata_is_decoded_and_unknown_values_rejected() {
 }
 use crate::platform::fiberhome_an4475_g2::{
     activation::{
-        BMP_CFG_RG_REQ, BMP_PLS_REQ, BMP_STA, PORTID_CFG_TAB, RSM_ALM, RSM_CFG_TCONT_CLR,
+        read_alloc_offset_mode, BMP_CFG_RG_REQ, BMP_PLS_REQ, BMP_STA, BWMAP_CFG_BASIC,
+        PORTID_CFG_TAB, RSM_ALM, RSM_CFG_TCONT_CLR,
     },
     downstream::{OMCI_CONTROL, OMCI_MEMORY, PLOAM_DATA as TX_PLOAM_DATA, PLOAM_INFO},
     gdba::{
@@ -27,7 +28,7 @@ use crate::platform::fiberhome_an4475_g2::{
         GDBA_DS_TAB_REQ_CFG, GDBA_PARA_H_TAB, GDBA_PARA_L_TAB, GDBA_TAB_REQ_CFG,
     },
     initialization::{
-        defaults::{DEBUG_PIN_SEL, GDBA_SLOT_REQ_CFG},
+        defaults::{DEBUG_PIN_SEL, GDBA_SLOT_REQ_CFG, GPON_ONUID_OFFSET_CFG},
         GPON_RAM_INIT_MASK, RAM_INIT_STATUS, SERDES_LOCK_MASK, SERDES_STATUS,
     },
     interrupts::{
@@ -40,6 +41,57 @@ use crate::platform::fiberhome_an4475_g2::{
     },
 };
 use std::collections::{BTreeMap, VecDeque};
+
+#[test]
+fn initialization_refuses_a_nonzero_onu_id_offset_instead_of_misrouting() {
+    let mut session = FslOltSession::new(SimBus::new(), OltSessionConfig::default());
+    session
+        .bus_mut()
+        .regs
+        .insert(GPON_ONUID_OFFSET_CFG, vec![4]);
+    let error = session.initialize(&mut no_sleep).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+    assert!(error.to_string().contains("GPON_ONUID_OFFSET_CFG"));
+    assert!(!session.is_initialized());
+}
+
+#[test]
+fn initialization_refuses_a_nonzero_alloc_offset_mode_instead_of_misrouting() {
+    let mut session = FslOltSession::new(SimBus::new(), OltSessionConfig::default());
+    // bits[4:3] of BWMAP_CFG_BASIC word 0 encode alloc_offset_mode = 3.
+    session.bus_mut().regs.insert(BWMAP_CFG_BASIC, vec![0x18]);
+    let error = session.initialize(&mut no_sleep).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+    assert!(error.to_string().contains("ALLOCID_OFFSET"));
+    assert!(!session.is_initialized());
+    // The helper stays the single source of the bit encoding.
+    assert_eq!(read_alloc_offset_mode(&mut session.mgmt.fsl).unwrap(), 3);
+}
+
+#[test]
+fn omci_responses_queue_only_for_live_sources() {
+    let mut session = FslOltSession::new(SimBus::new(), OltSessionConfig::default());
+    let live = super::super::runtime::omci_source_is_live;
+    assert!(!live(&session, 3), "unknown source must not queue");
+    session.onus.insert(
+        3,
+        ManagedOnu {
+            onu_id: 3,
+            onu_index: 3,
+            serial_number: *b"TEST\x01\x02\x03\x04",
+            rate: OnuUpstreamRate::Rate2p5G,
+            eqd: 0,
+            state: OnuState::Ranging,
+        },
+    );
+    assert!(
+        !live(&session, 3),
+        "a ranging ONU has no OMCC yet and must not queue"
+    );
+    session.onus.get_mut(&3).unwrap().state = OnuState::Active;
+    assert!(live(&session, 3));
+    assert!(!live(&session, 4));
+}
 
 #[test]
 fn pinned_high_slot_is_reserved_and_allocated_to_matching_identity() {
@@ -778,4 +830,54 @@ fn alarm_interrupts_respect_stock_losi_lofi_and_dying_gasp_thresholds() {
             .unwrap(),
         vec![(0, "dying_gasp")]
     );
+}
+
+#[test]
+fn a_latched_dying_gasp_bit_fires_once_and_never_kills_a_reused_slot() {
+    let mut cfg = OltSessionConfig::default();
+    cfg.init.max_onu_id = 16;
+    let mut session = FslOltSession::new(SimBus::new(), cfg);
+    session.initialize(&mut no_sleep).expect("initialize");
+    let active_onu = |id: u8, sn: [u8; 8]| ManagedOnu {
+        onu_id: id,
+        onu_index: u16::from(id),
+        serial_number: sn,
+        rate: OnuUpstreamRate::Rate1p25G,
+        eqd: 0,
+        state: OnuState::Active,
+    };
+
+    // First occupant sends DyingGasp and is deactivated.
+    session
+        .onus
+        .insert(0, active_onu(0, *b"TEST\x00\x00\x00\x44"));
+    session
+        .bus_mut()
+        .regs
+        .insert(GPON_DYING_GASP_ALM, vec![1, 0, 0, 0]);
+    assert_eq!(
+        session
+            .evaluate_alarm_interrupts(&[GponInterrupt::DyingGasp])
+            .unwrap(),
+        vec![(0, "dying_gasp")]
+    );
+    session
+        .deactivate_onu(0, &[], &[], &mut no_sleep)
+        .expect("deactivate");
+
+    // The bit stays latched (unverified semantics simulated by the fixed reg).
+    // A slot-reused ONU must survive repeated dispatches of that stale bit;
+    // its own real DyingGasp still arrives through the PLOAM Dying_Gasp path.
+    session
+        .onus
+        .insert(0, active_onu(0, *b"TEST\x00\x00\x00\x55"));
+    for _ in 0..3 {
+        assert!(
+            session
+                .evaluate_alarm_interrupts(&[GponInterrupt::DyingGasp])
+                .unwrap()
+                .is_empty(),
+            "a stale latched bit must not deactivate the new occupant"
+        );
+    }
 }
