@@ -377,13 +377,14 @@ fn print_status_table(status: &FttrSystemStatus) {
         );
     }
     println!("----------------------------------------------------------------------------------------------------");
+    let total_ports = status.switch_ports.len();
     if in_prog_count > 0 {
         println!(
-            " Downlink Ports: {} Carrier Up, {} Assigned Without Carrier / 16 Total",
-            active_count, in_prog_count
+            " Downlink Ports: {} Carrier Up, {} Assigned Without Carrier / {} Total",
+            active_count, in_prog_count, total_ports
         );
     } else {
-        println!(" Active Downlink Ports: {} / 16", active_count);
+        println!(" Active Downlink Ports: {} / {}", active_count, total_ports);
     }
     println!();
 

@@ -71,6 +71,13 @@ impl PlatformDiagnostics for FslDiagnostics {
         bus.write(UX3326S_DEVICE_ADDRESS, reg, &[byte])
     }
     fn calibrate_bosa(&self, source: &Path, offset: u64) -> io::Result<BosaCalibrationEvidence> {
+        // Same precondition as the runtime path: programming happens only with
+        // downstream TX off, and a refused TX-off must not start 802 writes.
+        // The FSL device is exclusive, so this also fails fast while fttrd is
+        // running; TX stays off afterwards (the operator re-enables explicitly).
+        let mut fsl = Fsl::new(Device::open(Path::new(FSL_DEVICE_PATH))?);
+        fsl.set_tx_enabled(false)?;
+        drop(fsl);
         let mut file = File::open(source)?;
         file.seek(SeekFrom::Start(offset))?;
         let mut raw = [0u8; calibration::TABLE_BYTES];

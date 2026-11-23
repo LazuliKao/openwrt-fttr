@@ -6,9 +6,13 @@ const DEFAULT_BOSA_CAL_SOURCE: &str = "/dev/ubi0_3";
 const DEFAULT_BOSA_CAL_OFFSET: u64 = 0x1a_5000;
 
 const USAGE: &str = "Usage: fttrctl hardware DEVICE COMMAND [ARGS]
+  DEVICE is the platform register endpoint, e.g. /dev/fsl-1fbd4000.fsl.
   status
   init
   calibrate-bosa [SOURCE [OFFSET]]
+      Verifies the factory table and programs the UX3326S over I2C (802 writes).
+      Disables downstream TX first and leaves it off; requires fttrd to be
+      stopped and the optical owner flock to be free.
   reg-read ADDRESS WORDS
   reg-write ADDRESS WORD...
   mem-read ADDRESS ROW WORDS
@@ -166,6 +170,10 @@ pub(super) fn handle(args: &[String]) -> io::Result<()> {
             })
         }
         Command::CalibrateBosa(source, offset) => {
+            // calibrate_bosa reopens the exclusive FSL device itself (keeping
+            // TX off across every failure path); the register session opened
+            // above would make that open fail with EBUSY.
+            drop(session);
             let ev = hardware.calibrate_bosa(Path::new(&source), offset)?;
             serde_json::json!({
                 "source": source,
@@ -191,11 +199,18 @@ pub(super) fn handle(args: &[String]) -> io::Result<()> {
         }
         Command::Tx(enabled) => {
             session.set_optical_tx_enable(enabled)?;
-            serde_json::json!({"tx_enabled": enabled, "readback_verified": true})
+            let mac = session.pon_mac_readback()?;
+            serde_json::json!({"tx_enabled": enabled,
+                "readback_tx_enabled": mac.tx_enabled,
+                "raw_optical_register": mac.raw,
+                "readback_verified": mac.tx_enabled == Some(enabled)})
         }
         Command::Fec(enabled) => {
             session.set_downstream_fec_enable(enabled)?;
-            serde_json::json!({"downstream_fec_enabled": enabled, "readback_verified": true})
+            let mac = session.pon_mac_readback()?;
+            serde_json::json!({"downstream_fec_enabled": enabled,
+                "readback_fec_enabled": mac.fec_enabled,
+                "readback_verified": mac.fec_enabled == Some(enabled)})
         }
     };
     println!(
