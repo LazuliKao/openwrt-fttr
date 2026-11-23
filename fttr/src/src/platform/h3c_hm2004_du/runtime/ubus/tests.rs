@@ -166,14 +166,20 @@ fn async_hl_results_follow_the_request_and_preserve_failure_evidence() {
         },
     ] {
         let accounts = query(action);
-        assert_eq!(normalize_hl_result(&accounts, result.clone()), Err(9));
+        assert_eq!(
+            normalize_hl_result(&accounts, result.clone()),
+            Err(UBUS_ERROR_INTERNAL)
+        );
         let mut payload = result.clone();
         payload["accounts"] = json!(null);
         payload["write_status"] = json!("unconfirmed");
         assert_eq!(normalize_hl_result(&accounts, payload.clone()), Ok(payload));
     }
     let report = HlQuery::Report { target };
-    assert_eq!(normalize_hl_result(&report, result), Err(9));
+    assert_eq!(
+        normalize_hl_result(&report, result),
+        Err(UBUS_ERROR_INTERNAL)
+    );
     let error =
         json!({"schema_version": 1, "error": {"code": "unavailable", "message": "offline"}});
     for request in [&exec, &report, &HlQuery::List] {

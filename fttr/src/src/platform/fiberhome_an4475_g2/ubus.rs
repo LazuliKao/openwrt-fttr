@@ -4,6 +4,7 @@ use crate::{
     controller::{
         optical_owner::{OpticalClient, OpticalCommand, OpticalReplyExt},
         service,
+        ubus_mib::UBUS_ERROR_INTERNAL,
     },
     ipc::SubDevice,
     pon_engine::PonEngine,
@@ -24,6 +25,10 @@ fn bind<Q: DeserializeOwned + 'static, R: Serialize + 'static>(
     method: &Method<Q, R>,
     handler: impl Fn(Q) -> Result<R, i32> + Send + Sync + 'static,
 ) -> (String, openwrt_ubus::MethodHandler) {
+    // Handlers run synchronously on the ubus server thread; long operations
+    // (optical transitions up to 15s, MIB jobs) belong on the optical actor or
+    // the job system. A stuck handler delays other ubus callers — there is no
+    // per-call timeout wrapper, so keep handlers bounded by construction.
     (
         method.name.into(),
         Box::new(move |_, message| {
@@ -32,7 +37,7 @@ fn bind<Q: DeserializeOwned + 'static, R: Serialize + 'static>(
                 object.remove("ubus_rpc_session");
             }
             let request = serde_json::from_value(payload).map_err(|_| 2)?;
-            serde_json::to_value(handler(request)?).map_err(|_| 9)
+            serde_json::to_value(handler(request)?).map_err(|_| UBUS_ERROR_INTERNAL)
         }),
     )
 }
@@ -46,11 +51,11 @@ fn optical(optics: &OpticalClient, command: OpticalCommand) -> Result<OpticalRep
             error,
         ),
     };
-    serde_json::from_value::<OpticalReply>(response).map_err(|_| 9)
+    serde_json::from_value::<OpticalReply>(response).map_err(|_| UBUS_ERROR_INTERNAL)
 }
 
 fn response<R: DeserializeOwned>(value: serde_json::Value) -> Result<R, i32> {
-    serde_json::from_value(value).map_err(|_| 9)
+    serde_json::from_value(value).map_err(|_| UBUS_ERROR_INTERNAL)
 }
 
 #[derive(Clone)]
@@ -84,7 +89,7 @@ impl Handlers {
     fn get_status(&self, _: EmptyRequest) -> Result<StatusReply, i32> {
         let provisioning =
             serde_json::from_value::<SyncStatusReply>(crate::provisioning::snapshot())
-                .map_err(|_| 9)?;
+                .map_err(|_| UBUS_ERROR_INTERNAL)?;
         let mut status = runtime::status_snapshot(
             &self.optics,
             &self.engine,
@@ -98,17 +103,20 @@ impl Handlers {
         Ok(status)
     }
     fn get_sync(&self, _: EmptyRequest) -> Result<SyncStatusReply, i32> {
-        serde_json::from_value(crate::provisioning::snapshot()).map_err(|_| 9)
+        serde_json::from_value(crate::provisioning::snapshot()).map_err(|_| UBUS_ERROR_INTERNAL)
     }
     fn config_check(&self, _: EmptyRequest) -> Result<ConfigCheckReply, i32> {
-        serde_json::from_str(&crate::provisioning::control("{\"op\":\"check\"}")).map_err(|_| 9)
+        serde_json::from_str(&crate::provisioning::control("{\"op\":\"check\"}"))
+            .map_err(|_| UBUS_ERROR_INTERNAL)
     }
     fn config_reload(&self, _: EmptyRequest) -> Result<ConfigReloadReply, i32> {
-        serde_json::from_str(&crate::provisioning::control("{\"op\":\"reload\"}")).map_err(|_| 9)
+        serde_json::from_str(&crate::provisioning::control("{\"op\":\"reload\"}"))
+            .map_err(|_| UBUS_ERROR_INTERNAL)
     }
     fn sync(&self, request: SyncRequest) -> Result<SyncReply, i32> {
         let payload = request.provisioning_request().map_err(|_| 2)?;
-        serde_json::from_str(&crate::provisioning::control(&payload.to_string())).map_err(|_| 9)
+        serde_json::from_str(&crate::provisioning::control(&payload.to_string()))
+            .map_err(|_| UBUS_ERROR_INTERNAL)
     }
     fn restart_service(&self, _: EmptyRequest) -> Result<RestartReply, i32> {
         std::thread::Builder::new()
@@ -124,7 +132,7 @@ impl Handlers {
                     )
                 });
             })
-            .map_err(|_| 9)?;
+            .map_err(|_| UBUS_ERROR_INTERNAL)?;
         Ok(RestartReply { restarting: true })
     }
     fn npu_status(&self, _: EmptyRequest) -> Result<NpuStatus, i32> {

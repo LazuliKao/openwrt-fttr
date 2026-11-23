@@ -6,6 +6,11 @@ use crate::{
 };
 use std::sync::{Arc, Mutex};
 
+/// Legacy numeric ubus failure code kept stable for existing clients: 9 marks a
+/// generic internal failure (busy lock, unavailable engine/service state), as
+/// opposed to the per-request validation code (2 = unsupported ONU-ID).
+pub(crate) const UBUS_ERROR_INTERNAL: i32 = 9;
+
 pub(crate) fn start(
     platform: PlatformContext,
     engine: Arc<Mutex<PonEngine>>,
@@ -16,7 +21,7 @@ pub(crate) fn start(
     if !platform.resources().onu_ids.contains(&request.onu_id) {
         return Err(2);
     }
-    let current = engine.try_lock().map_err(|_| 9)?;
+    let current = engine.try_lock().map_err(|_| UBUS_ERROR_INTERNAL)?;
     if !current.active_onus.iter().any(|onu| {
         onu.onu_id == request.onu_id
             && onu.full_sn_str() == request.optical_sn
@@ -25,14 +30,14 @@ pub(crate) fn start(
         return serde_json::from_value(fttr_jobs::error(
             "Device registration changed; reopen device details",
         ))
-        .map_err(|_| 9);
+        .map_err(|_| UBUS_ERROR_INTERNAL);
     }
     let generation = services
         .try_lock()
-        .map_err(|_| 9)?
+        .map_err(|_| UBUS_ERROR_INTERNAL)?
         .get(&request.onu_id)
         .map(|s| s.generation)
-        .ok_or(9)?;
+        .ok_or(UBUS_ERROR_INTERNAL)?;
     drop(current);
     let states = services.clone();
     let id = request.onu_id;
@@ -75,5 +80,5 @@ pub(crate) fn start(
             Err(error) => fttr_jobs::error(&error.to_string()),
         }
     }))
-    .map_err(|_| 9)
+    .map_err(|_| UBUS_ERROR_INTERNAL)
 }

@@ -1,5 +1,6 @@
 use super::*;
 use crate::controller::topology::{self, Snapshot};
+use crate::controller::ubus_mib::UBUS_ERROR_INTERNAL;
 use std::sync::Arc;
 
 impl Handlers {
@@ -8,15 +9,19 @@ impl Handlers {
             if id.is_empty() || id.len() > 96 {
                 return Err(2);
             }
-            return Ok(self.topology.lock().map_err(|_| 9)?.get(id));
+            return Ok(self
+                .topology
+                .lock()
+                .map_err(|_| UBUS_ERROR_INTERNAL)?
+                .get(id));
         }
         // get_status releases all engine/device locks before querying external services.
         let status = self.get_status(EmptyRequest {})?;
         let snapshot = topology::build(status, &self.engine, &self.services);
         // Reject mixed registrations if optical identity changed during local collection.
         {
-            let engine = self.engine.lock().map_err(|_| 9)?;
-            let services = self.services.lock().map_err(|_| 9)?;
+            let engine = self.engine.lock().map_err(|_| UBUS_ERROR_INTERNAL)?;
+            let services = self.services.lock().map_err(|_| UBUS_ERROR_INTERNAL)?;
             let observed: Vec<_> = snapshot
                 .reply
                 .nodes
@@ -27,7 +32,7 @@ impl Handlers {
                 })
                 .collect();
             if observed.len() != engine.active_onus.len() {
-                return Err(9);
+                return Err(UBUS_ERROR_INTERNAL);
             }
             for onu in observed {
                 let id = onu.onu_id.unwrap();
@@ -37,22 +42,31 @@ impl Handlers {
                         && Some(current.state) == onu.registration
                         && onu.serial_number.as_deref() == (!sn.is_empty()).then_some(sn.as_str())
                 }) {
-                    return Err(9);
+                    return Err(UBUS_ERROR_INTERNAL);
                 }
                 if let Some(business) = &onu.business {
                     if services.get(&id).map(|s| s.generation).unwrap_or_default()
                         != business.generation
                     {
-                        return Err(9);
+                        return Err(UBUS_ERROR_INTERNAL);
                     }
                 }
             }
         }
-        Ok(Some(self.topology.lock().map_err(|_| 9)?.insert(snapshot)))
+        Ok(Some(
+            self.topology
+                .lock()
+                .map_err(|_| UBUS_ERROR_INTERNAL)?
+                .insert(snapshot),
+        ))
     }
 
     pub(super) fn get_topology(&self, _: EmptyRequest) -> Result<TopologyReply, i32> {
-        Ok(self.topology_snapshot(None)?.ok_or(9)?.reply.clone())
+        Ok(self
+            .topology_snapshot(None)?
+            .ok_or(UBUS_ERROR_INTERNAL)?
+            .reply
+            .clone())
     }
 
     pub(super) fn get_topology_node(

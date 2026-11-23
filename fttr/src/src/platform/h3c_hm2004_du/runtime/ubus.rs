@@ -1,5 +1,6 @@
 //! HM2004-DU daemon handlers driven by shared wire contracts.
 use super::{OpticalClient, OpticalCommand, OpticalReplyExt};
+use crate::controller::ubus_mib::UBUS_ERROR_INTERNAL;
 use fttr_api::*;
 use serde::{de::DeserializeOwned, Serialize};
 use std::sync::atomic::Ordering;
@@ -26,7 +27,7 @@ fn bind<Q: DeserializeOwned + 'static, R: Serialize + 'static>(
                     object.remove("ubus_rpc_session");
                 }
                 let request = serde_json::from_value(payload).map_err(|_| 2)?;
-                serde_json::to_value(handler(request)?).map_err(|_| 9)
+                serde_json::to_value(handler(request)?).map_err(|_| UBUS_ERROR_INTERNAL)
             })();
             metrics::record(name, started.elapsed(), result.is_err());
             result
@@ -43,7 +44,7 @@ fn optical(optics: &OpticalClient, command: OpticalCommand) -> Result<OpticalRep
             error,
         ),
     };
-    serde_json::from_value::<OpticalReply>(response).map_err(|_| 9)
+    serde_json::from_value::<OpticalReply>(response).map_err(|_| UBUS_ERROR_INTERNAL)
 }
 
 #[derive(Clone)]
@@ -291,34 +292,37 @@ impl Handlers {
         optical(&self.optics, OpticalCommand::Set(request))
     }
     fn get_status(&self, _: EmptyRequest) -> Result<StatusReply, i32> {
-        let provisioning =
-            serde_json::from_value(crate::provisioning::snapshot()).map_err(|_| 9)?;
-        let devices = self.devices.lock().map_err(|_| 9)?;
-        let engine = self.engine.lock().map_err(|_| 9)?;
+        let provisioning = serde_json::from_value(crate::provisioning::snapshot())
+            .map_err(|_| UBUS_ERROR_INTERNAL)?;
+        let devices = self.devices.lock().map_err(|_| UBUS_ERROR_INTERNAL)?;
+        let engine = self.engine.lock().map_err(|_| UBUS_ERROR_INTERNAL)?;
         let mut status = crate::platform::h3c_hm2004_du::status::snapshot(
             &engine,
             &self.services,
             (&devices, provisioning),
         );
         if let Some(jobs) = self.jobs.snapshot() {
-            status.jobs = Some(serde_json::from_value(jobs).map_err(|_| 9)?);
+            status.jobs = Some(serde_json::from_value(jobs).map_err(|_| UBUS_ERROR_INTERNAL)?);
         }
         status.ubus = metrics::snapshot();
         status.ipc = Some(super::ipc_server::metrics::snapshot());
         Ok(status)
     }
     fn get_sync(&self, _: EmptyRequest) -> Result<SyncStatusReply, i32> {
-        serde_json::from_value(crate::provisioning::snapshot()).map_err(|_| 9)
+        serde_json::from_value(crate::provisioning::snapshot()).map_err(|_| UBUS_ERROR_INTERNAL)
     }
     fn config_check(&self, _: EmptyRequest) -> Result<ConfigCheckReply, i32> {
-        serde_json::from_str(&crate::provisioning::control("{\"op\":\"check\"}")).map_err(|_| 9)
+        serde_json::from_str(&crate::provisioning::control("{\"op\":\"check\"}"))
+            .map_err(|_| UBUS_ERROR_INTERNAL)
     }
     fn config_reload(&self, _: EmptyRequest) -> Result<ConfigReloadReply, i32> {
-        serde_json::from_str(&crate::provisioning::control("{\"op\":\"reload\"}")).map_err(|_| 9)
+        serde_json::from_str(&crate::provisioning::control("{\"op\":\"reload\"}"))
+            .map_err(|_| UBUS_ERROR_INTERNAL)
     }
     fn sync(&self, request: SyncRequest) -> Result<SyncReply, i32> {
         let payload = request.provisioning_request().map_err(|_| 2)?;
-        serde_json::from_str(&crate::provisioning::control(&payload.to_string())).map_err(|_| 9)
+        serde_json::from_str(&crate::provisioning::control(&payload.to_string()))
+            .map_err(|_| UBUS_ERROR_INTERNAL)
     }
     fn restart_service(&self, _: EmptyRequest) -> Result<RestartReply, i32> {
         std::thread::Builder::new()
@@ -340,7 +344,7 @@ impl Handlers {
                     eprintln!("[ubus] service restart request failed: {error}");
                 }
             })
-            .map_err(|_| 9)?;
+            .map_err(|_| UBUS_ERROR_INTERNAL)?;
         Ok(RestartReply { restarting: true })
     }
     fn npu_status(&self, _: EmptyRequest) -> Result<NpuStatus, i32> {
@@ -389,7 +393,7 @@ pub(super) fn methods(
 }
 
 fn response<R: DeserializeOwned>(value: serde_json::Value) -> Result<R, i32> {
-    serde_json::from_value(value).map_err(|_| 9)
+    serde_json::from_value(value).map_err(|_| UBUS_ERROR_INTERNAL)
 }
 
 #[cfg(feature = "device-hl202")]
@@ -413,5 +417,5 @@ fn normalize_hl_result(
 fn normalize<R: DeserializeOwned + Serialize>(
     value: serde_json::Value,
 ) -> Result<serde_json::Value, i32> {
-    serde_json::to_value(response::<R>(value)?).map_err(|_| 9)
+    serde_json::to_value(response::<R>(value)?).map_err(|_| UBUS_ERROR_INTERNAL)
 }
