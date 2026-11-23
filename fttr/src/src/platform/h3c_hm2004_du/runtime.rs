@@ -552,20 +552,28 @@ async fn run_async(platform: PlatformContext) {
     };
     let service_states: super::service::States = Arc::new(Mutex::new(BTreeMap::new()));
 
-    if let Ok(listener) = ipc::create_socket_listener() {
-        start_ipc_server(
-            listener,
-            devices.clone(),
-            pon_engine.clone(),
-            service_states.clone(),
-            OpticalClient {
-                platform,
-                requests: optical_requests.clone(),
-                hardware_ready: hardware_ready.clone(),
-                stopping: stopping.clone(),
-            },
-        );
-        println!("[+] IPC socket server listening on {}", ipc::SOCKET_PATH);
+    match ipc::create_socket_listener() {
+        Ok(listener) => {
+            start_ipc_server(
+                listener,
+                devices.clone(),
+                pon_engine.clone(),
+                service_states.clone(),
+                OpticalClient {
+                    platform,
+                    requests: optical_requests.clone(),
+                    hardware_ready: hardware_ready.clone(),
+                    stopping: stopping.clone(),
+                },
+            );
+            println!("[+] IPC socket server listening on {}", ipc::SOCKET_PATH);
+        }
+        Err(error) => {
+            // fttrctl is unreachable without the socket; let procd rebuild the
+            // process instead of running an unmanageable daemon.
+            eprintln!("[-] IPC socket listener unavailable: {error}");
+            std::process::exit(1);
+        }
     }
 
     let _ubus_thread = start_ubus_server(
@@ -592,12 +600,19 @@ async fn run_async(platform: PlatformContext) {
             let initial = initialize_hardware(&stopping);
             let (ready, state) = match initial {
                 Ok(state) => (true, state),
+                Err(error) if stopping.load(Ordering::Acquire) => {
+                    // procd stop is a clean stop, not a fault.
+                    eprintln!("[-] Hardware initialization interrupted by shutdown: {error}");
+                    (false, OpticalState::Unknown)
+                }
                 Err(error) => {
-                    eprintln!("[-] Hardware initialization failed; discovery paused: {error}");
+                    eprintln!("[-] Hardware initialization failed; requesting supervised restart: {error}");
                     if let Err(reset) = bosa::set_optical_tx_enable(false) {
                         eprintln!("[-] Recovery reset failed: {reset}");
                     }
-                    (false, OpticalState::Unknown)
+                    // Spinning forever as a non-functional daemon has no
+                    // in-process recovery; let procd create a fresh process.
+                    std::process::exit(1);
                 }
             };
             hardware_ready.store(ready, Ordering::Release);
