@@ -1,9 +1,9 @@
 name: FTTR API contract
 on:
   push:
-    paths: ['fttr/src/**', 'fttr/files/**', 'fttr/Makefile', '.github/workflows/fttr-api.yml']
+    paths: ['fttr/src/**', 'fttr/files/**', 'fttr/Makefile', 'fiberhome-fsl/**', '.github/workflows/fttr-api.yml']
   pull_request:
-    paths: ['fttr/src/**', 'fttr/files/**', 'fttr/Makefile', '.github/workflows/fttr-api.yml']
+    paths: ['fttr/src/**', 'fttr/files/**', 'fttr/Makefile', 'fiberhome-fsl/**', '.github/workflows/fttr-api.yml']
   workflow_dispatch:
     inputs:
       frontend_ref:
@@ -25,6 +25,9 @@ jobs:
           ref: ${{ inputs.frontend_ref || vars.FTTR_FRONTEND_REF || 'main' }}
           path: luci-app-fttr
       - uses: dtolnay/rust-toolchain@stable
+      # UAPI drift guard: the C static asserts mirror the Rust transport tests.
+      - run: cc -std=c11 -Wall -Werror -Ifiberhome-fsl/src fiberhome-fsl/tests/check-uapi.c -o /tmp/check-uapi && /tmp/check-uapi
+        working-directory: openwrt-fttr
       - run: cargo fmt --all --check --manifest-path openwrt-fttr/fttr/src/Cargo.toml
       - run: cargo test --locked --workspace --manifest-path openwrt-fttr/fttr/src/Cargo.toml --features fttr-api/codegen
       - run: cargo test --locked --manifest-path openwrt-fttr/fttr/src/Cargo.toml --lib --no-default-features --features all-devices,acs,mqtt,npu
