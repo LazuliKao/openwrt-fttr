@@ -87,11 +87,17 @@ impl Resources {
         &self,
         pins: &std::collections::BTreeMap<String, u8>,
     ) -> Result<(), String> {
-        if pins.values().any(|id| !self.onu_ids.contains(id)) {
-            Err("configured ONU-ID is unsupported by the selected platform".into())
-        } else {
-            Ok(())
+        let mut assigned = std::collections::BTreeSet::new();
+        // Identities are serial-number material: keep them out of every message.
+        for (_identity, id) in pins {
+            if !self.onu_ids.contains(id) {
+                return Err("configured ONU-ID is unsupported by the selected platform".into());
+            }
+            if !assigned.insert(*id) {
+                return Err(format!("duplicate pin assignment for ONU-ID {id}"));
+            }
         }
+        Ok(())
     }
 }
 
@@ -208,5 +214,18 @@ mod tests {
             let error = resources.validate().unwrap_err();
             assert!(error.contains(expected), "{resources:?}: {error}");
         }
+    }
+
+    #[test]
+    fn pin_validation_rejects_unsupported_and_duplicate_ids_without_exposing_identities() {
+        let pins =
+            |entries: &[(&str, u8)]| entries.iter().map(|(k, v)| (k.to_string(), *v)).collect();
+        assert!(VALID.validate_pins(&pins(&[("AAA", 3)])).is_ok());
+        let error = VALID.validate_pins(&pins(&[("AAA", 7)])).unwrap_err();
+        assert!(error.contains("unsupported by the selected platform"));
+        let error = VALID
+            .validate_pins(&pins(&[("AAA", 3), ("BBB", 3)]))
+            .unwrap_err();
+        assert!(error.contains("duplicate pin assignment for ONU-ID 3"));
     }
 }
