@@ -320,6 +320,9 @@ impl Collector {
             session.cancel_when(self.token.clone());
             match segmented::Upload::begin(session, deadline) {
                 Ok(upload) => self.upload = Some(upload),
+                // Unlike step/verify timeouts there is no cursor to preserve
+                // yet, so the concrete error becomes this round's ani evidence;
+                // refresh clears it and the next round retries from the top.
                 Err(error) => return Some(Err(error)),
             }
         }

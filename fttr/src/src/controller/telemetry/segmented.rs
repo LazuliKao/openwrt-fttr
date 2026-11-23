@@ -62,6 +62,12 @@ impl Upload {
 
     pub fn verify(&mut self, deadline: Instant) -> io::Result<()> {
         self.prepare(deadline)?;
+        // Exact comparison on the decoded value (byte-width MibDataSync,
+        // schema size 1) is intentional: any counter movement inside the
+        // window (including the 255→0 wrap) must reject the whole snapshot. The
+        // only theoretical hole — exactly 256 increments landing back on the
+        // observed byte — is indistinguishable at byte width, and a window with
+        // 256 MIB changes deserves a re-upload anyway.
         if mib_sync(&mut self.session)? != self.sync {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
