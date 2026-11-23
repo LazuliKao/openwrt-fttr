@@ -78,23 +78,35 @@ pub(crate) struct OpticalClient {
 impl OpticalClient {
     pub(crate) fn request(&self, command: OpticalCommand) -> io::Result<Value> {
         if matches!(command, OpticalCommand::Shutdown) {
-            self.stopping.store(true, Ordering::Release);
-        } else if self.stopping.load(Ordering::Acquire)
-            && !matches!(command, OpticalCommand::Status)
-        {
+            // The fsl loop observes `stopping` and exits (draining the queue
+            // with a bounded wait afterwards), so the request must already be
+            // in the queue at that moment: enqueue first, then flip the flag
+            // only after the send succeeded. A failed send leaves the flag
+            // untouched and the loop keeps serving requests; the caller sees
+            // the send error and a process stop still converges through the
+            // termination path's own Shutdown request.
+            let sent = self.enqueue(command);
+            if sent.is_ok() {
+                self.stopping.store(true, Ordering::Release);
+            }
+            return self.await_reply(sent);
+        }
+        if self.stopping.load(Ordering::Acquire) && !matches!(command, OpticalCommand::Status) {
             return Err(io::Error::new(
                 io::ErrorKind::NotConnected,
                 "controller is stopping",
             ));
         }
-        if !self.hardware_ready.load(Ordering::Acquire)
-            && !matches!(command, OpticalCommand::Shutdown)
-        {
+        if !self.hardware_ready.load(Ordering::Acquire) {
             return Err(io::Error::new(
                 io::ErrorKind::NotConnected,
                 "hardware initialization incomplete",
             ));
         }
+        self.await_reply(self.enqueue(command))
+    }
+
+    fn enqueue(&self, command: OpticalCommand) -> io::Result<mpsc::Receiver<Value>> {
         let (reply, response) = mpsc::sync_channel(1);
         self.requests
             .try_send(OpticalRequest {
@@ -110,7 +122,11 @@ impl OpticalClient {
                     io::Error::new(io::ErrorKind::NotConnected, "optical owner unavailable")
                 }
             })?;
-        response
+        Ok(response)
+    }
+
+    fn await_reply(&self, response: io::Result<mpsc::Receiver<Value>>) -> io::Result<Value> {
+        response?
             .recv_timeout(Duration::from_secs(15))
             .map_err(|error| {
                 io::Error::new(
@@ -368,10 +384,17 @@ impl OpticalActor {
                     if self.state == OpticalState::Unknown
                         || (self.state == OpticalState::Disabled && actual)
                     {
+                        // fail_closed recovery has already run before this reply
+                        // reaches the client; a failed recovery appends its own
+                        // detail to this message, so the base wording stays
+                        // neutral about the outcome.
                         return Err(io::Error::other(
-                            "optical state is unconfirmed; explicit reload required",
+                            "optical state is unconfirmed; transmission recovery attempted; explicit reload required",
                         ));
                     }
+                    // The trait does not guarantee reconcile_controls quiesces
+                    // (platform adapters do via the shared MAC policy), so the
+                    // downgrade still owes its own explicit quiesce.
                     backend.reconcile_controls(actual)?;
                     if self.state == OpticalState::Enabled && !actual {
                         self.state = OpticalState::Disabled;
@@ -476,6 +499,68 @@ mod tests {
                 "MAC must use the freshly saved setting"
             );
         }
+    }
+
+    #[test]
+    fn shutdown_enqueues_before_requesting_the_loop_to_stop() {
+        let (requests, receiver) = mpsc::sync_channel(2);
+        let stopping = Arc::new(AtomicBool::new(false));
+        let client = OpticalClient {
+            platform: crate::platform::context::PlatformContext::test_context(),
+            requests,
+            hardware_ready: Arc::new(AtomicBool::new(true)),
+            stopping: stopping.clone(),
+        };
+        // Once the flip is visible to this observer (Release store ↔ Acquire
+        // load), the enqueue that preceded it in program order must already be
+        // in the queue — this is what discriminates the enqueue-before-flip
+        // ordering instead of passing under either order.
+        let observer_stopping = stopping.clone();
+        let observer = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !observer_stopping.load(Ordering::Acquire) {
+                assert!(Instant::now() < deadline, "flag never set");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let request = receiver
+                .recv_timeout(Duration::from_secs(2))
+                .expect("shutdown request enqueued before the flag flip");
+            let _ = request.reply.send(serde_json::json!({"status": "success"}));
+        });
+        let reply = client.request(OpticalCommand::Shutdown).expect("reply");
+        assert_eq!(reply["status"], "success");
+        observer.join().expect("observer thread");
+        assert!(
+            stopping.load(Ordering::Acquire),
+            "stopping is set once the send succeeded"
+        );
+    }
+
+    #[test]
+    fn shutdown_leaves_stopping_untouched_when_the_queue_is_full() {
+        let (requests, receiver) = mpsc::sync_channel(1);
+        let stopping = Arc::new(AtomicBool::new(false));
+        let client = OpticalClient {
+            platform: crate::platform::context::PlatformContext::test_context(),
+            requests,
+            hardware_ready: Arc::new(AtomicBool::new(true)),
+            stopping: stopping.clone(),
+        };
+        // Keep the receiver alive but never drain it: the shutdown enqueue must
+        // fail with WouldBlock and, per the request-path comment, the flag flip
+        // must not happen — the loop stays free to serve later requests.
+        let _pending = client
+            .enqueue(OpticalCommand::Status)
+            .expect("fill the queue");
+        let error = client
+            .request(OpticalCommand::Shutdown)
+            .expect_err("queue full");
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert!(
+            !stopping.load(Ordering::Acquire),
+            "a failed send must leave the flag untouched"
+        );
+        drop(receiver);
     }
 
     struct Backend {
