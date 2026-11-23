@@ -72,13 +72,20 @@ static void fsl_free(struct kref *refs)
 {
 	struct fsl_device *fsl = container_of(refs, struct fsl_device, refs);
 
+	mutex_destroy(&fsl->lock);
 	kfree(fsl->misc.name);
 	kfree(fsl);
 }
 
+/* SCU 0x1c4 divider field (div << 23 | BIT(16) enable) is reconstructed from
+ * the stock fslstack code and confirmed on hardware; it is undocumented in
+ * public datasheets. Keep the per-transfer write: SCU owns no other writer
+ * today, but a future clock consumer must not wedge this bus silently.
+ */
 static int fsl_set_clk(struct fsl_device *fsl, u32 speed_hz)
 {
 	u32 mhz, div, val;
+	int ret;
 
 	if (!fsl->scu)
 		return 0;
@@ -91,8 +98,12 @@ static int fsl_set_clk(struct fsl_device *fsl, u32 speed_hz)
 	div = clamp_t(u32, div, 2U, 62U);
 	val = (div << 23) | SCU_PCM_CLK_EN;
 
-	return regmap_update_bits(fsl->scu, SCU_SPI_CLK_DIV_SEL,
-				  SCU_PCM_CLK_MASK, val);
+	ret = regmap_update_bits(fsl->scu, SCU_SPI_CLK_DIV_SEL,
+				 SCU_PCM_CLK_MASK, val);
+	if (ret)
+		dev_err_ratelimited(fsl->dev, "scu clk set failed: %pe\n",
+				    ERR_PTR(ret));
+	return ret;
 }
 
 static int fsl_cmd(struct fsl_device *fsl, u32 opcode, u32 len)
@@ -105,15 +116,22 @@ static int fsl_cmd(struct fsl_device *fsl, u32 opcode, u32 len)
 
 	ret = readl_poll_timeout(fsl->base + SPI_CMD_BUSY, val, val == 0,
 				 1, SPI_POLL_TIMEOUT_US);
-	if (ret)
+	if (ret) {
+		dev_err_ratelimited(fsl->dev, "opfifo busy timeout (op %#x)\n",
+				    opcode);
 		return ret;
+	}
 
 	writel((opcode << 9) | (len & SPI_MAX_XFER_LEN),
 	       fsl->base + SPI_CMD_REG);
 	writel(1, fsl->base + SPI_CMD_TRIG);
 
-	return readl_poll_timeout(fsl->base + SPI_CMD_DONE, val, val != 0,
-				  1, SPI_POLL_TIMEOUT_US);
+	ret = readl_poll_timeout(fsl->base + SPI_CMD_DONE, val, val != 0,
+				 1, SPI_POLL_TIMEOUT_US);
+	if (ret)
+		dev_err_ratelimited(fsl->dev,
+				    "op %#x len %u done timeout\n", opcode, len);
+	return ret;
 }
 
 static int fsl_tx(struct fsl_device *fsl, const u8 *buf, u32 len, bool cont)
@@ -128,15 +146,23 @@ static int fsl_tx(struct fsl_device *fsl, const u8 *buf, u32 len, bool cont)
 	for (i = 0; i < len; i++) {
 		ret = readl_poll_timeout(fsl->base + SPI_TX_BUSY, val,
 					 val == 0, 1, SPI_POLL_TIMEOUT_US);
-		if (ret)
+		if (ret) {
+			dev_err_ratelimited(fsl->dev,
+					    "tx fifo full timeout (byte %u/%u)\n",
+					    i, len);
 			return ret;
+		}
 
 		writel(buf[i], fsl->base + SPI_TX_DATA);
 
 		ret = readl_poll_timeout(fsl->base + SPI_TX_BUSY, val,
 					 val == 0, 1, SPI_POLL_TIMEOUT_US);
-		if (ret)
+		if (ret) {
+			dev_err_ratelimited(fsl->dev,
+					    "tx fifo drain timeout (byte %u/%u)\n",
+					    i, len);
 			return ret;
+		}
 	}
 
 	return 0;
@@ -154,8 +180,12 @@ static int fsl_rx(struct fsl_device *fsl, u8 *buf, u32 len)
 	for (i = 0; i < len; i++) {
 		ret = readl_poll_timeout(fsl->base + SPI_RX_BUSY, val,
 					 val == 0, 1, SPI_POLL_TIMEOUT_US);
-		if (ret)
+		if (ret) {
+			dev_err_ratelimited(fsl->dev,
+					    "rx fifo empty timeout (byte %u/%u)\n",
+					    i, len);
 			return ret;
+		}
 
 		buf[i] = readl(fsl->base + SPI_RX_DATA) & 0xff;
 		writel(1, fsl->base + SPI_RX_TRIG);
@@ -176,8 +206,10 @@ static int fsl_hw_transfer(struct fsl_device *fsl, const u8 *tx, u32 tx_len,
 	writel(0, fsl->base + SPI_CTRL_CFG0);
 	ret = readl_poll_timeout(fsl->base + SPI_BUSY_STS, val, val == 0,
 				 1, SPI_POLL_TIMEOUT_US);
-	if (ret)
+	if (ret) {
+		dev_err_ratelimited(fsl->dev, "controller busy timeout\n");
 		goto out_close;
+	}
 
 	writel(1, fsl->base + SPI_MSG_EN);
 	writel(9, fsl->base + SPI_FIFO_CFG);
@@ -330,7 +362,8 @@ static int fsl_probe(struct platform_device *pdev)
 
 	fsl->base = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(fsl->base)) {
-		ret = PTR_ERR(fsl->base);
+		ret = dev_err_probe(&pdev->dev, PTR_ERR(fsl->base),
+				    "cannot map registers\n");
 		fsl->base = NULL;
 		goto fail;
 	}
@@ -340,22 +373,54 @@ static int fsl_probe(struct platform_device *pdev)
 	if (IS_ERR(fsl->scu))
 		fsl->scu = syscon_regmap_lookup_by_compatible(
 			"airoha,en7581-chip-scu");
-	if (IS_ERR(fsl->scu))
+	if (PTR_ERR(fsl->scu) == -EPROBE_DEFER) {
+		/* The SCU driver may simply not have probed yet; retrying
+		 * gets the divider programmed instead of silently keeping
+		 * the bootloader value.
+		 */
+		ret = dev_err_probe(&pdev->dev, -EPROBE_DEFER,
+				    "SCU syscon not ready\n");
+		goto fail;
+	}
+	if (IS_ERR(fsl->scu)) {
 		fsl->scu = NULL;
+		/* Non-fatal: transfers then run at whatever divider the
+		 * bootloader left, so say so instead of failing silently.
+		 */
+		dev_warn(&pdev->dev,
+			 "SCU syscon unavailable; SPI clock divider stays as configured by the bootloader\n");
+	}
 
 	fsl->rst = devm_reset_control_get_optional_exclusive(&pdev->dev, "pcm");
-	if (!IS_ERR_OR_NULL(fsl->rst))
-		reset_control_deassert(fsl->rst);
+	if (IS_ERR(fsl->rst)) {
+		ret = dev_err_probe(&pdev->dev, PTR_ERR(fsl->rst),
+				    "cannot get pcm reset\n");
+		goto fail;
+	}
+	if (fsl->rst) {
+		ret = reset_control_deassert(fsl->rst);
+		if (ret) {
+			ret = dev_err_probe(&pdev->dev, ret,
+					    "cannot deassert pcm reset\n");
+			goto fail;
+		}
+	}
 
 	/* Release active-low reset if wired to GPIO4; do not pulse on every open. */
 	fsl->reset_gpio = devm_gpiod_get_optional(&pdev->dev, "reset",
 						  GPIOD_OUT_LOW);
 	if (IS_ERR(fsl->reset_gpio)) {
-		ret = PTR_ERR(fsl->reset_gpio);
+		ret = dev_err_probe(&pdev->dev, PTR_ERR(fsl->reset_gpio),
+				    "cannot get reset gpio\n");
 		goto fail;
 	}
 
 	of_property_read_u32(pdev->dev.of_node, "spi-max-frequency", &max_hz);
+	if (!max_hz) {
+		ret = dev_err_probe(&pdev->dev, -EINVAL,
+				    "invalid spi-max-frequency\n");
+		goto fail;
+	}
 	fsl->max_speed_hz = min(max_hz, 10000000U);
 	fsl->chip_select = 0;
 
@@ -368,13 +433,16 @@ static int fsl_probe(struct platform_device *pdev)
 	fsl->misc.parent = &pdev->dev;
 	fsl->misc.mode = 0600;
 	if (!fsl->misc.name) {
-		ret = -ENOMEM;
+		ret = dev_err_probe(&pdev->dev, -ENOMEM,
+				    "cannot allocate device name\n");
 		goto fail;
 	}
 
 	ret = misc_register(&fsl->misc);
-	if (ret)
+	if (ret) {
+		dev_err_probe(&pdev->dev, ret, "cannot register misc device\n");
 		goto fail;
+	}
 
 	platform_set_drvdata(pdev, fsl);
 	dev_info(&pdev->dev, "registered /dev/%s (max_hz=%u)\n",
